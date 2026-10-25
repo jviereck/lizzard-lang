@@ -109,6 +109,14 @@ impl Parser {
                 let body = self.suite()?;
                 StmtKind::For { target, iter, body }
             }
+            Tok::With => {
+                self.advance();
+                let ctx = self.expr()?;
+                let name = if self.eat(&Tok::As) { Some(self.name("name")?.0) } else { None };
+                self.expect(&Tok::Colon, "`:`")?;
+                let body = self.suite()?;
+                StmtKind::With { ctx, name, body }
+            }
             Tok::Indent => return Err(Error::syntax("unexpected indent", span)),
             _ => {
                 let (stmt, ended_block) = self.simple_stmt()?;
@@ -169,6 +177,12 @@ impl Parser {
                 let exc = self.expr()?;
                 let cause = if self.eat(&Tok::From) { Some(self.expr()?) } else { None };
                 Ok((mk(StmtKind::Raise { exc: Some(exc), cause }), false))
+            }
+            Tok::Assert => {
+                self.advance();
+                let cond = self.expr()?;
+                let msg = if self.eat(&Tok::Comma) { Some(self.expr()?) } else { None };
+                Ok((mk(StmtKind::Assert { cond, msg }), false))
             }
             Tok::Global => {
                 self.advance();

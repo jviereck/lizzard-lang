@@ -113,6 +113,8 @@ opcodes! {
     NotIn { dst: Reg, a: Reg, b: Reg } => sem::not_contains;
 
     Jump { target: u32 } => sem::jump;
+    /// Loop back-edge: a safepoint, then a jump.
+    Loop { target: u32 } => sem::loop_;
     JumpIfFalse { cond: Reg, target: u32 } => sem::jump_if_false;
     JumpIfTrue { cond: Reg, target: u32 } => sem::jump_if_true;
 

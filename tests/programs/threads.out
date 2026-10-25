@@ -1,0 +1,10 @@
+joined total 40000 counter 40000
+got item 0
+got item 1
+got item 2
+got item 3
+got item 4
+join raised: thread failed
+parallel sum 7998000 True
+rc-audit: ok
+[exit 0]

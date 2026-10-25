@@ -22,6 +22,7 @@ pub fn check(th: &Thread, v: Value, t: &TypeDesc) -> bool {
             v.body(),
             Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_))
         ),
+        TypeDesc::Builtin(n) => v.is_ptr() && v.type_name() == *n,
         TypeDesc::Option(inner) => v == Value::NONE || check(th, v, inner),
         TypeDesc::Global(idx, _) => {
             let target = th.vm.global(*idx);

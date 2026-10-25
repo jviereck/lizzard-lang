@@ -1,34 +1,78 @@
-//! Reference-counting bookkeeping.
+//! Reference-counting bookkeeping and epoch-based reclamation.
 //!
 //! A decrement never frees inline: objects whose count reaches zero are queued
 //! on the current thread's pending-free list, and references released from
 //! shared memory (fields, elements, globals) are queued as *deferred*
-//! decrements that only apply once no borrow taken before them can still be
-//! live (borrow pins). `Vm::rc_run` drains both queues at a time the program
-//! chooses.
+//! decrements. Both kinds of entries are stamped with the global epoch.
+//! `Thread::rc_run` processes only entries older than the *horizon*: the
+//! minimum, over all threads, of the epoch at each thread's last safepoint and
+//! of its oldest borrow pin. A thread holds no unpinned borrows of shared
+//! memory at a safepoint (function entry, loop back-edge), so no borrow can
+//! observe an entry that is past the horizon.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::object::Obj;
 use crate::value::Value;
 
-/// Global epoch, advanced whenever deferred decrements are queued.
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static LIVE_OBJECTS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Default)]
-struct RcState {
-    pending: VecDeque<*mut Obj>,
-    /// (epoch, value) of decrements waiting for the grace period.
+const OFFLINE: u64 = u64::MAX;
+
+/// Per-thread record visible to other threads.
+pub struct ThreadRec {
+    /// Epoch observed at the last safepoint, or `OFFLINE` while blocked.
+    quiescent: AtomicU64,
+    /// Oldest active borrow pin, or `u64::MAX`.
+    min_pin: AtomicU64,
+}
+
+static THREADS: Mutex<Vec<Arc<ThreadRec>>> = Mutex::new(Vec::new());
+
+/// Queue entries left behind by threads that exited.
+struct Orphans {
+    pending: Vec<(u64, usize)>,
     deferred: Vec<(u64, Value)>,
-    /// Epochs at which currently active borrow pins were taken.
+}
+
+static ORPHANS: Mutex<Orphans> = Mutex::new(Orphans { pending: Vec::new(), deferred: Vec::new() });
+
+struct RcState {
+    rec: Arc<ThreadRec>,
+    pending: VecDeque<(u64, *mut Obj)>,
+    deferred: Vec<(u64, Value)>,
     pins: Vec<u64>,
+    cascade: Vec<*mut Obj>,
+    in_cascade: bool,
+}
+
+impl RcState {
+    fn new() -> RcState {
+        let rec = Arc::new(ThreadRec {
+            quiescent: AtomicU64::new(EPOCH.load(Ordering::SeqCst)),
+            min_pin: AtomicU64::new(u64::MAX),
+        });
+        THREADS.lock().unwrap().push(rec.clone());
+        RcState { rec, pending: VecDeque::new(), deferred: Vec::new(), pins: Vec::new(), cascade: Vec::new(), in_cascade: false }
+    }
+}
+
+impl Drop for RcState {
+    fn drop(&mut self) {
+        THREADS.lock().unwrap().retain(|r| !Arc::ptr_eq(r, &self.rec));
+        let mut o = ORPHANS.lock().unwrap();
+        o.pending.extend(self.pending.drain(..).map(|(e, p)| (e, p as usize)));
+        o.pending.extend(self.cascade.drain(..).map(|p| (0, p as usize)));
+        o.deferred.append(&mut self.deferred);
+    }
 }
 
 thread_local! {
-    static RC: RefCell<RcState> = RefCell::new(RcState::default());
+    static RC: RefCell<RcState> = RefCell::new(RcState::new());
 }
 
 pub(crate) fn note_alloc() {
@@ -44,20 +88,29 @@ pub fn live_objects() -> u64 {
     LIVE_OBJECTS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn enqueue_free(p: *mut Obj) {
-    let _ = RC.try_with(|rc| rc.borrow_mut().pending.push_back(p));
+fn epoch() -> u64 {
+    EPOCH.load(Ordering::SeqCst)
 }
 
-/// Releases a reference that was held in shared memory. The decrement is
-/// applied by `rc_run` after every borrow pin older than now has ended.
+pub(crate) fn enqueue_free(p: *mut Obj) {
+    let e = epoch();
+    let _ = RC.try_with(|rc| {
+        let mut rc = rc.borrow_mut();
+        if rc.in_cascade {
+            rc.cascade.push(p);
+        } else {
+            rc.pending.push_back((e, p));
+        }
+    });
+}
+
+/// Releases a reference that was held in shared memory; the decrement is
+/// applied by `rc_run` once no borrow taken before now can be live.
 pub fn defer_decref(v: Value) {
-    if !v.is_ptr() {
+    if !v.is_ptr() || v.obj().is_some_and(|o| o.is_immortal()) {
         return;
     }
-    if v.obj().is_some_and(|o| o.is_immortal()) {
-        return;
-    }
-    let e = EPOCH.fetch_add(1, Ordering::Relaxed);
+    let e = epoch();
     let _ = RC.try_with(|rc| rc.borrow_mut().deferred.push((e, v)));
 }
 
@@ -69,45 +122,118 @@ pub fn autorelease(v: Value) -> Value {
     v
 }
 
-/// Pins the current epoch: deferred decrements queued from now on are not
-/// applied until the pin is released.
+/// Marks a safepoint: the thread holds no unpinned borrows of shared memory.
+#[inline]
+pub fn safepoint() {
+    let _ = RC.try_with(|rc| rc.borrow().rec.quiescent.store(epoch(), Ordering::SeqCst));
+}
+
+/// The thread is about to block (join, lock, channel): it cannot touch
+/// shared memory until `online`.
+pub fn offline() {
+    let _ = RC.try_with(|rc| rc.borrow().rec.quiescent.store(OFFLINE, Ordering::SeqCst));
+}
+
+pub fn online() {
+    safepoint();
+}
+
+/// Pins the epoch of the thread's last safepoint for the duration of a call
+/// that receives borrows of shared memory.
 pub fn pin() {
-    let e = EPOCH.load(Ordering::Relaxed);
-    RC.with(|rc| rc.borrow_mut().pins.push(e));
+    RC.with(|rc| {
+        let mut rc = rc.borrow_mut();
+        let q = rc.rec.quiescent.load(Ordering::SeqCst);
+        rc.pins.push(q);
+        let m = rc.pins[0];
+        rc.rec.min_pin.store(m, Ordering::SeqCst);
+    });
 }
 
 pub fn unpin() {
     RC.with(|rc| {
-        rc.borrow_mut().pins.pop();
+        let mut rc = rc.borrow_mut();
+        rc.pins.pop();
+        let m = rc.pins.first().copied().unwrap_or(u64::MAX);
+        rc.rec.min_pin.store(m, Ordering::SeqCst);
     });
 }
 
-/// Removes and returns the deferred decrements whose grace period passed.
-pub(crate) fn take_ready_deferred() -> Vec<Value> {
-    RC.with(|rc| {
-        let mut rc = rc.borrow_mut();
-        let horizon = rc.pins.first().copied().unwrap_or(u64::MAX);
-        if horizon == u64::MAX {
-            return rc.deferred.drain(..).map(|(_, v)| v).collect();
-        }
-        let mut ready = Vec::new();
-        rc.deferred.retain(|&(e, v)| {
-            if e < horizon {
-                ready.push(v);
+/// Entries stamped before this epoch can be processed.
+fn horizon() -> u64 {
+    let threads = THREADS.lock().unwrap();
+    threads
+        .iter()
+        .map(|r| r.quiescent.load(Ordering::SeqCst).min(r.min_pin.load(Ordering::SeqCst)))
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+/// Starts an `rc_run`: advances the epoch, marks a safepoint and returns
+/// the horizon for this run.
+pub(crate) fn begin_run() -> u64 {
+    EPOCH.fetch_add(1, Ordering::SeqCst);
+    safepoint();
+    horizon()
+}
+
+/// Removes the deferred decrements whose grace period passed.
+pub(crate) fn take_deferred(h: u64) -> Vec<Value> {
+    let mut decs = Vec::new();
+    {
+        let mut o = ORPHANS.lock().unwrap();
+        o.deferred.retain(|&(e, v)| {
+            if e < h {
+                decs.push(v);
                 false
             } else {
                 true
             }
         });
-        ready
-    })
+    }
+    RC.with(|rc| {
+        rc.borrow_mut().deferred.retain(|&(e, v)| {
+            if e < h {
+                decs.push(v);
+                false
+            } else {
+                true
+            }
+        });
+    });
+    decs
 }
 
-pub(crate) fn pop_pending() -> Option<*mut Obj> {
-    RC.with(|rc| rc.borrow_mut().pending.pop_front())
+/// While set, objects reaching zero are children of an object being freed:
+/// they were only reachable through it and are freed in the same run.
+pub(crate) fn set_cascade(on: bool) {
+    RC.with(|rc| rc.borrow_mut().in_cascade = on);
 }
 
-/// Objects queued for freeing plus deferred decrements.
+/// Pops the next object that can be freed in a run with horizon `h`.
+pub(crate) fn pop_ready(h: u64) -> Option<*mut Obj> {
+    let local = RC.with(|rc| {
+        let mut rc = rc.borrow_mut();
+        if let Some(p) = rc.cascade.pop() {
+            return Some(p);
+        }
+        match rc.pending.front() {
+            Some(&(e, p)) if e < h => {
+                rc.pending.pop_front();
+                Some(p)
+            }
+            _ => None,
+        }
+    });
+    if local.is_some() {
+        return local;
+    }
+    let mut o = ORPHANS.lock().unwrap();
+    let i = o.pending.iter().position(|&(e, _)| e < h)?;
+    Some(o.pending.swap_remove(i).1 as *mut Obj)
+}
+
+/// Objects queued for freeing plus deferred decrements on this thread.
 pub fn pending_count() -> usize {
     RC.with(|rc| {
         let rc = rc.borrow();
@@ -115,9 +241,12 @@ pub fn pending_count() -> usize {
     })
 }
 
+/// Total entries still queued anywhere (this thread and exited threads).
+pub fn total_pending() -> usize {
+    let o = ORPHANS.lock().unwrap();
+    pending_count() + o.pending.len() + o.deferred.len()
+}
+
 pub(crate) fn has_ready_work() -> bool {
-    RC.with(|rc| {
-        let rc = rc.borrow();
-        !rc.pending.is_empty() || (!rc.deferred.is_empty() && rc.pins.is_empty())
-    })
+    pending_count() > 0
 }

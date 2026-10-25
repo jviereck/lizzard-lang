@@ -144,6 +144,7 @@ fn resume_inner(th: &mut Thread, g: &Generator, sent: Value, throw: Option<Value
         return Err(th.raise("RecursionError", "maximum recursion depth exceeded"));
     }
     th.depth += 1;
+    crate::rc::safepoint();
     let mut frame = Frame {
         regs: regs.as_mut_ptr(),
         code: std::sync::Arc::as_ptr(&func.code),

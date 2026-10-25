@@ -297,6 +297,11 @@ pub fn jump<B: Backend>(b: &mut B, target: u32) -> Flow<()> {
     b.jump(target)
 }
 
+pub fn loop_<B: Backend>(b: &mut B, target: u32) -> Flow<()> {
+    b.frame_op(h::f_safepoint, 0, 0, 0, 0)?;
+    b.jump(target)
+}
+
 pub fn jump_if_false<B: Backend>(b: &mut B, cond: Reg, target: u32) -> Flow<()> {
     let v = b.reg(cond);
     let t = truthy(b, v)?;

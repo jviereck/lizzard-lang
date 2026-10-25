@@ -1,0 +1,15 @@
+drop w0
+drop w1
+after while, freed 7
+drop a1
+drop b2
+after for, freed 6
+drop moved
+after range, freed 3
+drop w2
+drop c3
+drop again 1
+drop again 0
+end, freed 8
+rc-audit: ok
+[exit 0]

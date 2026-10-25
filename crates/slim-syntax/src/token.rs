@@ -44,6 +44,8 @@ pub enum Tok {
     False,
     Global,
     Del,
+    With,
+    Assert,
 
     // punctuation
     LParen,
@@ -126,6 +128,8 @@ impl Tok {
             "False" => Tok::False,
             "global" => Tok::Global,
             "del" => Tok::Del,
+            "with" => Tok::With,
+            "assert" => Tok::Assert,
             _ => return None,
         })
     }
@@ -168,6 +172,8 @@ impl fmt::Display for Tok {
             Tok::False => "`False`",
             Tok::Global => "`global`",
             Tok::Del => "`del`",
+            Tok::With => "`with`",
+            Tok::Assert => "`assert`",
             Tok::LParen => "`(`",
             Tok::RParen => "`)`",
             Tok::LBracket => "`[`",

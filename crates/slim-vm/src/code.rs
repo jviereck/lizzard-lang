@@ -22,6 +22,8 @@ pub enum TypeDesc {
     List,
     Dict,
     Function,
+    /// A builtin object type checked by name (`Lock`, `Channel`, `Thread`).
+    Builtin(String),
     /// A class or trait bound to a module-level name (resolved at check time).
     Global(u32, String),
     Option(Box<TypeDesc>),
@@ -41,6 +43,7 @@ impl fmt::Display for TypeDesc {
             TypeDesc::List => f.write_str("list"),
             TypeDesc::Dict => f.write_str("dict"),
             TypeDesc::Function => f.write_str("function"),
+            TypeDesc::Builtin(n) => f.write_str(n),
             TypeDesc::Global(_, n) => f.write_str(n),
             TypeDesc::Option(t) => write!(f, "Option<{t}>"),
         }

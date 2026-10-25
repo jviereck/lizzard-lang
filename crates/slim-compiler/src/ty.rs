@@ -28,6 +28,8 @@ pub enum Ty {
     Iter,
     Instance(String),
     Trait(String),
+    /// A builtin object type (`Lock`, `Channel`, `Thread`): a move type.
+    Opaque(String),
     /// A class object (immortal, copied freely).
     Class(String),
     Option(Box<Ty>),
@@ -78,7 +80,7 @@ impl Ty {
             Ty::Func | Ty::StaticFn => "function".into(),
             Ty::Generator => "generator".into(),
             Ty::Iter => "iterator".into(),
-            Ty::Instance(c) | Ty::Trait(c) => c.clone(),
+            Ty::Instance(c) | Ty::Trait(c) | Ty::Opaque(c) => c.clone(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Option(t) => format!("Option<{}>", t.name()),
         }
@@ -114,6 +116,7 @@ pub fn resolve(
                 "dict" => no_args(Ty::Dict, TypeDesc::Dict),
                 "function" | "Callable" | "Fn" => no_args(Ty::Func, TypeDesc::Function),
                 "any" | "Any" => no_args(Ty::Unknown, TypeDesc::Any),
+                "Lock" | "Channel" | "Thread" => no_args(Ty::Opaque(n.clone()), TypeDesc::Builtin(n.clone())),
                 "Option" => {
                     if args.len() != 1 {
                         return Err("`Option` takes exactly one type argument: `Option<T>`".into());

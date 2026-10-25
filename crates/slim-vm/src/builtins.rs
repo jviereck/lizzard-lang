@@ -69,7 +69,7 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
             keys.iter().for_each(|x| x.incref());
             Ok(items_iter(keys))
         }
-        Some(Body::Iter(_)) | Some(Body::Generator(_)) => {
+        Some(Body::Iter(_)) | Some(Body::Generator(_)) | Some(Body::Channel(_)) => {
             v.incref();
             Ok(v)
         }
@@ -155,6 +155,7 @@ pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
             }
         }
         Some(Body::Generator(_)) => generator::resume(th, it, Value::NONE, None),
+        Some(Body::Channel(_)) => Ok(crate::threads::recv(it)),
         _ => Err(th.raise("TypeError", format!("'{}' object is not an iterator", it.type_name()))),
     }
 }
@@ -390,6 +391,7 @@ fn b_len(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(Body::Tuple(t)) => t.len(),
         Some(Body::List(l)) => l.lock().unwrap().len(),
         Some(Body::Dict(d)) => d.lock().unwrap().len(),
+        Some(Body::Channel(_)) => return crate::helpers::call_simple(th, type_method(v, "__len__").unwrap(), Some(v), &[]),
         Some(Body::Instance(inst)) if inst.class().methods.contains_key("__len__") => {
             let m = inst.class().methods["__len__"];
             return helpers::call_simple(th, m, Some(v), &[]);
@@ -668,7 +670,9 @@ fn b_channel(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
     Ok(crate::threads::new_channel())
 }
 
-struct BuiltinDef {
+pub(crate) type BuiltinDefPub = BuiltinDef;
+
+pub(crate) struct BuiltinDef {
     name: &'static str,
     f: BuiltinFn,
     min: usize,
@@ -678,6 +682,12 @@ struct BuiltinDef {
 
 const fn def(name: &'static str, f: BuiltinFn, min: usize, max: usize, keep: u64) -> BuiltinDef {
     BuiltinDef { name, f, min, max, keep }
+}
+
+impl BuiltinDef {
+    pub(crate) const fn new(name: &'static str, f: BuiltinFn, min: usize, max: usize, keep: u64) -> BuiltinDef {
+        def(name, f, min, max, keep)
+    }
 }
 
 const FUNCTIONS: &[BuiltinDef] = &[
@@ -1229,6 +1239,9 @@ fn method_table() -> &'static MethodTable {
             mk(&[def("send", m_send, 2, 2, 1 << 1), def("throw", m_throw, 2, 2, 1 << 1), def("close", m_close, 1, 1, 0)]),
         );
         t.insert("any", mk(&[def("some_or", m_some_or, 2, 2, 1 << 1)]));
+        for (ty, defs) in crate::threads::methods() {
+            t.insert(ty, mk(&defs));
+        }
         t
     })
 }
@@ -1241,6 +1254,9 @@ pub fn type_method(recv: Value, name: &str) -> Option<Value> {
         Some(Body::Tuple(_)) => "tuple",
         Some(Body::Dict(_)) => "dict",
         Some(Body::Generator(_)) => "generator",
+        Some(Body::Thread(_)) => "thread",
+        Some(Body::Lock(_)) => "lock",
+        Some(Body::Channel(_)) => "channel",
         _ => "",
     };
     let t = method_table();

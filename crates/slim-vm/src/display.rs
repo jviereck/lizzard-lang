@@ -99,6 +99,9 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             out.push('}');
         }
         Body::Iter(_) => out.push_str("<iterator>"),
+        Body::Thread(_) => out.push_str("<Thread>"),
+        Body::Lock(_) => out.push_str("<Lock>"),
+        Body::Channel(_) => out.push_str("<Channel>"),
         Body::Generator(g) => out.push_str(&format!("<generator {}>", g.name())),
         Body::Trait(t) => out.push_str(&format!("<trait {}>", t.name)),
         Body::Instance(inst) => {

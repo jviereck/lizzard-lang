@@ -797,7 +797,77 @@ impl<'m> FnCtx<'m> {
                 }
                 Ok(())
             }
+            StmtKind::With { ctx, name, body } => self.with_stmt(ctx, name.as_deref(), body, s.span),
+            StmtKind::Assert { cond, msg } => {
+                // `assert c, m` == `if not c: raise AssertionError(m)`
+                let fails = self.cond_jump(cond, true)?;
+                let raise = self.jump();
+                let h = self.here();
+                for at in fails {
+                    self.patch(at, h);
+                }
+                let _ = raise;
+                let skip = self.jump();
+                let raise_at = self.here();
+                self.patch(raise, raise_at);
+                let before = self.state.clone();
+                let args: Vec<Expr> = msg.iter().cloned().collect();
+                let call = Expr {
+                    kind: ExprKind::Call(Box::new(Expr { kind: ExprKind::Name("AssertionError".into()), span: s.span }), args),
+                    span: s.span,
+                };
+                self.raise_stmt(Some(&call), None, s.span)?;
+                self.state = before;
+                let h = self.here();
+                self.patch(skip, h);
+                Ok(())
+            }
         }
+    }
+
+    /// `with ctx as name: body` ==
+    /// `t = ctx++; name = t.__enter__(); try: body finally: t.__exit__()`
+    fn with_stmt(&mut self, ctx: &Expr, name: Option<&str>, body: &Block, span: Span) -> R<()> {
+        let hidden = format!("<with {}>", self.instrs.len());
+        let reg = self.new_reg(true, Some(hidden.clone()));
+        self.locals.insert(hidden.clone(), Local { reg, kind: LocalKind::Owned, decl: None });
+        let r = self.expr(ctx)?;
+        let ty = r.ty.clone();
+        let o = if r.own == Own::Owned {
+            r
+        } else {
+            let dst = self.tmp_owned();
+            self.emit(Instr::Dup { dst, src: r.reg });
+            Res { reg: dst, own: Own::Owned, ty: ty.clone(), root: None, desc: "value".into() }
+        };
+        self.emit(Instr::Mov { dst: reg, src: o.reg });
+        self.set_var(&hidden, St::Live, ty);
+        let hname = || Box::new(Expr { kind: ExprKind::Name(hidden.clone()), span });
+        let method = |m: &str| Expr {
+            kind: ExprKind::Call(Box::new(Expr { kind: ExprKind::Attr(hname(), m.into()), span }), Vec::new()),
+            span,
+        };
+        let enter = method("__enter__");
+        match name {
+            Some(n) => {
+                let target = Expr { kind: ExprKind::Name(n.into()), span };
+                self.assign(&target, &enter, span, false)?;
+            }
+            None => {
+                let r = self.expr(&enter)?;
+                self.discard(&r);
+            }
+        }
+        let fin = Block { stmts: vec![Stmt { kind: StmtKind::Expr(method("__exit__")), span }] };
+        let t = TryExpr { body: body.clone(), handlers: Vec::new(), else_: None, finally: Some(fin) };
+        let dst = self.tmp_owned();
+        self.try_expr(&t, Some(dst))?;
+        if self.state.is_some() {
+            self.emit(Instr::Drop { reg: dst });
+            self.emit(Instr::Drop { reg });
+        }
+        self.set_st(&hidden, St::Uninit);
+        Ok(())
     }
 
     // ------------------------------------------------------------ expressions
@@ -936,7 +1006,15 @@ impl<'m> FnCtx<'m> {
                 let ty = self.st(n).map(|v| v.ty.clone()).unwrap_or(ty);
                 return Ok(Res { reg: dst, own: Own::Local(n.to_string()), ty, root: None, desc: format!("`{n}`") });
             }
-            self.heap_borrows += 1;
+            // Builtins, functions, classes and traits are immortal: borrowing
+            // them never needs an epoch pin.
+            let immortal = !self.m.module_vars.contains(n)
+                || self.m.funcs.contains_key(n)
+                || self.m.classes.contains_key(n)
+                || self.m.traits.contains_key(n);
+            if !immortal {
+                self.heap_borrows += 1;
+            }
             return Ok(Res { reg: dst, own: Own::Borrowed, ty, root: None, desc: format!("global `{n}`") });
         }
         Err(name_err(format!("name `{n}` is not defined"), span))
@@ -1186,7 +1264,7 @@ impl<'m> FnCtx<'m> {
                 let sent = self.tmp_owned();
                 self.emit(Instr::Yield { dst: sent, src: item });
                 self.emit(Instr::Drop { reg: sent });
-                self.emit(Instr::Jump { target: head });
+                self.emit(Instr::Loop { target: head });
                 let h = self.here();
                 self.patch(fi, h);
                 self.emit(Instr::Drop { reg: it });
@@ -1539,7 +1617,36 @@ impl<'m> FnCtx<'m> {
         Ok(ty.unwrap_or(Ty::Unknown))
     }
 
+    /// A local the loop body assigns may hold the previous iteration's value
+    /// at the head, so its reassignment must drop (a no-op on `UNINIT`/`MOVED`).
+    fn widen_loop_head(&mut self, body: &Block, target: Option<&Expr>) {
+        let mut names = Vec::new();
+        scan::assigned_names(body, &mut names);
+        if let Some(t) = target {
+            let mut wrapped = Block::default();
+            wrapped.stmts.push(Stmt {
+                kind: StmtKind::Assign { target: t.clone(), value: t.clone() },
+                span: t.span,
+            });
+            scan::assigned_names(&wrapped, &mut names);
+        }
+        for n in names {
+            if !self.locals.contains_key(&n) {
+                continue;
+            }
+            match self.st(&n).map(|v| v.st) {
+                None | Some(St::Uninit) => {
+                    let ty = self.st(&n).map(|v| v.ty.clone()).unwrap_or(Ty::Unknown);
+                    self.set_var(&n, St::MaybeUninit, ty);
+                }
+                Some(St::Moved) => self.set_st(&n, St::MaybeMoved),
+                _ => {}
+            }
+        }
+    }
+
     fn while_stmt(&mut self, cond: &Expr, body: &Block) -> R<()> {
+        self.widen_loop_head(body, None);
         let entry = self.state.clone();
         let head = self.here();
         let mark = self.mark();
@@ -1558,9 +1665,10 @@ impl<'m> FnCtx<'m> {
         let lp = self.loops.pop().unwrap();
         let end_body = join_opt(self.state.take(), lp.cont_state.clone());
         self.check_loop_moves(&entry, &end_body, body)?;
-        self.emit(Instr::Jump { target: head });
+        let back = self.here();
+        self.emit(Instr::Loop { target: head });
         for at in lp.continues {
-            self.patch(at, head);
+            self.patch(at, back);
         }
         let end = self.here();
         for at in exits.into_iter().chain(lp.breaks) {
@@ -1619,6 +1727,7 @@ impl<'m> FnCtx<'m> {
             self.discard(&src);
             self.end_stmt(mark);
         }
+        self.widen_loop_head(body, Some(target));
         let entry = self.state.clone();
         let head = self.here();
         let item = self.tmp_owned();
@@ -1638,9 +1747,10 @@ impl<'m> FnCtx<'m> {
         let lp = self.loops.pop().unwrap();
         let end_body = join_opt(self.state.take(), lp.cont_state.clone());
         self.check_loop_moves(&entry, &end_body, body)?;
-        self.emit(Instr::Jump { target: head });
+        let back = self.here();
+        self.emit(Instr::Loop { target: head });
         for at in lp.continues {
-            self.patch(at, head);
+            self.patch(at, back);
         }
         let end = self.here();
         self.patch(fi, end);
@@ -1680,6 +1790,7 @@ impl<'m> FnCtx<'m> {
             self.emit(Instr::CheckType { reg: end, ty: ti, what: w });
             self.end_stmt(mark);
         }
+        self.widen_loop_head(body, None);
         let entry = self.state.clone();
         let head = self.here();
         let t = self.tmp_owned();
@@ -1715,7 +1826,7 @@ impl<'m> FnCtx<'m> {
         self.emit(Instr::Add { dst: t2, a: counter, b: step_reg });
         self.emit(Instr::Mov { dst: counter, src: t2 });
         self.owned_used -= 1;
-        self.emit(Instr::Jump { target: head });
+        self.emit(Instr::Loop { target: head });
         let out = self.here();
         self.patch(exit, out);
         for at in lp.breaks {

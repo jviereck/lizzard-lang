@@ -1,0 +1,58 @@
+class Counter:
+    n: int
+    lock: Lock
+    def __init__(self) -> ():
+        self.n = 0
+        self.lock <- Lock()
+    def add(self, k: int) -> ():
+        with self.lock:
+            self.n += k
+
+def work(c: Counter + keep, times: int) -> int:
+    for i in range(times):
+        c.add(1)
+    times
+
+def main() -> ():
+    c = Counter()
+    threads = []
+    for i in range(4):
+        threads.append(spawn(work, c++, 10000))
+    total = 0
+    for t in threads:
+        total += t.join()
+    print("joined total", total, "counter", c.n)
+
+    # producer / consumer over a channel
+    ch = Channel()
+    def producer(out: Channel + keep, n: int) -> ():
+        for i in range(n):
+            out.send("item " + str(i))
+        out.close()
+    p = spawn(producer, ch++, 5)
+    for item in ch:
+        print("got", item)
+    p.join()
+
+    # exceptions propagate through join
+    def boom() -> int:
+        raise ValueError("thread failed")
+    t = spawn(boom)
+    try:
+        t.join()
+    except ValueError as e:
+        print("join raised:", e)
+
+    # parallel sum of independent lists
+    def psum(data: list + keep) -> int:
+        sum(data)
+    parts = []
+    for k in range(4):
+        parts.append(spawn(psum, list(range(k * 1000, (k + 1) * 1000))))
+    s = 0
+    for t in parts:
+        s += t.join()
+    print("parallel sum", s, s == sum(list(range(4000))))
+    assert s == 7998000, "bad sum"
+
+main()

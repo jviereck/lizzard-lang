@@ -66,6 +66,7 @@ pub fn run_module(th: &mut Thread, code: &Arc<Code>) -> Result<(), String> {
 
 /// Releases all globals and drains the RC queues (interpreter shutdown).
 pub fn shutdown(th: &mut Thread) {
+    threads::wait_all();
     // Immortal globals (functions, classes, builtins) stay available to
     // destructors that run during shutdown.
     for g in th.vm.globals.iter() {

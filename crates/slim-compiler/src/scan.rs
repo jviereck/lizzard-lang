@@ -60,6 +60,12 @@ fn stmt_assigned(s: &Stmt, out: &mut Vec<String>) {
         }
         StmtKind::Expr(e) => expr_assigned(e, out),
         StmtKind::Return(Some(e)) => expr_assigned(e, out),
+        StmtKind::With { name, body, .. } => {
+            if let Some(n) = name {
+                push(out, n);
+            }
+            assigned_names(body, out);
+        }
         _ => {}
     }
 }
@@ -154,7 +160,7 @@ fn visit_block_deep(b: &Block, f: &mut dyn FnMut(&Expr)) {
 }
 
 fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr), deep: bool) {
-    let mut ve = |e: &Expr, f: &mut dyn FnMut(&Expr)| visit_expr(e, f, deep);
+    let ve = |e: &Expr, f: &mut dyn FnMut(&Expr)| visit_expr(e, f, deep);
     match &s.kind {
         StmtKind::Expr(e) => ve(e, f),
         StmtKind::Assign { target, value } => {
@@ -198,6 +204,18 @@ fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr), deep: bool) {
             }
         }
         StmtKind::Del(ts) => ts.iter().for_each(|t| ve(t, f)),
+        StmtKind::With { ctx, body, .. } => {
+            ve(ctx, f);
+            for s in &body.stmts {
+                visit_stmt(s, f, deep);
+            }
+        }
+        StmtKind::Assert { cond, msg } => {
+            ve(cond, f);
+            if let Some(m) = msg {
+                ve(m, f);
+            }
+        }
         StmtKind::Def(d) if deep => {
             if let Some(b) = &d.body {
                 for s in &b.stmts {
@@ -211,7 +229,7 @@ fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr), deep: bool) {
 
 fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr), deep: bool) {
     f(e);
-    let mut v = |x: &Expr, f: &mut dyn FnMut(&Expr)| visit_expr(x, f, deep);
+    let v = |x: &Expr, f: &mut dyn FnMut(&Expr)| visit_expr(x, f, deep);
     match &e.kind {
         ExprKind::Tuple(xs) | ExprKind::List(xs) => xs.iter().for_each(|x| v(x, f)),
         ExprKind::Dict(kv) => kv.iter().for_each(|(k, x)| {

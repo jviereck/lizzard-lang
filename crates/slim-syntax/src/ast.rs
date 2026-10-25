@@ -40,6 +40,10 @@ pub enum StmtKind {
     Raise { exc: Option<Expr>, cause: Option<Expr> },
     Global(Vec<String>),
     Del(Vec<Expr>),
+    /// `with ctx [as name]: body`
+    With { ctx: Expr, name: Option<String>, body: Block },
+    /// `assert cond[, msg]`
+    Assert { cond: Expr, msg: Option<Expr> },
 }
 
 #[derive(Clone, Debug)]

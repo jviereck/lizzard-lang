@@ -158,14 +158,15 @@ impl Thread {
     /// `limit` pending objects (running `__drop__` destructors). Returns the
     /// number of objects freed.
     pub fn rc_run(&mut self, limit: Option<usize>) -> usize {
-        for v in rc::take_ready_deferred() {
+        let h = rc::begin_run();
+        for v in rc::take_deferred(h) {
             v.decref();
         }
         let mut freed = 0;
         while limit.is_none_or(|l| freed < l) {
-            let Some(p) = rc::pop_pending() else { break };
-            // SAFETY: the object's count reached zero and it is unreachable;
-            // only this thread holds the pointer.
+            let Some(p) = rc::pop_ready(h) else { break };
+            // SAFETY: the object's count reached zero, it is unreachable and
+            // its grace period passed; only this thread holds the pointer.
             let obj = unsafe { &mut *p };
             if let Body::Instance(inst) = &obj.body {
                 if let Some(&m) = inst.class().methods.get("__drop__") {
@@ -195,7 +196,9 @@ impl Thread {
                     }
                 }
             }
+            rc::set_cascade(true);
             obj.release_children();
+            rc::set_cascade(false);
             // SAFETY: allocated by `Obj::alloc` as a Box.
             drop(unsafe { Box::from_raw(p) });
             rc::note_free();
@@ -277,6 +280,7 @@ pub fn run_code(th: &mut Thread, code: &Arc<Code>, regs: &mut [Value], captures:
         return Err(th.raise("RecursionError", "maximum recursion depth exceeded"));
     }
     th.depth += 1;
+    rc::safepoint();
     let mut frame = Frame {
         regs: regs.as_mut_ptr(),
         code: Arc::as_ptr(code),

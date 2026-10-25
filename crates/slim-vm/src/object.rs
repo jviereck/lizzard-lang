@@ -35,6 +35,9 @@ pub enum Body {
     Dict(Mutex<crate::dict::Dict>),
     Iter(Mutex<crate::builtins::IterKind>),
     Generator(crate::generator::Generator),
+    Thread(crate::threads::ThreadHandle),
+    Lock(crate::threads::LockObj),
+    Channel(crate::threads::ChannelObj),
 }
 
 pub struct Function {
@@ -218,6 +221,9 @@ impl Obj {
             }
             Body::Iter(it) => it.get_mut().unwrap_or_else(|e| e.into_inner()).release(),
             Body::Generator(g) => g.release(),
+            Body::Thread(t) => t.release(),
+            Body::Channel(c) => c.release(),
+            Body::Lock(_) => {}
             Body::Int(_)
             | Body::Float(_)
             | Body::BigInt(_)
@@ -288,6 +294,9 @@ impl Value {
             Some(Body::Dict(_)) => "dict",
             Some(Body::Iter(_)) => "iterator",
             Some(Body::Generator(_)) => "generator",
+            Some(Body::Thread(_)) => "Thread",
+            Some(Body::Lock(_)) => "Lock",
+            Some(Body::Channel(_)) => "Channel",
             None => "<invalid>",
         }
         .into()
