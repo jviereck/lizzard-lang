@@ -343,3 +343,19 @@ pub trait Backend {
 - `slim run --dis file.slim` lets you inspect bytecode, with every RC op visible.
 - From M6, thread stress tests: N threads racing `<-` stores and borrowed reads on shared objects, and shared list/dict under Lock. `cargo +nightly test -Zsanitizer=thread` on the runtime.
 - In Phase B, `SLIM_JIT_DUMP=1` dumps the Cranelift IR, and benchmarks in `benches/` compare interpreter and JIT time. The JIT should be several times faster on integer and float code.
+
+## Implementation notes (Phase A as built)
+Refinements made while building milestones 1–6. Where they conflict with the sections above, these take precedence.
+- **Crates.** The runtime lives in `slim-vm` (no separate `slim-runtime` crate). The crates are `slim-syntax`, `slim-compiler`, `slim-vm` and `slim` (CLI). `slim-jit` arrives with Phase B.
+- **Minimal freeze.** Borrows freeze nothing, with one exception: a local can't be moved into a call that also borrows that same local, e.g. `f(x, x)` where the first parameter is `keep`. This is checked statically, and at runtime for dynamic calls.
+- **Epoch-gated frees.** Every free is stamped with an epoch, whether it comes from a refcount reaching 0 or a deferred decref. `rc_run` processes only entries older than the horizon, which is the minimum over threads of the last safepoint and the oldest pin.
+  - Children freed while releasing a parent cascade in the same run.
+  - Entries left by exited threads go to an orphan queue.
+- **Safepoints:** function entry, loop back-edges and generator resume. Blocking calls (join, lock acquire, channel receive) take the thread offline.
+- **Pins.** Only calls whose arguments include a heap borrow (a field, an element, or a borrowed module value) pin the epoch. Loads of immortal globals don't.
+- **`some_or`** borrows its receiver and returns either the default or a new reference (`self++`).
+- **`and` / `or`** always produce a `bool`.
+- **Generators.** Generators driven by `for` / `next` are sent `None`.
+- **New statements:** `with ctx [as name]:` (`__enter__` / `__exit__`) and `assert cond[, msg]`.
+- **Loop heads.** A local assigned in a loop body counts as "maybe initialized" at the loop head, so reassigning it drops the previous iteration's value.
+- **Module-level `def`s** are static functions (a copy type), so `f = g` is allowed.
