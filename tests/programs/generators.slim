@@ -1,0 +1,56 @@
+def count_up(n: int):
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+    return "done"
+
+for x in count_up(3):
+    print("for", x)
+
+def echo():
+    total = 0
+    while True:
+        v = yield total
+        if v is None:
+            break
+        total += v
+
+e = echo()
+print(next(e))
+print(e.send(5))
+print(e.send(10))
+
+def chain():
+    yield from count_up(2)
+    yield from ["a", "b"]
+
+print(list(chain()))
+
+def guarded():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print("generator cleanup")
+
+gg = guarded()
+print(next(gg))
+gg.close()
+
+def catcher():
+    while True:
+        try:
+            yield "waiting"
+        except ValueError as e:
+            print("generator got", repr(e))
+
+c = catcher()
+print(next(c))
+print(c.throw(ValueError("boom")))
+
+def squares(n: int):
+    for i in range(n):
+        yield i * i
+
+print(sum(squares(5)))

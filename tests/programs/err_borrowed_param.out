@@ -1,0 +1,5 @@
+  File "err_borrowed_param.slim", line 2
+        y = msg
+            ^
+OwnershipError: cannot move parameter `msg` (a borrowed `str`) into a variable; use `msg++` to create a new reference
+[exit 1]

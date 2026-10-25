@@ -1,0 +1,9 @@
+trait Shape:
+    def area(self) -> float: ...
+
+class Square(impl Shape):
+    side: float
+    def __init__(self, s: float) -> ():
+        self.side = s
+
+sq = Square(2.0)

@@ -1,0 +1,5 @@
+  File "err_move_while_borrowed.slim", line 6
+        print(both(l, l))
+                      ^
+OwnershipError: `l` is moved into this call while the same call also borrows it; pass `l++` instead
+[exit 1]

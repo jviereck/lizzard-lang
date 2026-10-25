@@ -1,0 +1,5 @@
+  File "err_loop_move.slim", line 4
+            m = l
+            ^
+OwnershipError: `l` is moved inside the loop and would be used again in the next iteration; use `l++` or reassign it before the loop repeats
+[exit 1]

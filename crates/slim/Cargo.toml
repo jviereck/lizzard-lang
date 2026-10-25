@@ -1,0 +1,9 @@
+[package]
+name = "slim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+slim-syntax = { path = "../slim-syntax" }
+slim-vm = { path = "../slim-vm" }
+slim-compiler = { path = "../slim-compiler" }

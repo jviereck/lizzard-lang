@@ -1,0 +1,5 @@
+  File "err_field_eq_move.slim", line 4
+            self.name = n
+            ^
+OwnershipError: field `name` holds a move type (`str`); use `<-` to move a value in
+[exit 1]

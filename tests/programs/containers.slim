@@ -1,0 +1,32 @@
+nums = [3, 1, 2]
+nums.append(5)
+nums.sort()
+print(nums, len(nums), nums[0], nums[-1])
+first = nums[0]
+print(first + 1)
+words = "the quick brown fox".split()
+print(words, " ".join(words).upper())
+d = {"one": 1, "two": 2}
+d["three"] = 3
+for k in d:
+    print(k, d[k])
+print(d.get("four", 0), "two" in d, len(d))
+t = (1, "a", 2.5)
+print(t, t[1])
+a, b = 1, 2
+a, b = b, a
+print(a, b)
+for i, w in enumerate(["x", "y"]):
+    print(i, w)
+pairs = [(1, "one"), (2, "two")]
+for n, name in pairs:
+    print(n, name)
+s = "hello"
+print(s[1], s.find("l"), s.replace("l", "L"), s.startswith("he"))
+items = []
+for i in range(4):
+    items.append(i * i)
+print(items, sum(items), max(items), min(items))
+big = bigint("123456789012345678901234567890")
+print(big * bigint(2))
+print(sorted([5, 3, 9]), 9 in [5, 3, 9])

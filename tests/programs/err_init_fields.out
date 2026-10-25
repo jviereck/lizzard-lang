@@ -1,0 +1,5 @@
+  File "err_init_fields.slim", line 4
+        def __init__(self, c: bool) -> ():
+        ^
+TypeError: `A.__init__` must assign field `x` on every path
+[exit 1]

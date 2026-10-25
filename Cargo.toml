@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/slim-syntax", "crates/slim-vm", "crates/slim-compiler", "crates/slim"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = 1

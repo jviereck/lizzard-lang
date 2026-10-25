@@ -1,0 +1,15 @@
+for 0
+for 1
+for 2
+0
+5
+15
+[0, 1, 'a', 'b']
+1
+generator cleanup
+waiting
+generator got ValueError('boom')
+waiting
+30
+rc-audit: ok
+[exit 0]

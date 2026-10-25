@@ -1,0 +1,5 @@
+  File "err_untyped_method.slim", line 2
+        def f(self, x) -> ():
+                    ^
+SyntaxError: parameter `x` of method `f` needs a type annotation (all method parameters must be typed)
+[exit 1]

@@ -1,0 +1,5 @@
+  File "err_none_not_option.slim", line 1
+    x: int = None
+    ^
+TypeError: `x` is declared `int` but assigned a `None`
+[exit 1]

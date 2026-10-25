@@ -1,0 +1,90 @@
+class Node:
+    value: int
+    next: Option<Node>
+    def __init__(self, v: int) -> ():
+        self.value = v
+        self.next <- None
+
+class Stack:
+    head: Option<Node>
+    size: int
+    def __init__(self) -> ():
+        self.head <- None
+        self.size = 0
+    def push(self, v: int) -> ():
+        n = Node(v)
+        old <- self.head <- None
+        n.next <- old
+        self.head <- n
+        self.size += 1
+    def peek(self) -> int:
+        if self.head is not None:
+            return self.head.value
+        -1
+
+st = Stack()
+for i in range(5):
+    st.push(i * 10)
+print(st.size, st.peek())
+
+def risky(n: int) -> int:
+    if n == 0:
+        raise ValueError("zero!")
+    100 // n
+
+r = try:
+    risky(0)
+except ValueError as e:
+    print("caught:", e)
+    -1
+print("r =", r)
+
+def lookup(d: dict, k: str) -> str:
+    try:
+        d[k]++
+    except LookupError:
+        "missing"
+    finally:
+        print("finally runs")
+
+print(lookup({"a": "A"}, "a"), lookup({"a": "A"}, "b"))
+
+def gen(n: int):
+    i = 0
+    while i < n:
+        got = yield i
+        if got is not None:
+            print("got", got)
+        i += 1
+
+for x in gen(3):
+    print("gen", x)
+
+g = gen(3)
+print(next(g))
+print(g.send("hi"))
+
+add = |a: int, b: int| a + b
+print(add(2, 3))
+report = |n: int| {
+    if n > 10:
+        print("big")
+    n * 2
+}
+print(report(20))
+
+class Res:
+    name: str
+    def __init__(self, n: str + keep) -> ():
+        self.name <- n
+    def __drop__(self) -> ():
+        print("dropping", self.name)
+
+rc_auto(False)
+def make() -> ():
+    a = Res("a")
+    b = Res("b")
+make()
+print("pending:", rc_pending())
+print("freed:", rc_run())
+print("pending:", rc_pending())

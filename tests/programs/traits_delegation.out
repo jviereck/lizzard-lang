@@ -1,0 +1,12 @@
+console: one
+console: two
+previous: one
+console: hello from default
+previous: two
+console: via trait
+previous: hello from default
+4 4
+via trait
+Service(out=Console(lines=4), last='via trait', count=4)
+rc-audit: ok
+[exit 0]

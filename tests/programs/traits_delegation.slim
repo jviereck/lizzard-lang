@@ -1,0 +1,40 @@
+trait Log:
+    def log(self, msg: str) -> (): ...
+    def hello(self) -> ():
+        self.log("hello from default")
+
+class Console(impl Log):
+    lines: int
+    def __init__(self) -> ():
+        self.lines = 0
+    def log(self, msg: str) -> ():
+        self.lines += 1
+        print("console:", msg)
+
+class Service(impl Log):
+    out: Console
+    last: Option<str>
+    count: int
+    def __init__(self, out: Console + keep) -> ():
+        self.out <- out
+        self.last <- None
+        self.count = 0
+    def log(self, msg: str) -> ():
+        self.out.log(msg)
+        old <- self.last <- Some(msg++)
+        if old is not None:
+            print("previous:", old)
+        self.count += 1
+
+def use_log(l: Log) -> ():
+    l.log("via trait")
+
+s = Service(Console())
+s.log("one")
+s.log("two")
+s.hello()
+use_log(s)
+print(s.count, s.out.lines)
+label = s.last++.some_or("none")
+print(label)
+print(s)

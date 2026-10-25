@@ -1,0 +1,15 @@
+AppError 7 app failed
+1
+lookup failed: 'z'
+cleanup
+from try
+inner caught, re-raising
+outer caught: ZeroDivisionError('integer division or modulo by zero')
+no error
+100
+RuntimeError: bad config
+tuple handler: KeyError('k')
+tuple handler: TypeError('t')
+bare handler
+rc-audit: ok
+[exit 0]

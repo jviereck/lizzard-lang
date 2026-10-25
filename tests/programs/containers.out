@@ -1,0 +1,19 @@
+[1, 2, 3, 5] 4 1 5
+2
+['the', 'quick', 'brown', 'fox'] THE QUICK BROWN FOX
+one 1
+two 2
+three 3
+0 True 3
+(1, 'a', 2.5) a
+2 1
+0 x
+1 y
+1 one
+2 two
+e 2 heLLo True
+[0, 1, 4, 9] 14 9 0
+246913578024691357802469135780
+[3, 5, 9] True
+rc-audit: ok
+[exit 0]

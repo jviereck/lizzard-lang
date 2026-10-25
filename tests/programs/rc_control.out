@@ -1,0 +1,13 @@
+after scope, pending = 3
+drop a
+freed (limit 1): 1
+drop b
+drop c
+freed rest: 2
+popped, nothing freed yet
+drop in-list
+shared still alive via r2: shared
+drop replacement
+drop shared
+rc-audit: ok
+[exit 0]

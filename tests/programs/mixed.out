@@ -1,0 +1,22 @@
+5 40
+caught: zero!
+r = -1
+finally runs
+finally runs
+A missing
+gen 0
+gen 1
+gen 2
+0
+got hi
+1
+5
+big
+40
+pending: 6
+dropping a
+dropping b
+freed: 7
+pending: 0
+rc-audit: ok
+[exit 0]

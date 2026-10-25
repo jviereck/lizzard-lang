@@ -1,0 +1,345 @@
+# slim — Python-syntax toy language with a derived Cranelift JIT
+
+## Context
+Greenfield project in `/Users/jmeivier/dev/slim_lang` (empty; rustc 1.96). The goal is a research-style VM inspired by Deegen and Druid. **Each opcode's semantics is written once**, and from that single definition we get both the interpreter and a hot-function Cranelift JIT. The transitions between them (JIT entry, OSR, deopt, exception exits, generator resume) are generated rather than hand-written.
+
+**Sequencing: language first, JIT later.**
+- Milestones 1–6 build the complete language on the interpreter, so we can see how it feels.
+- From day one, the interpreter's ops are written as generic `Backend` semantics, so the JIT (milestones 7–9) can be derived later without rewriting them.
+- Nothing Cranelift-related is built until then.
+
+**Refcounting is deterministic and user-scheduled, for realtime use.** Dropping the last reference never frees anything inline. Dead objects are queued, and `rc_run()` does the freeing and bookkeeping at a moment the program chooses.
+
+Language: Python syntax with these differences:
+- classes **without inheritance**, plus nominal **traits** (`class C(impl T1, T2)`); delegation is written by hand
+- mandatory typing for class fields and methods, with annotations checked at runtime
+- **explicit ownership**: moves, `++` for a new reference, and `+ keep` parameters, which keeps refcount traffic minimal
+- Rust-style `Option<T>` with `Some(v)` / `None`. There's no `unwrap`: you either narrow the type or call `some_or(...)`.
+- Rust-style lambdas `|x| expr` / `|x| { statements }`, where the multiline body sets its own indentation level
+- **expression-oriented like Rust**: the last line of a block is its value and an implicit `return`, and `if`/`try` blocks produce values
+- generators, Python-style exceptions, and real **no-GIL multithreading**
+
+## Language surface (v1)
+```python
+trait Log:
+    def log(self, msg: str) -> (): ...           # `...` body = required method
+
+class Console(impl Log):
+    def log(self, msg: str) -> ():               # msg is borrowed (no `keep`)
+        print(msg)
+
+class Service(impl Log):
+    out: Console                                 # all fields declared + typed
+    last: Option<str>
+    count: int                                   # stored as raw i64
+    def __init__(self, out: Console + keep) -> ():
+        self.out <- out                          # move into field; `out` now dead
+        self.last <- None
+        self.count = 0                           # copy types use plain `=`
+    def log(self, msg: str) -> ():               # hand-written delegation
+        self.out.log(msg)                        # temp borrow of a field: fine
+        old <- self.last <- Some(msg++)          # swap out old value, store new ref
+        if old is not None:                      # narrows `old` to str
+            print(old)
+        self.count += 1
+
+s = Service(Console())                           # fresh object moved into keep param
+name = "svc"
+t = name++                                       # new reference; `name` still usable
+u = name                                         # move; `name` dead from here on
+label = s.last++.some_or("none")                 # no unwrap(); some_or consumes its receiver
+
+def classify(n: int) -> str:
+    if n > 100:
+        return "huge"                            # early return still allowed
+    size = if n > 10:                            # `if` is an expression
+        "big"
+    else:
+        "small"
+    size                                         # last line = implicit return
+
+double = |x: int| x * 2
+report = |n: int| {
+    if n > 10:
+        print("big")
+    n                                            # lambda block value
+}
+```
+- **Copy types:** `int`, `bigint`, `float`, `bool`, plus `None` and `()`. They are always copied and never touch reference counts.
+  - `int` is a 64-bit integer, and overflow raises `OverflowError`.
+  - `bigint` is a separate arbitrary-precision type.
+- **Move types:** everything else, i.e. str, tuple, list, dict, instances, generators, exceptions, Thread, Lock and Channel.
+- **`Option<T>`, written like Rust.** Its values are `Some(v)` and `None`, and `None` is valid only where an `Option` is expected. There's no `unwrap()`. You get at the value in one of two ways:
+  - **Narrowing.** `if x is not None:` / `if x is None: ... else:` narrows `x` to `T` inside the branch, and so does `while x is not None:`. This works on locals and on field paths (`self.head`). Each narrowed use of a field re-checks the tag, so if a callee or another thread has cleared the field in the meantime you get an error, not a crash.
+  - **`some_or`.** `opt.some_or(default)` consumes its receiver, which makes it a `keep` call. On a field you write `self.f++.some_or(d)`. On an `Option` of a copy type it simply copies.
+- **Representation of `Option`.** `Some(v)` is represented as `v` itself, so it costs nothing, and `None` is an immediate. Nested `Option<Option<T>>` is a compile error in v1.
+- **Generic types use angle brackets** in annotations: `list<int>`, `dict<str, int>`, `Option<Node>`.
+- A function that returns nothing is declared `-> ()`.
+- **Expression-oriented blocks, like Rust:**
+  - The value of a block is the value of its last line, so the last line of a function or lambda body is an implicit `return`. Explicit `return` stays available for early exits.
+  - `if/elif/else` is an expression whose value is the last line of the branch taken. An `if` without `else` has the value `()`.
+  - `try/except/else` gives the value of the last line of the path taken, and `finally` doesn't change it.
+  - `while`, `for`, assignments, `<-` and `del` all have the value `()`.
+  - A compound expression can appear on the right-hand side of an assignment, or as the last line, using normal indented blocks: `x = if c:` followed by an indented block. The inline form `a if c else b` is also kept.
+  - In a function declared `-> ()`, the last line's value is discarded (dropped), so you never have to write a trailing `()`. For any other return type, the implicit value is type-checked like an explicit `return`.
+  - The implicit return is a move, like `return`: a last line of `self.name` (a move type) has to be written `self.name++`.
+  - In a generator, the last line's value is not implicitly returned. Only an explicit `return x` sets `StopIteration.value`.
+- **Lambdas:**
+  - `|a, b: int| expr` returns `expr`. Writing `|x| { ... }` instead allows full statements, and its value is the last line. `return` can still be used for early exits.
+  - A `{` directly after the parameter list opens a block, not a dict literal; write `|x| ({...})` to return a dict.
+  - Inside the block the lexer pushes a nested indentation context. The first non-blank line after `{` sets the base indent, the usual INDENT/DEDENT rules apply relative to it, and `}` ends the context.
+  - Parameters follow the same rules as functions: borrowed by default, with `+ keep` allowed. Captures move move-type values in (`++` a value first to keep it) and copy copy-type values.
+  - A lambda is itself a move-type object.
+- **Mandatory class typing.**
+  - Every field is declared in the class body with a type.
+  - Every method annotates all its parameters except `self`, plus its return type.
+  - `__init__` must assign every field on every path. This is checked statically, and a runtime `UNINIT` sentinel is the backstop.
+  - Annotations stay optional on free functions and locals.
+- **Runtime checks.** Annotations are checked on parameters at call entry, on return values, on annotated locals, and on field stores; a mismatch raises `TypeError`.
+  - `x: T` matches if `type(x) is T`, if T is a trait in `type(x)`'s `impl` list, or if T is `Option<U>` and x is `None` or matches U.
+  - Generics are erased: `list<int>` checks only `list`.
+- **Classes and traits.** Classes are sealed once defined (no monkeypatching, fixed slots). The parentheses after a class name may contain only `impl` trait lists.
+  - A trait method whose body is `...` is required; one with a real body is a default that gets copied into the class.
+  - A class missing a required method raises `TypeError` when it is defined.
+- **Exceptions:** `try/except/else/finally`, `raise` (which moves the exception), `raise X from Y`, `except (A, B) as e` (`e` is an owned local). Exception groups such as `LookupError` and `ArithmeticError` are built-in traits.
+- **Generators:** `yield` (which moves the value out), `yield from`, `.send()`, `.throw()`, `.close()`, `StopIteration`. `for` loops use `__iter__` / `__next__`; `__next__` returns an owned value, and a list iterator returns `++` of each element.
+- **Threads:** `spawn(f, args...)` is a `keep` call, so objects move or `++` into the thread. Built-ins `Lock` and `Channel` (`send` is `keep`).
+
+## Ownership model (compile-time checked, minimal refcounting)
+| construct | meaning | RC work |
+|---|---|---|
+| object creation | owned by the destination, rc = 1 | none |
+| `y = x` (move type) | move; `x` dead | none |
+| `y = x++` | new reference; both usable | +1 |
+| `foo.bar <- obj` | move into field; `obj` dead; old field value dropped | -1 (old, deferred) |
+| `x <- foo.bar <- y` | swap: old value moves to `x`, `y` moves in | none (atomic swap) |
+| `x = foo.bar` (move type) | **compile error**: use `++` or `<-` swap | — |
+| `foo.bar.m()`, `f(foo.bar)` to a non-keep param | temporary borrow; `foo` stays fully usable | none |
+| `f(obj)`, non-keep param | borrow; `obj` still usable | none |
+| `f(obj)`, `p: T + keep` param | move into callee; `obj` dead | none |
+| `f(obj++)` | caller keeps `obj`, callee gets a new ref | +1 |
+| `return x` / last-line value / `yield x` | move out (owned locals only; borrowed values need `++`) | none |
+| scope exit / reassignment of an owned local | drop | -1 |
+
+**Rules enforced by the compiler**
+- Locals are never borrows. A non-keep parameter is borrowed for the whole call, so it can't be moved or stored anywhere without `++`.
+- Use-after-move of a local is a compile error. The analysis is flow-sensitive; a maybe-moved local can't be used, though it can still be dropped.
+- Generator functions, nested functions and lambdas outlive the call, so their move-type parameters must be `+ keep`. Nested functions and lambdas capture by move.
+
+**Dynamic calls.** When a callee isn't known statically, the call site can't tell whether a parameter is `keep`. This is the case for first-class function values; methods on typed receivers and module-level `def`s are resolved statically. For dynamic calls:
+- the `Call` op carries an "owned args" mask
+- the callee's keep mask is compared against it at runtime
+- a moved register becomes `MOVED`, and a later use raises `OwnershipError`
+- passing a borrowed value to a keep parameter raises `OwnershipError`
+
+**Borrows freeze nothing; the only rule is that a borrow can't escape.** Memory safety comes from the runtime, so the compiler only checks that a borrow doesn't escape its expression or call:
+- it can't be bound to a local, stored, returned, yielded or captured without `++`
+- no `yield` inside an expression that holds a borrow
+
+Everything else is allowed while a borrow of `p.a.b` or `c[i]` is live. That includes reading, writing or moving `p` and `p.a`, other borrows such as `p.a.m(p.b)`, `++`, and writes from aliases or other threads. There's no hidden RC traffic anywhere in the language.
+
+**Why that's safe: every free is epoch-gated.**
+1. Every queued item is stamped with the global epoch when it's enqueued. That covers objects whose count reached 0 (whether from a local drop, a moved parent being dropped, or a swap-out followed by a drop) and every deferred decrement of an overwritten field or element.
+2. A call that receives a field or element borrow pins the thread's epoch for the duration of the call. That's one push/pop on a thread-local stack, published with a relaxed store.
+3. Borrows that don't span a call are covered by QSBR, because the thread hasn't passed a safepoint yet.
+4. `rc_run` processes only items older than every thread's oldest pin and last safepoint.
+
+The result: a borrowed object can't be freed while any borrow of it is live, even if the parent is moved and dropped by a callee, or overwritten by another thread. The borrower keeps working with the object it borrowed, a snapshot.
+
+**Cascades.** When `rc_run` frees an object, the children whose count reaches 0 are freed in the same run without waiting. They were reachable only through a parent whose grace period has already passed.
+
+**Runtime representation**
+
+### Scheduled cleanup: `rc_run()`
+A decrement never frees anything inline; it only does bookkeeping.
+
+**What a decrement does.** When a count reaches 0, the object goes onto the current thread's **pending-free queue**. This costs one atomic decrement plus one push. When a `<-` store overwrites a value in shared memory, the old value is pushed onto a **deferred-decrement queue**, stamped with the current epoch.
+
+**What `rc_run()` does.** It does all the expensive work, at a time the program chooses:
+1. It applies deferred decrements whose grace period has passed, meaning their epoch stamp is older than every thread's oldest borrow pin and last safepoint. Objects that reach 0 join the pending-free queue.
+2. It pops the pending objects whose grace period has passed. For each one it runs the class's optional `__drop__(self) -> ()` destructor, decrements the object's children (which may queue more objects, handled in the same run), and returns the memory to the allocator.
+
+**Built-ins**
+| function | effect |
+|---|---|
+| `rc_run() -> int` | Drains the queues completely and returns the number of objects freed |
+| `rc_run(limit) -> int` | Frees at most `limit` objects; the rest wait for the next call. This gives bounded pause time in realtime loops |
+| `rc_pending() -> int` | Number of queued objects |
+| `rc_auto(on: bool) -> ()` | Per-thread switch, on by default. When on, the VM calls `rc_run(N)` itself at function returns or loop back-edges once the pending count passes a threshold. Realtime threads turn it off and call `rc_run` explicitly, e.g. once per frame or tick |
+
+**Further rules**
+- **Exceptions in `__drop__`** are printed and ignored, as in Python.
+- **Thread exit** drains that thread's queues.
+- **Interpreter shutdown** runs `rc_run()` until both queues are empty.
+- **Safepoints** cross the QSBR epoch automatically. That's a single store of the current epoch, not a free, so a realtime thread still controls when frees happen.
+- **Why the grace period matters.** Epoch pins and QSBR together cover every live borrow, so a lock-free borrowed read on any thread never sees memory that `rc_run` has freed. That includes an `rc_run` called by the borrower's callee.
+- **Single-threaded programs without pins.** If a program has one thread and no pins are live, the grace period has always passed, and `rc_run` frees everything immediately.
+- Frames separate owned registers from borrow registers.
+- Registers start out `UNINIT`, and a move sets the source register to `MOVED`.
+- Dropping an `UNINIT` or `MOVED` register does nothing. Unwinding drops every owned register using a per-function bitmask, so no per-pc maps are needed.
+
+## Architecture
+
+### Cargo workspace
+| crate | contents |
+|---|---|
+| `slim-syntax` | Indentation-aware lexer with an indent-context stack (lambda `{}` blocks), `<-`, `++`, `+ keep`, `<...>` generics in type position; recursive-descent parser, AST, spans/diagnostics |
+| `slim-compiler` | Scope analysis (including lambda captures), **type/ownership checker** (moves, borrows, keep masks, definite assignment, `Option` narrowing), AST → register bytecode, exception tables, liveness, the borrow-escape check, and insertion of epoch pins |
+| `slim-runtime` | `Value`, object header + atomic RC, QSBR, classes/traits, str/tuple/list/dict/bigint/boxed float, exceptions, `Thread` state, `extern "C"` helpers |
+| `slim-vm` | `ops.rs` opcode table + **semantics written once**; `backend/mod.rs` trait; `backend/interp.rs`; dispatch loop; frames; generators |
+| `slim-jit` | `backend/jit.rs` Cranelift backend; compile-queue thread; entry/exit generation; code installation |
+| `slim` (bin) | CLI: `slim run file.slim [--jit=off\|auto\|always] [--dis]` |
+| `tests/` | Golden `.slim` programs with `.out` files (including expected compile errors), run under every JIT mode |
+
+Dependencies:
+- `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`
+- `parking_lot`, `num-bigint`
+- dev only: `loom`
+
+### Opcode table (declared once)
+A `macro_rules! opcodes { Add { dst: Reg, lhs: Reg, rhs: Reg, site: Site } ... }` in `slim-vm/src/ops.rs` generates:
+- the `Op` enum
+- the encoder and decoder
+- the disassembler
+- interpreter dispatch (`sem::add::<Interp>`)
+- JIT dispatch (`sem::add::<Jit>`)
+
+The ownership ops are ordinary opcodes, so the JIT sees every refcount operation explicitly:
+- `Move`, `Dup` (`++`), `Drop`
+- `StoreMove` (`<-`), `Swap` (`x <- f <- y`)
+- `Pin` / `Unpin` (epoch pins around calls that receive a field or element borrow)
+
+### Backend trait (the core idea)
+```rust
+type Flow<T> = Result<T, Exit>;           // Exit = Raise | Deopt | Return | Yield
+pub trait Backend {
+    type V: Copy; type Bool: Copy;
+    fn reg(&mut self, r: Reg) -> Self::V;
+    fn set_reg(&mut self, r: Reg, v: Self::V);            // JIT: write-through to frame
+    fn konst(&mut self, bits: u64) -> Self::V;
+    fn has_tag(&mut self, v: Self::V, t: Tag) -> Self::Bool;
+    fn iadd_ovf(&mut self, a: Self::V, b: Self::V) -> (Self::V, Self::Bool);
+    fn load_slot(&mut self, obj: Self::V, idx: Self::V) -> Self::V;   // atomic Acquire, borrowed
+    fn swap_slot(&mut self, obj: Self::V, idx: Self::V, v: Self::V) -> Self::V;
+    fn incref(&mut self, v: Self::V); fn decref(&mut self, v: Self::V);
+    fn ic(&mut self, s: Site) -> (Self::V, Self::V);      // interp: atomic load; JIT: iconsts from snapshot
+    fn record(&mut self, s: Site, v: Self::V);            // type feedback; JIT: no-op
+    fn if_else<T: Merge<Self>>(&mut self, c: Self::Bool,
+        t: impl FnOnce(&mut Self) -> Flow<T>, e: impl FnOnce(&mut Self) -> Flow<T>) -> Flow<T>;
+    fn speculate<T: Merge<Self>>(&mut self, s: Site, c: Self::Bool,
+        fast: impl FnOnce(&mut Self) -> Flow<T>, slow: impl FnOnce(&mut Self) -> Flow<T>) -> Flow<T>;
+    fn call<const N: usize>(&mut self, h: Helper<N>, a: [Self::V; N]) -> Flow<Self::V>;
+}
+```
+**How each backend implements it**
+- **Interpreter backend.** `V = Value`. `if_else` and `speculate` run the closures directly, so after monomorphization each op compiles to code as good as a hand-written handler.
+- **JIT backend.** `V = cranelift::Value`.
+  - `if_else` emits blocks and merges results through block params or `Variable`s.
+  - `Err` from a branch means that block is already terminated.
+  - `speculate` emits guard + deopt when feedback says the slow path is cold, and a full if/else otherwise.
+  - `call` emits a call to the `extern "C"` helper plus a check for the exception sentinel.
+
+**Rules for writing semantics**
+- **Static vs dynamic.** Operands and arg counts are plain Rust values; only runtime data is `B::V`. Loops over static counts unroll, and dynamic loops go into helpers.
+- **Restartable ops.** Every guard and deopt comes before any side effect. A debug audit checks this.
+- **Escape hatch.** Ops may be helper-only. Calls, generators, raise and containers start out that way.
+- **Inline caches.** One `AtomicU64` per site packs `(class_id, slot/method idx)`. Classes are sealed, so ICs never need invalidating, and there's no bytecode quickening.
+- **Free type facts from class typing.** Field stores are type-checked, so after an IC hit the type of a field load is known. Method parameters are checked on entry. The compiler passes these facts to the JIT, which skips the tag checks and works on raw i64/f64.
+
+### Values and memory
+- **Generic `Value` word: 64-bit pointer tagging.**
+  - Pointers are 8-aligned with low bits `000`.
+  - An `int` whose value fits in 63 bits is an immediate (low bit `1`); the rare full-width i64 is boxed. Arithmetic overflow past i64 raises `OverflowError`.
+  - `bool`, `None`, `()`, `UNINIT` and `MOVED` are `x10` immediates. `Some(v)` is just `v`.
+  - **A float is boxed when it is passed around as a generic Value.** Boxes are immutable, so copying one is a hidden incref; that's allowed because floats are a copy type.
+- **Typed storage is raw.** Fields declared `int` or `float` store a raw i64/f64 in their slot, and JIT code keeps ints and floats unboxed in machine registers. Boxing happens only at generic boundaries such as untyped locals, containers and dynamic calls.
+- **Object header:** atomic refcount with an immortal bit (classes, functions, code objects and string constants), plus a class pointer. Slots are `[AtomicU64]`: stores use Release, loads use Acquire.
+- **Thread safety without a GIL.**
+  - Deferred decrefs are gated by epochs (QSBR plus borrow pins), and only `rc_run` frees (see the cleanup section above).
+  - Field reads are lock-free borrowed loads, and they're memory-safe even while other threads write.
+  - Swaps use an atomic `swap` and need no deferral.
+  - Pending queues are per-thread vectors, so enqueueing takes no lock.
+  - list and dict take a per-object `parking_lot` lock in v1.
+  - Biased refcounting is a later option.
+- **Cycles leak in v1.** Ownership makes cycles less likely: to build one you have to write `++` explicitly.
+
+### Frames, JIT transitions, exceptions, generators
+- **Frame layout:** registers (owned and borrow sets) + pc + code pointer, shared by the interpreter and the JIT.
+- **JIT function signature:** `extern "C" fn(*mut Thread, *mut Frame, entry_pc: u32) -> ExitStatus`.
+- **Entries:** the entry block does a `br_table` over pc 0, loop headers (OSR) and yield-resume points, using the shared liveness analysis.
+- **Exits:** registers are write-through, so an exit stores only the pc and returns `Return`, `Yield`, `Raise` (exception pending in `Thread`) or `Deopt`.
+  - The interpreter resumes at that pc.
+  - Unwinding always happens in the interpreter: it reads the exception table and drops owned registers using the bitmask.
+  - Helpers never panic; they return sentinels.
+- **Exception table:** zero-cost style. `finally` is duplicated on the normal and exceptional paths.
+- **Generators:**
+  - The generator object owns its frame on the heap; move-type parameters are `keep`.
+  - Resume writes the sent value into the yield's destination register and enters at `resume_pc`.
+  - `throw` and `close` resume in the interpreter.
+  - An atomic "running" flag prevents two threads from resuming the same generator at once.
+- **Hot detection:**
+  - Relaxed atomic counters on function entry and loop back-edges.
+  - Past a threshold, the function goes to the **background compiler thread**, which owns the `JITModule`.
+  - Code is published with an `AtomicPtr` (Release), and retired code is leaked in v1.
+  - There's a native-stack recursion limit.
+
+## Milestones (each ends with all golden tests green)
+
+### Phase A: the language, on the interpreter
+1. **Front end and interpreter.**
+   - Workspace, lexer/parser (including `<-`, `++`, `+ keep`, `-> ()`, `<...>` types), compiler, opcode macro, disassembler.
+   - The `Backend` trait with only the interpreter implementation.
+   - int, bool, `()`, functions, globals, if/while/for-range, `print`, str literals.
+   - Expression-oriented blocks: implicit last-line return, `if` as an expression (including on the right-hand side of an assignment), and value-or-discard compilation modes in the code generator.
+   - A golden-test harness that includes expected compile errors.
+2. **Ownership and RC framework.**
+   - The ownership checker for locals and parameters (move, `++`, keep, use-after-move errors).
+   - `Move`/`Dup`/`Drop` ops, the per-thread pending-free and deferred-decref queues, `rc_run`/`rc_pending`/`rc_auto`, `__drop__`.
+   - A debug refcount audit.
+3. **Classes and typing.**
+   - Classes with typed slots (raw i64/f64), `<-` stores, swap, the borrow-escape check, and epoch pins with grace-gated `rc_run`.
+   - Method ICs and traits (`class C(impl T)`, required/default methods, completeness check).
+   - `Option<T>`/`Some`/`None` with narrowing and `some_or`, definite assignment in `__init__`, and runtime annotation checks.
+4. **Exceptions, core types and lambdas.**
+   - Exception tables, raise/try/finally, unwinding drops, tracebacks.
+   - str/tuple/list/dict/float/bigint.
+   - Lambdas: the lexer indent-context stack, move captures, closure objects.
+   - Dynamic-call ownership masks.
+5. **Generators.** yield/send/throw/close, `yield from`, the iterator protocol, and heap generator frames.
+6. **Threads.** `spawn`/`join`/`Lock`/`Channel`, QSBR epochs gating deferred decrefs, immortal objects. Add stress tests and `loom` tests for QSBR and `rc_run`.
+
+**Checkpoint:** use the language and revise the syntax and semantics before starting on the JIT.
+
+### Phase B: the derived JIT (later)
+7. **Spike, then the JIT backend.**
+   - Spike `cranelift-jit` on aarch64-darwin: call an `extern "C"` helper, a `br_table` multi-entry function, and `sadd_overflow`.
+   - The JIT `Backend` for the existing semantics, entering at pc 0 only.
+   - `--jit=always` differential testing: every golden test runs in both modes, and outputs must match.
+8. **Transitions.** OSR loop-header entries, generator resume entries, `Raise`/`Deopt` exits, the background compiler thread, and `AtomicPtr` installation.
+9. **Speculation.** Feedback-driven `speculate` + deopt, typed unboxed float/int paths, and benchmarks (fib, nbody, a generator pipeline, a parallel sum).
+
+## Biggest risks / mitigations
+| risk | mitigation |
+|---|---|
+| Refcount bugs across exits | RC is explicit in the bytecode; write-through registers; a debug refcount audit; Miri on the runtime, without the JIT |
+| Ownership-checker gaps, such as a borrow escaping its call or a missing pin | The escape check is expression-local and easy to test; a debug mode that poisons freed objects; stress tests where callees and other threads move, drop or overwrite the parents of live borrows |
+| The Backend abstraction leaking | Helper-only escape hatch |
+| Non-restartable ops | Guard-before-effect rule, plus a debug check |
+| ARM memory ordering | Explicit Acquire/Release; loom |
+| Scope | The differential harness stays green at every milestone |
+
+## Verification
+- `cargo test --workspace` runs:
+  - unit tests for the lexer, parser, compiler and ownership checker
+  - golden tests: every `tests/programs/*.slim` is checked against its `.out`. In Phase B the same tests also run under `--jit=always` and `--jit=auto` (low threshold).
+  - RC tests:
+    - with `rc_auto(False)`, objects stay alive until `rc_run()`
+    - `rc_run(limit)` frees at most `limit` objects
+    - `__drop__` order and output
+    - `rc_pending()` counts
+  - expression tests: implicit returns, `if`/`try` values, an `if` without `else` producing `()`, the discarded last value in a `-> ()` function, and `TypeError` on a wrongly typed implicit return
+  - negative tests: use-after-move, `x = foo.bar` without `++`/`<-`, a borrow escaping (bound, stored, returned or yielded without `++`), moving a borrowed param, missing annotations, using an `Option` without narrowing, `None` assigned to a non-Option, lambda indentation errors, `TypeError`/`OverflowError`/`OwnershipError` messages
+- A debug-build refcount audit at exit: with the immortals excluded, every non-leaked object must reach rc 0.
+- `slim run --dis file.slim` lets you inspect bytecode, with every RC op visible.
+- From M6, thread stress tests: N threads racing `<-` stores and borrowed reads on shared objects, and shared list/dict under Lock. `cargo +nightly test -Zsanitizer=thread` on the runtime.
+- In Phase B, `SLIM_JIT_DUMP=1` dumps the Cranelift IR, and benchmarks in `benches/` compare interpreter and JIT time. The JIT should be several times faster on integer and float code.

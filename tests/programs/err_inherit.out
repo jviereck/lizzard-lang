@@ -1,0 +1,5 @@
+  File "err_inherit.slim", line 4
+    class Child(impl Base):
+                     ^
+TypeError: `Base` is a class, not a trait; classes cannot inherit (use a field and delegate by hand)
+[exit 1]

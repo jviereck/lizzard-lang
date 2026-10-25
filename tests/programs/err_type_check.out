@@ -1,0 +1,7 @@
+6
+rc-audit: ok
+Traceback (most recent call last):
+  File "err_type_check.slim", line 7, in <module>
+  File "err_type_check.slim", line 1, in area
+TypeError: argument `h` of `area()` expected `int`, got `str`
+[exit 1]

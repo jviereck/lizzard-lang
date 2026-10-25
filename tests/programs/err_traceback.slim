@@ -1,0 +1,7 @@
+def inner(d: dict) -> int:
+    d["missing"]
+
+def outer() -> int:
+    inner({})
+
+outer()

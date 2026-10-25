@@ -1,0 +1,5 @@
+  File "err_missing_trait_method.slim", line 4
+    class Square(impl Shape):
+    ^
+TypeError: class `Square` implements `Shape` but does not define required method `area`
+[exit 1]
