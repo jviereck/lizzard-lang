@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/slim-syntax", "crates/slim-vm", "crates/slim-compiler", "crates/slim"]
+members = ["crates/slim-syntax", "crates/slim-vm", "crates/slim-compiler", "crates/slim", "examples/embed_geom"]
 
 [workspace.package]
 version = "0.1.0"

@@ -11,6 +11,7 @@ pub mod generator;
 pub mod helpers;
 pub mod interp;
 pub mod list;
+pub mod native;
 pub mod object;
 pub mod ops;
 pub mod rc;
@@ -29,12 +30,23 @@ pub use value::Value;
 
 /// Creates a VM whose global table has the given names (builtins are filled in).
 pub fn new_vm(global_names: Vec<String>) -> Arc<Vm> {
+    new_vm_with(global_names, &[])
+}
+
+/// Like `new_vm`; `natives` gives the values of native module items
+/// (`("geom.dot", f)`, see `native::Module::globals`).
+pub fn new_vm_with(global_names: Vec<String>, natives: &[(String, Value)]) -> Arc<Vm> {
     let next_class_id = AtomicU32::new(1);
     let (defs, builtins) = builtins::create(&next_class_id);
     let globals: Vec<AtomicU64> = global_names
         .iter()
         .map(|n| {
-            let v = defs.iter().find(|(d, _)| d == n).map(|(_, v)| *v).unwrap_or(Value::UNINIT);
+            let v = defs
+                .iter()
+                .find(|(d, _)| d == n)
+                .map(|(_, v)| *v)
+                .or_else(|| natives.iter().find(|(d, _)| d == n).map(|(_, v)| *v))
+                .unwrap_or(Value::UNINIT);
             AtomicU64::new(v.0)
         })
         .collect();

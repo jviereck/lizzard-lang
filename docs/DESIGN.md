@@ -367,7 +367,7 @@ Refinements made while building milestones 1–6. Where they conflict with the s
 - **Loop heads.** A local assigned in a loop body counts as "maybe initialized" at the loop head, so reassigning it drops the previous iteration's value.
 - **Module-level `def`s** are static functions (a copy type), so `f = g` is allowed.
 
-## Implementation notes (milestones 7–9e)
+## Implementation notes (milestones 7–10)
 - **Refcount word flags.** Bit 60 is `LOCAL` (see "Thread locality" below). Bit 63 is `IMMORTAL`. Bit 62 is `REVIVED`, set by an increment from zero: a borrow of shared memory took a new reference to an object already queued for freeing. Bit 61 is `QUEUED`: the object has a pending-free entry. When an entry's grace period has passed, `rc_run` frees it only if the count is still zero and it was not revived. A revived object waits a new grace period; a live one is dropped from the queue and is queued again when it next reaches zero.
 - **`rc::retire(ptr, free)`** frees raw memory (an old list buffer, an old dict table) after the same grace period as objects.
 - **Poison mode** (`SLIM_POISON=1`, debug builds): freed objects are overwritten and leaked, and any later refcount operation on them panics. The golden tests run in this mode.
@@ -398,3 +398,30 @@ Refinements made while building milestones 1–6. Where they conflict with the s
   - **Only storage is checked.** Parameters, return values and variables ignore locality: `def f(c: Counter)` accepts a local counter, and type arguments are inferred without it. Heap slots check it: a local value may only be stored in a local slot (a field, element or key of local type). Non-local values may go anywhere.
   - **Thread crossings reject local values:** `spawn` arguments and functions (a closure capturing a local value is local), channel sends (`Channel<T>` with a local `T` is an error), a thread's result or escaping exception (the joiner gets a `TypeError`), and module variables (a local-typed declaration is a compile error; storing a local value raises). A non-local generator cannot keep a local value across a `yield`.
   - **Freeing.** A local object only reaches zero on its own thread. When a thread exits, its queued local objects (and deferred releases of local values) are freed on that thread, without waiting for a grace period: no other thread can reach them. So destructors of local objects always run on their owner thread, which milestone 10 needs for non-`Send` Rust types.
+- **Rust bindings (10).** `crates/slim` is a library plus the CLI binary. `slim::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding layer lives in `crates/slim-vm/src/native.rs`.
+  - **Functions.** `m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| ...)` accepts any `Fn` of up to 8 arguments. A first parameter `&mut Ctx` gives access to the interpreter: `ctx.call(&func, (args,))` calls a slim function or closure, and `ctx.offline(|| ...)` runs a `Send` closure with the thread marked offline, so a long computation or a blocking wait doesn't hold back `rc_run` on other threads. A result of `Result<T, SlimError>` raises on `Err`. `SlimError::new("ZeroDivisionError", msg)` names any builtin exception class (an unknown name becomes `RuntimeError`), and an exception raised by a callback passes through unchanged when the native returns its error. A panic becomes `RuntimeError: native panic in f(): <message>`.
+  - **Conversions.** The `SlimType` trait maps each Rust type to the slim type the compiler sees. `FromSlim` converts arguments; `IntoSlim` converts results.
+    - Scalars: `i8`–`i64`, `u8`–`u64` and `usize` are range-checked, so `300` passed as a `u8` raises `OverflowError`. `f64` and `f32` accept ints too. Also `bool`, `String`, `()` and `Option<T>`.
+    - `Vec<T>` copies a `list<T>`.
+    - `Any` holds an arbitrary value.
+    - `Func` holds a callable.
+    - `ListRef<T>`, `DictRef<K, V>` and `ArrayRef<T>` are typed handles that read and write a container in place. Their type is checked once, by comparing the container's reified type (O(1)), and writes go through the container's element check.
+    - `Native<T>` holds an instance of a native class.
+  - **Static signatures.** Calls of natives are checked against the Rust signature, like calls of slim functions: "argument `#2` expects `int`, got `str`". Parameters are named `#1`, `#2`, and so on. An argument typed `any` is checked at runtime instead. `NativeFn::scalar_sig` exposes all-scalar signatures, which the JIT can use to call natives directly.
+  - **Ownership.** Native parameters always borrow; there is no `keep`. A handle (`ListRef`, `Func`, `Native<T>`, ...) holds its own counted reference, so a native may keep one past the call. Handles are `!Send`, so they stay on the interpreter thread that created them.
+  - **Classes.** `m.class::<T>("Point", |c| { c.init(...); c.method(...); c.method_mut(...); c.repr(...); })`. `init` takes the constructor's arguments and returns `T` (or `Result<T, SlimError>`). `method` gets `&T`, and `method_mut` gets `&mut T`. Instances are slim objects of type `geom.Point`. They work with `isinstance` and in annotations (after `from geom import Point`), and their Rust value is dropped when the count reaches zero. Which registration function to use depends on `T`'s auto traits:
+
+    | Registration | Requires | Behavior |
+    |---|---|---|
+    | `class` | `T: Send + Sync` | `&self` methods run concurrently from any thread; `&mut self` methods are exclusive |
+    | `class_send` | `T: Send` | every call is exclusive |
+    | `class_local` | any `T` | instances are local (`+ local`): they cannot cross threads or be stored in a non-local slot; each call also checks the owner thread (`ThreadError`) as a safety net |
+
+    Access is tracked by an atomic borrow counter on the object. A call that conflicts with a running call, such as a re-entrant `&mut self` call from a callback, raises `BorrowError`. A class registered with `c.locked()` waits instead: it goes offline and yields until the conflicting call finishes. Waiting is only useful across threads; a re-entrant conflict on one thread would never finish.
+  - **Imports.** `import geom [as g]` and `from geom import dot [as d], Point` are only allowed at module level. Before compiling, imports are resolved by an AST rewrite (`crates/slim-compiler/src/imports.rs`): every name an import binds (`dot`, `g.dot`) becomes the qualified global `geom.dot`, and the compiler registers the native signatures under those names. A function's parameters and locals shadow imported names. Redefining an imported name at module level is an error, and so is using a module as a value. Unknown modules and items are compile-time `NameError`s.
+  - **Limitations.**
+    - Native classes are not generic and cannot implement slim traits.
+    - Annotations need the class imported by name (`from m import C`); dotted type names (`m.C`) are not supported.
+    - Error messages show qualified names such as `geom.Point`.
+    - `ThreadError` cannot be reached from slim code, since a local value never reaches another thread; the check exists for misuse from Rust.
+    - A local native object that is somehow freed off its owner thread is leaked with a warning rather than dropped there. There is no debug assertion for this.

@@ -14,6 +14,7 @@ use slim_vm::code::{
     Arg, ArgList, ClassSpec, Code, Ctor, ExcEntry, FieldSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
     TypeParamInfo,
 };
+use slim_vm::native::{FnSpec, ModuleSpec, NType};
 use slim_vm::object::{Body, Obj};
 use slim_vm::ops::{BinKind, Instr, StoreMode, UnKind};
 use slim_vm::Value;
@@ -74,6 +75,8 @@ impl Sig {
 }
 
 pub struct ClassInfo {
+    /// A native class whose instances are local to their thread.
+    pub local: bool,
     pub tparams: Vec<TParamSig>,
     pub fields: Vec<(String, Ty, TypeDesc)>,
     pub methods: HashMap<String, Sig>,
@@ -297,7 +300,7 @@ impl ModInfo {
             Ty::Local(_) => true,
             Ty::Instance(c, args) => {
                 args.iter().any(|a| self.is_local(a))
-                    || self.classes.get(c).is_some_and(|ci| ci.fields.iter().any(|(_, ft, _)| ft.mentions_local()))
+                    || self.classes.get(c).is_some_and(|ci| ci.local || ci.fields.iter().any(|(_, ft, _)| ft.mentions_local()))
             }
             Ty::List(x) | Ty::Iter(x) | Ty::Option(x) => self.is_local(x),
             Ty::Dict(k, v) => self.is_local(k) || self.is_local(v),
@@ -336,7 +339,51 @@ fn tparam_map<'a>(tps: &'a [TParamSig], args: &'a [Ty]) -> impl Fn(&str) -> Opti
 
 /// Compiles a parsed module. Returns the module code and the global names.
 pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<String>)> {
+    compile_module_with(module, filename, &[])
+}
+
+/// The static type of a native's parameter or result (`nested`: inside a
+/// type argument, where `any` is a type of its own).
+fn ntype_ty(t: &NType, classes: &HashMap<std::any::TypeId, String>, nested: bool) -> Ty {
+    let b = |t: &NType| Box::new(ntype_ty(t, classes, true));
+    match t {
+        NType::Int => Ty::Int,
+        NType::Float => Ty::Float,
+        NType::Bool => Ty::Bool,
+        NType::Str => Ty::Str,
+        NType::Unit => Ty::Unit,
+        NType::Any if nested => Ty::Any,
+        NType::Any => Ty::Unknown,
+        NType::Function => Ty::Func,
+        NType::List(x) => Ty::List(b(x)),
+        NType::Dict(k, v) => Ty::Dict(b(k), b(v)),
+        NType::Option(x) => Ty::Option(Box::new(ntype_ty(x, classes, nested))),
+        NType::Array(e) => Ty::Array(Some(*e)),
+        NType::Class(id) => classes.get(id).map(|n| Ty::Instance(n.clone(), Vec::new())).unwrap_or(Ty::Unknown),
+    }
+}
+
+fn native_sig(f: &FnSpec, classes: &HashMap<std::any::TypeId, String>) -> Sig {
+    let params = f
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ParamSig { name: format!("#{}", i + 1), keep: false, ty: ntype_ty(t, classes, false) })
+        .collect();
+    Sig { tparams: Vec::new(), params, ret: ntype_ty(&f.ret, classes, false) }
+}
+
+/// Compiles a module that may import the native modules `natives`.
+pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpec]) -> R<(Arc<Code>, Vec<String>)> {
+    let mut module = module.clone();
+    let used = crate::imports::resolve(&mut module, natives)?;
+    let module = &module;
     let mut globals: Vec<String> = slim_vm::builtins::names().into_iter().map(String::from).collect();
+    for m in &used {
+        for n in m.functions.iter().map(|f| &f.name).chain(m.classes.iter().map(|c| &c.name)) {
+            globals.push(format!("{}.{n}", m.name));
+        }
+    }
     let builtin_names: HashSet<String> = globals.iter().cloned().collect();
     let mut module_vars = Vec::new();
     scan::assigned_names(&module.body, &mut module_vars);
@@ -381,6 +428,26 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
         builtin_traits,
         filename: filename.into(),
     };
+    // Native classes and functions of the imported modules.
+    let mut native_names: HashMap<std::any::TypeId, String> = HashMap::new();
+    for m in &used {
+        for c in &m.classes {
+            native_names.insert(c.type_id, format!("{}.{}", m.name, c.name));
+        }
+    }
+    for m in &used {
+        for c in &m.classes {
+            let mut methods: HashMap<String, Sig> = c.methods.iter().map(|f| (f.name.clone(), native_sig(f, &native_names))).collect();
+            if let Some(init) = &c.init {
+                methods.insert("__init__".into(), native_sig(init, &native_names));
+            }
+            let ci = ClassInfo { local: c.local, tparams: Vec::new(), fields: Vec::new(), methods, impls: Vec::new() };
+            info.classes.insert(format!("{}.{}", m.name, c.name), ci);
+        }
+        for f in &m.functions {
+            info.funcs.insert(format!("{}.{}", m.name, f.name), native_sig(f, &native_names));
+        }
+    }
     let names = |tps: &[TypeParam]| tps.iter().map(|t| TParamSig { name: t.name.clone(), bounds: Vec::new() }).collect::<Vec<_>>();
     let scope_of = |tps: &[TypeParam]| tps.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect::<Vec<_>>();
     // Register class and trait names (and arities) first so annotations can
@@ -391,7 +458,7 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
                 if builtin_names.contains(&c.name) {
                     return Err(syn_err(format!("cannot redefine builtin `{}`", c.name), c.span));
                 }
-                let ci = ClassInfo { tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new() };
+                let ci = ClassInfo { local: false, tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new() };
                 info.classes.insert(c.name.clone(), ci);
             }
             StmtKind::Trait(t) => {
@@ -1325,6 +1392,8 @@ impl<'m> FnCtx<'m> {
             StmtKind::Class(c) => self.class_stmt(c),
             StmtKind::Trait(t) => self.trait_stmt(t),
             StmtKind::Raise { exc, cause } => self.raise_stmt(exc.as_ref(), cause.as_ref(), s.span),
+            // Resolved before compiling (see `imports`).
+            StmtKind::Import { .. } | StmtKind::FromImport { .. } => Ok(()),
             StmtKind::Global(names) => {
                 if self.is_module {
                     return Err(syn_err("`global` is only meaningful inside a function", s.span));

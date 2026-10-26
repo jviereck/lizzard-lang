@@ -184,6 +184,27 @@ impl Parser {
                 let msg = if self.eat(&Tok::Comma) { Some(self.expr()?) } else { None };
                 Ok((mk(StmtKind::Assert { cond, msg }), false))
             }
+            Tok::Import => {
+                self.advance();
+                let module = self.name("a module name")?.0;
+                let alias = if self.eat(&Tok::As) { Some(self.name("a name")?.0) } else { None };
+                Ok((mk(StmtKind::Import { module, alias }), false))
+            }
+            Tok::From => {
+                self.advance();
+                let module = self.name("a module name")?.0;
+                self.expect(&Tok::Import, "`import`")?;
+                let mut names = Vec::new();
+                loop {
+                    let n = self.name("a name")?.0;
+                    let alias = if self.eat(&Tok::As) { Some(self.name("a name")?.0) } else { None };
+                    names.push((n, alias));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                Ok((mk(StmtKind::FromImport { module, names }), false))
+            }
             Tok::Global => {
                 self.advance();
                 let mut names = vec![self.name("name")?.0];

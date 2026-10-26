@@ -19,7 +19,7 @@ pub fn materialize(th: &Thread, d: &TypeDesc, env: &dyn Fn(u16) -> Value) -> Res
             let v = th.vm.global(*idx);
             let args = args.iter().map(|a| materialize(th, a, env)).collect::<Result<Vec<_>, _>>()?;
             match v.body() {
-                Some(Body::Class(_)) => Ok(rtype::intern(Ctor::Class(v), &args)),
+                Some(Body::Class(_) | Body::NativeClass(_)) => Ok(rtype::intern(Ctor::Class(v), &args)),
                 Some(Body::Trait(_)) => Ok(rtype::intern(Ctor::Trait(v), &args)),
                 _ => Err(n.clone()),
             }
@@ -111,7 +111,7 @@ pub fn pre_resolve(th: &Thread, d: &TypeDesc) -> Result<TypeDesc, String> {
             let args = args.iter().map(|a| pre_resolve(th, a)).collect::<Result<_, _>>()?;
             let v = th.vm.global(*idx);
             let c = match v.body() {
-                Some(Body::Class(_)) => Ctor::Class(v),
+                Some(Body::Class(_) | Body::NativeClass(_)) => Ctor::Class(v),
                 Some(Body::Trait(_)) => Ctor::Trait(v),
                 _ => return Err(n.clone()),
             };

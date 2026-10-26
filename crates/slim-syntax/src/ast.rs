@@ -39,6 +39,10 @@ pub enum StmtKind {
     Pass,
     Raise { exc: Option<Expr>, cause: Option<Expr> },
     Global(Vec<String>),
+    /// `import module [as alias]`
+    Import { module: String, alias: Option<String> },
+    /// `from module import name [as alias], ...`
+    FromImport { module: String, names: Vec<(String, Option<String>)> },
     Del(Vec<Expr>),
     /// `with ctx [as name]: body`
     With { ctx: Expr, name: Option<String>, body: Block },

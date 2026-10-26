@@ -41,6 +41,10 @@ impl Builtins {
             .map(|(_, v)| *v)
             .unwrap_or_else(|| panic!("no builtin exception {name}"))
     }
+
+    pub fn has_class(&self, name: &str) -> bool {
+        self.classes.iter().any(|(n, _)| *n == name)
+    }
 }
 
 pub struct Vm {

@@ -1,10 +1,11 @@
 //! The slim compiler: AST to register bytecode with ownership checking.
 
 mod compiler;
+mod imports;
 mod scan;
 mod ty;
 
-pub use compiler::compile_module;
+pub use compiler::{compile_module, compile_module_with};
 
 use std::sync::Arc;
 
@@ -15,4 +16,15 @@ use slim_vm::Code;
 pub fn compile_source(src: &str, filename: &str) -> Result<(Arc<Code>, Vec<String>), slim_syntax::Error> {
     let module = slim_syntax::parse(src)?;
     compile_module(&module, filename)
+}
+
+/// Like `compile_source`, for a program that may import the native modules
+/// `natives`.
+pub fn compile_source_with(
+    src: &str,
+    filename: &str,
+    natives: &[slim_vm::native::ModuleSpec],
+) -> Result<(Arc<Code>, Vec<String>), slim_syntax::Error> {
+    let module = slim_syntax::parse(src)?;
+    compile_module_with(&module, filename, natives)
 }

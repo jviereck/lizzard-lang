@@ -104,7 +104,11 @@ fn can_be_local(c: Ctor) -> bool {
 /// class whose instances are always local.
 fn implied_local(ctor: Ctor, args: &[Value]) -> bool {
     args.iter().any(|a| as_type(*a).is_some_and(|t| t.local))
-        || matches!(ctor, Ctor::Class(c) if c.as_class().is_some_and(|c| c.always_local))
+        || matches!(ctor, Ctor::Class(c) if match c.body() {
+            Some(Body::Class(c)) => c.always_local,
+            Some(Body::NativeClass(c)) => c.mode == crate::native::Mode::Local,
+            _ => false,
+        })
 }
 
 /// `ctor<args>`, local if `explicit` (`+ local`) or if implied by its parts.
@@ -184,7 +188,11 @@ fn type_name_plain(ctor: Ctor, args: &[Value]) -> String {
         Ctor::Channel => "Channel",
         Ctor::Lock => "Lock",
         Ctor::Thread => "Thread",
-        Ctor::Class(c) => c.as_class().map(|c| c.name.as_str()).unwrap_or_default(),
+        Ctor::Class(c) => match c.body() {
+            Some(Body::Class(c)) => c.name.as_str(),
+            Some(Body::NativeClass(c)) => c.name.as_str(),
+            _ => "",
+        },
         Ctor::Trait(t) => t.as_trait().map(|t| t.name.as_str()).unwrap_or_default(),
     };
     if args.is_empty() {
@@ -211,7 +219,12 @@ pub fn subst(d: &TypeDesc, env: &[Value]) -> Option<Value> {
 
 /// The type of instances of a non-generic class.
 pub fn class_type(c: Value) -> Value {
-    *c.as_class().expect("a class").canonical.get_or_init(|| intern(Ctor::Class(c), &[]))
+    let cell = match c.body() {
+        Some(Body::Class(k)) => &k.canonical,
+        Some(Body::NativeClass(k)) => &k.canonical,
+        _ => panic!("not a class"),
+    };
+    *cell.get_or_init(|| intern(Ctor::Class(c), &[]))
 }
 
 /// The trait types a class type implements, with its type arguments
@@ -219,7 +232,7 @@ pub fn class_type(c: Value) -> Value {
 pub fn impls_of(t: &RtType) -> &[Value] {
     t.impls.get_or_init(|| {
         let Ctor::Class(c) = t.ctor else { return Box::new([]) };
-        let class = c.as_class().unwrap();
+        let Some(class) = c.as_class() else { return Box::new([]) };
         class
             .trait_args
             .iter()
@@ -433,6 +446,7 @@ pub fn type_of(v: Value) -> Value {
         }
         Some(Body::Array(a)) => prim(Ctor::Array(Some(a.elem))),
         Some(Body::Instance(i)) => i.ty,
+        Some(Body::Native(n)) => n.ty,
         Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Instantiated { .. }) => prim(Ctor::Function),
         Some(Body::Lock(_)) => prim(Ctor::Lock),
         Some(Body::Thread(_)) => prim(Ctor::Thread),
@@ -492,7 +506,11 @@ pub fn has_type(v: Value, t: &RtType) -> bool {
         ),
         Ctor::Lock => matches!(v.body(), Some(Body::Lock(_))),
         Ctor::Thread => matches!(v.body(), Some(Body::Thread(_))),
-        Ctor::Class(c) => v.as_instance().is_some_and(|i| i.class == c && (t.is_bare() || same(i.ty, t))),
+        Ctor::Class(c) => match v.body() {
+            Some(Body::Instance(i)) => i.class == c && (t.is_bare() || same(i.ty, t)),
+            Some(Body::Native(n)) => n.class == c,
+            _ => false,
+        },
         Ctor::Trait(tr) => match v.body() {
             Some(Body::Instance(i)) if t.is_bare() => i.class().implements(tr),
             Some(Body::Generator(_) | Body::Iter(_)) if t.is_bare() => tr.as_trait().is_some_and(|t| t.name == "Iterator" || t.name == "Iterable"),

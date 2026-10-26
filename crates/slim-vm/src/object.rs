@@ -69,6 +69,12 @@ pub enum Body {
     Thread(crate::threads::ThreadHandle),
     Lock(crate::threads::LockObj),
     Channel(crate::threads::ChannelObj),
+    /// A Rust function or method (immortal).
+    NativeFn(crate::native::NativeFn),
+    /// A Rust class (immortal).
+    NativeClass(crate::native::NativeClass),
+    /// An instance of a Rust class.
+    Native(crate::native::NativeObj),
 }
 
 pub struct Function {
@@ -223,6 +229,7 @@ fn body_is_local(body: &Body) -> bool {
         Body::Function(f) => f.captures.iter().any(|v| v.is_local()),
         Body::BoundMethod { recv, func } => recv.is_local() || func.is_local(),
         Body::Instantiated { func, .. } => func.is_local(),
+        Body::Native(n) => ty_local(n.ty),
         _ => false,
     }
 }
@@ -386,7 +393,8 @@ impl Obj {
             Body::Thread(t) => t.release(),
             Body::Channel(c) => c.release(),
             Body::Array(a) => a.release(),
-            Body::Lock(_) | Body::ElemType(_) | Body::Type(_) => {}
+            Body::Native(n) => n.release(),
+            Body::Lock(_) | Body::ElemType(_) | Body::Type(_) | Body::NativeFn(_) | Body::NativeClass(_) => {}
             Body::Int(_)
             | Body::Float(_)
             | Body::BigInt(_)
@@ -463,6 +471,9 @@ impl Value {
             Some(Body::Class(_)) => "class",
             Some(Body::Trait(_)) => "trait",
             Some(Body::Instance(i)) => return crate::rtype::name(i.ty).to_string(),
+            Some(Body::Native(n)) => return crate::rtype::name(n.ty).to_string(),
+            Some(Body::NativeFn(_)) => "function",
+            Some(Body::NativeClass(_)) => "class",
             Some(Body::Dict(d)) => return crate::rtype::name(d.ty).to_string(),
             Some(Body::Array(a)) => return format!("array<{}>", a.elem.name()),
             Some(Body::ElemType(_)) | Some(Body::Type(_)) => "type",

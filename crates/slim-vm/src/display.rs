@@ -94,6 +94,9 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             out.push('>');
         }
         Body::Class(c) => out.push_str(&format!("<class {}>", c.name)),
+        Body::NativeClass(c) => out.push_str(&format!("<class {}.{}>", c.module, c.name)),
+        Body::NativeFn(f) => out.push_str(&format!("<native function {}>", f.name)),
+        Body::Native(n) => out.push_str(&n.display()),
         Body::Instantiated { func, targs } => {
             out.push_str("<function ");
             if let Some(Body::Function(f)) = func.body() {

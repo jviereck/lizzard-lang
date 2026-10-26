@@ -70,6 +70,7 @@ fn keep_flags(f: Value, nargs: usize) -> Vec<bool> {
             (0..nargs).map(|i| ps.get(i).copied().unwrap_or(false)).collect()
         }
         Some(Body::Instantiated { func, .. }) => keep_flags(*func, nargs),
+        Some(Body::NativeFn(_)) | Some(Body::NativeClass(_)) => vec![false; nargs],
         Some(Body::Builtin(b)) => (0..nargs).map(|i| b.keep_mask & (1 << i) != 0).collect(),
         Some(Body::BoundMethod { func, .. }) => {
             let mut k = keep_flags(*func, nargs + 1);
@@ -95,7 +96,16 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     let fargs: Vec<Value> = args[1..].to_vec();
     if !matches!(
         f.body(),
-        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_) | Body::Instantiated { .. } | Body::Type(_))
+        Some(
+            Body::Function(_)
+                | Body::Builtin(_)
+                | Body::BoundMethod { .. }
+                | Body::Class(_)
+                | Body::Instantiated { .. }
+                | Body::Type(_)
+                | Body::NativeFn(_)
+                | Body::NativeClass(_)
+        )
     ) {
         fargs.iter().for_each(|v| v.decref());
         return Err(th.raise("TypeError", format!("spawn() needs a function, got '{}'", f.type_name())));

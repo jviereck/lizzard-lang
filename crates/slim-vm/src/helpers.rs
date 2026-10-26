@@ -78,7 +78,7 @@ fn to_big(n: &Num) -> BigInt {
     }
 }
 
-fn dead_operand(th: &mut Thread, v: Value) -> Option<Raised> {
+pub(crate) fn dead_operand(th: &mut Thread, v: Value) -> Option<Raised> {
     match v {
         Value::MOVED => Some(th.raise("OwnershipError", "use of a moved value")),
         Value::UNINIT => Some(th.raise("NameError", "use of an uninitialized value")),
@@ -879,7 +879,7 @@ pub fn invoke(
             }
             construct(th, caller, f, c, rtype::class_type(f), args)
         }
-        Some(Body::Type(t)) if matches!(t.ctor, Ctor::Class(_)) => {
+        Some(Body::Type(t)) if matches!(t.ctor, Ctor::Class(c) if c.as_class().is_some()) => {
             let Ctor::Class(cls) = t.ctor else { unreachable!() };
             let c = cls.as_class().unwrap();
             if t.args.len() != c.tparams.len() {
@@ -887,6 +887,16 @@ pub fn invoke(
             }
             construct(th, caller, cls, c, t.value(), args)
         }
+        Some(Body::NativeFn(nf)) => {
+            let mut vals = Vec::with_capacity(args.len() + 1);
+            vals.extend(self_val);
+            vals.extend(args.iter().map(|a| a.v));
+            crate::native::call(th, nf, &vals)
+        }
+        Some(Body::NativeClass(c)) => match c.init {
+            Some(init) => invoke(th, caller, init, None, None, args),
+            None => Err(th.raise("TypeError", format!("cannot create `{}` objects from slim", c.name))),
+        },
         Some(Body::Instantiated { func, targs }) => {
             let mut full: Vec<CallArg> = targs.iter().map(|t| CallArg::borrowed(*t)).collect();
             full.extend_from_slice(args);
@@ -1094,6 +1104,7 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
 pub fn lookup_method(recv: Value, name: &str) -> Option<Value> {
     match recv.body() {
         Some(Body::Instance(inst)) => inst.class().methods.get(name).copied(),
+        Some(Body::Native(n)) => n.class().methods.get(name).copied(),
         _ => crate::builtins::type_method(recv, name),
     }
 }
