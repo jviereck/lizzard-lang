@@ -54,8 +54,13 @@ pub struct RtType {
     /// container type, which stands for any container of that kind.
     pub args: Box<[Value]>,
     pub name: String,
+    /// Values of this type are confined to the thread that created them
+    /// (`+ local`, a local type argument, or a class with a local field).
+    pub local: bool,
     /// The type's own value (set when it is interned).
     this: OnceLock<Value>,
+    /// The same type with every explicit `+ local` removed.
+    base: OnceLock<Value>,
     list_of: OnceLock<Value>,
     option_of: OnceLock<Value>,
     /// For a class type: the implemented trait types (`Iterable<int>`).
@@ -78,7 +83,7 @@ impl RtType {
     }
 }
 
-type Table = RwLock<HashMap<(Ctor, Box<[u64]>), Value>>;
+type Table = RwLock<HashMap<(Ctor, Box<[u64]>, bool), Value>>;
 
 fn table() -> &'static Table {
     static T: OnceLock<Table> = OnceLock::new();
@@ -87,7 +92,26 @@ fn table() -> &'static Table {
 
 /// The unique type value for `ctor<args>`.
 pub fn intern(ctor: Ctor, args: &[Value]) -> Value {
-    let key = (ctor, args.iter().map(|a| a.0).collect::<Box<[u64]>>());
+    intern_with(ctor, args, false)
+}
+
+/// Kinds of values that can be local (objects that hold references).
+fn can_be_local(c: Ctor) -> bool {
+    matches!(c, Ctor::Any | Ctor::List | Ctor::Dict | Ctor::Option | Ctor::Tuple | Ctor::Iterator | Ctor::Function | Ctor::Class(_) | Ctor::Trait(_))
+}
+
+/// Locality implied by the parts of a type: a local type argument, or a
+/// class whose instances are always local.
+fn implied_local(ctor: Ctor, args: &[Value]) -> bool {
+    args.iter().any(|a| as_type(*a).is_some_and(|t| t.local))
+        || matches!(ctor, Ctor::Class(c) if c.as_class().is_some_and(|c| c.always_local))
+}
+
+/// `ctor<args>`, local if `explicit` (`+ local`) or if implied by its parts.
+pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
+    let implied = implied_local(ctor, args);
+    let local = can_be_local(ctor) && (explicit || implied);
+    let key = (ctor, args.iter().map(|a| a.0).collect::<Box<[u64]>>(), local);
     if let Some(v) = table().read().unwrap().get(&key) {
         return *v;
     }
@@ -98,8 +122,10 @@ pub fn intern(ctor: Ctor, args: &[Value]) -> Value {
     let v = Obj::alloc_immortal(Body::Type(RtType {
         ctor,
         args: args.into(),
-        name: type_name(ctor, args),
+        name: type_name(ctor, args, local && !implied),
+        local,
         this: OnceLock::new(),
+        base: OnceLock::new(),
         list_of: OnceLock::new(),
         option_of: OnceLock::new(),
         impls: OnceLock::new(),
@@ -109,7 +135,36 @@ pub fn intern(ctor: Ctor, args: &[Value]) -> Value {
     v
 }
 
-fn type_name(ctor: Ctor, args: &[Value]) -> String {
+/// The local version of `t` (`t + local`); `t` itself if it cannot be local.
+pub fn local_of(t: &RtType) -> Value {
+    intern_with(t.ctor, &t.args, true)
+}
+
+/// `t` without explicit locality (also in its arguments): annotations on
+/// parameters and variables compare types this way.
+pub fn base(t: &RtType) -> &'static RtType {
+    let v = *t.base.get_or_init(|| {
+        if !t.local && t.args.iter().all(|a| !as_type(*a).unwrap().local) {
+            return t.value();
+        }
+        let args: Vec<Value> = t.args.iter().map(|a| base(as_type(*a).unwrap()).value()).collect();
+        intern_with(t.ctor, &args, false)
+    });
+    as_type(v).unwrap()
+}
+
+fn type_name(ctor: Ctor, args: &[Value], show_local: bool) -> String {
+    let n = type_name_plain(ctor, args);
+    if !show_local {
+        return n;
+    }
+    match n.strip_suffix('>') {
+        Some(head) => format!("{head} + local>"),
+        None => format!("{n}<+local>"),
+    }
+}
+
+fn type_name_plain(ctor: Ctor, args: &[Value]) -> String {
     let base = match ctor {
         Ctor::Any => "any",
         Ctor::Int => "int",
@@ -149,6 +204,7 @@ pub fn subst(d: &TypeDesc, env: &[Value]) -> Option<Value> {
         }
         TypeDesc::Param(k, _) => *env.get(*k as usize)?,
         TypeDesc::Resolved(v) => *v,
+        TypeDesc::Local(t) => local_of(as_type(subst(t, env)?).unwrap()),
         TypeDesc::Global(..) => return None,
     })
 }
@@ -445,16 +501,24 @@ pub fn has_type(v: Value, t: &RtType) -> bool {
     }
 }
 
+/// `a` (a type value) is `t`, ignoring explicit locality.
 #[inline]
 fn same(a: Value, t: &RtType) -> bool {
-    as_type(a).is_some_and(|a| std::ptr::eq(a, t))
+    as_type(a).is_some_and(|a| std::ptr::eq(a, t) || std::ptr::eq(base(a), base(t)))
+}
+
+/// Whether `v` may be stored in a heap slot of type `t`: a local value only
+/// goes into a local slot.
+#[inline]
+pub fn local_ok(v: Value, t: &RtType) -> bool {
+    t.local || !v.is_local()
 }
 
 /// Converts an owned value for storage as an element of type `t`: checks it
 /// and coerces an `int` stored as a `float`. Returns `None` (leaving `v`
 /// untouched) if the value does not have the type.
 pub fn admit(v: Value, t: &RtType) -> Option<Value> {
-    if !has_type(v, t) {
+    if !has_type(v, t) || !local_ok(v, t) {
         return None;
     }
     let float_slot = match t.ctor {

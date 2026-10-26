@@ -226,7 +226,7 @@ pub fn build_dict(th: &mut Thread, ty: Value, items: Vec<Value>) -> VResult<Valu
         let checked = match (rtype::admit(k, kt), rtype::admit(v, vt)) {
             (Some(k), Some(v)) => Ok((k, v)),
             (None, _) => Err(types::key_type_error(th, k, &t.name)),
-            (Some(_), None) => Err(types::elem_error(th, v, &t.name)),
+            (Some(_), None) => Err(types::elem_error(th, v, vt, &t.name)),
         };
         let (k, v) = match checked {
             Ok(kv) => kv,
@@ -824,6 +824,9 @@ pub fn construct_type(th: &mut Thread, t: &'static RtType, args: &[Value]) -> VR
         }
         Ctor::Channel if !t.is_bare() => {
             arity(th, 0)?;
+            if t.arg(0).local {
+                return Err(th.raise("TypeError", format!("`{}`: channels connect threads and cannot carry local values", t.name)));
+            }
             Ok(crate::threads::new_channel(t.value()))
         }
         _ => Err(th.raise("TypeError", format!("type `{}` cannot be called", t.name))),
@@ -982,6 +985,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
             traits: tr,
             trait_args: Vec::new(),
             is_exception: true,
+            always_local: false,
             canonical: std::sync::OnceLock::new(),
         }));
         classes.push((*name, c));

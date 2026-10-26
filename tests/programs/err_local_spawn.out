@@ -1,0 +1,7 @@
+1
+rc-audit: ok
+Traceback (most recent call last):
+  File "err_local_spawn.slim", line 17, in <module>
+  File "err_local_spawn.slim", line 15, in main
+TypeError: spawn(): the function is local (`function`) and cannot be sent to another thread
+[exit 1]

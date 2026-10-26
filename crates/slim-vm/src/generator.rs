@@ -95,8 +95,14 @@ pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value>
         _ => unreachable!("generator of a non-function"),
     };
     f.incref();
+    // A generator holding a local argument is local itself.
+    let mut ty = crate::rtype::iterator_of(item.value());
+    let Some(Body::Function(func)) = f.body() else { unreachable!() };
+    if regs.iter().zip(func.code.owned.iter()).any(|(v, owned)| *owned && v.is_local()) || f.is_local() {
+        ty = crate::rtype::local_of(crate::rtype::as_type(ty).unwrap());
+    }
     let g = Generator {
-        ty: crate::rtype::iterator_of(item.value()),
+        ty,
         func: f,
         state: Mutex::new(GenState { regs, pc: 0, yield_dst: None, status: Status::Created, retval: Value::UNIT }),
         running: AtomicBool::new(false),
@@ -204,6 +210,25 @@ fn resume_inner(th: &mut Thread, g: &Generator, sent: Value, throw: Option<Value
     th.depth -= 1;
     match r {
         Ok(v) if frame.yielded => {
+            // A non-local generator may be resumed on another thread, so it
+            // cannot keep a local value across a `yield`.
+            let local = crate::rtype::as_type(g.ty).is_some_and(|t| t.local);
+            let held = (!local).then(|| (0..regs.len()).find(|&i| func.code.owned[i] && regs[i].is_local())).flatten();
+            if let Some(i) = held {
+                let msg = format!(
+                    "generator `{}` is not local and cannot keep local `{}` across a `yield`",
+                    func.code.name,
+                    crate::types::value_type_name(regs[i])
+                );
+                v.decref();
+                for (i, owned) in func.code.owned.iter().enumerate() {
+                    if *owned {
+                        regs[i].decref();
+                    }
+                }
+                put_back(Vec::new(), Status::Done);
+                return Err(th.raise("TypeError", msg));
+            }
             let mut st = g.state.lock().unwrap();
             st.regs = regs;
             st.pc = frame.pc;

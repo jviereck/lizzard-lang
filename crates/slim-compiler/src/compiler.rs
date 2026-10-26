@@ -209,6 +209,9 @@ impl ModInfo {
     /// bounds of type parameters in scope. Unknown types pass (the runtime
     /// checks them).
     fn satisfies(&self, t: &Ty, bound: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>) -> bool {
+        if t.mentions_local() || bound.mentions_local() {
+            return self.satisfies(&t.unlocal(), &bound.unlocal(), pb);
+        }
         let Ty::Trait(b, bargs) = bound else { return true };
         let args_match = |got: &[Ty]| bargs.is_empty() || got.len() == bargs.len() && got.iter().zip(bargs).all(|(x, y)| ty_compatible(y, x) && ty_compatible(x, y));
         let item = |it: Ty| args_match(&[it]);
@@ -251,6 +254,10 @@ impl ModInfo {
     /// dict keys are hashable.
     fn check_wf(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>, span: Span) -> R<()> {
         match t {
+            Ty::Local(x) => self.check_wf(x, pb, span),
+            Ty::Chan(x) if self.is_local(x) => {
+                Err(type_err(format!("`{}`: channels connect threads and cannot carry local values", t.name()), span))
+            }
             Ty::Instance(c, args) | Ty::Trait(c, args) => {
                 let tps = match self.classes.get(c) {
                     Some(ci) => ci.tparams.clone(),
@@ -280,6 +287,22 @@ impl ModInfo {
             Ty::List(x) | Ty::Iter(x) | Ty::Chan(x) | Ty::Option(x) | Ty::TypeVal(x) => self.check_wf(x, pb, span),
             Ty::Tuple(Some(ts)) => ts.iter().try_for_each(|a| self.check_wf(a, pb, span)),
             _ => Ok(()),
+        }
+    }
+
+    /// Whether values of type `t` are always local: it mentions `+ local` or
+    /// is an instance of a class with a local field.
+    fn is_local(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Local(_) => true,
+            Ty::Instance(c, args) => {
+                args.iter().any(|a| self.is_local(a))
+                    || self.classes.get(c).is_some_and(|ci| ci.fields.iter().any(|(_, ft, _)| ft.mentions_local()))
+            }
+            Ty::List(x) | Ty::Iter(x) | Ty::Option(x) => self.is_local(x),
+            Ty::Dict(k, v) => self.is_local(k) || self.is_local(v),
+            Ty::Tuple(Some(ts)) | Ty::Trait(_, ts) => ts.iter().any(|a| self.is_local(a)),
+            _ => false,
         }
     }
 
@@ -950,6 +973,9 @@ impl<'m> FnCtx<'m> {
     /// Whether a value of static type `v` may be used where `d` is expected
     /// (trait types are checked against the traits `v` implements).
     fn compatible(&self, d: &Ty, v: &Ty) -> bool {
+        if d.mentions_local() || v.mentions_local() {
+            return self.compatible(&d.unlocal(), &v.unlocal());
+        }
         match (d, v) {
             (Ty::Trait(..), v) if !matches!(v, Ty::Unknown | Ty::Any | Ty::NoneT) => self.satisfies(v, d),
             (Ty::Option(a), Ty::Option(b)) => self.compatible(a, b),
@@ -1005,6 +1031,9 @@ impl<'m> FnCtx<'m> {
     /// Binds type parameters `tps` in `out` by matching parameter type `p`
     /// against argument type `a`.
     fn unify(&self, p: &Ty, a: &Ty, tps: &[TParamSig], out: &mut [Option<Ty>]) {
+        if p.mentions_local() || a.mentions_local() {
+            return self.unify(&p.unlocal(), &a.unlocal(), tps, out);
+        }
         match (p, a) {
             (Ty::Param(n), _) => {
                 if let Some(k) = tps.iter().position(|t| t.name == *n) {
@@ -1063,7 +1092,7 @@ impl<'m> FnCtx<'m> {
             None => vec![None; tps.len()],
         };
         if let Some(e) = expect {
-            self.unify(&sig.ret, e, tps, &mut known);
+            self.unify(&sig.ret, &e.unlocal(), tps, &mut known);
         }
         let full = |known: &[Option<Ty>]| {
             let k = known.to_vec();
@@ -1269,6 +1298,12 @@ impl<'m> FnCtx<'m> {
                     return Err(syn_err("only simple names can be annotated", target.span));
                 };
                 let (ty, d) = self.resolve_type(ann)?;
+                if self.is_module && self.m.is_local(&ty) {
+                    return Err(type_err(
+                        format!("module variable `{n}` cannot have the local type `{}` (module variables are shared between threads)", ty.name()),
+                        ann.span(),
+                    ));
+                }
                 if let Some(l) = self.locals.get_mut(n) {
                     l.decl = Some((ty.clone(), d.clone()));
                 } else if self.is_module {
@@ -1501,7 +1536,7 @@ impl<'m> FnCtx<'m> {
     fn name_expr(&mut self, n: &str, span: Span) -> R<Res> {
         if let Some(l) = self.locals.get(n) {
             let (reg, kind) = (l.reg, l.kind);
-            let decl_ty = l.decl.as_ref().map(|d| d.0.clone());
+            let decl_ty = l.decl.as_ref().map(|d| d.0.unlocal());
             self.check_use(n, Some(reg), span)?;
             let ty = self.st(n).map(|v| v.ty.clone()).or(decl_ty).unwrap_or(Ty::Unknown);
             let own = if kind == LocalKind::Borrowed { Own::Borrowed } else { Own::Local(n.to_string()) };
@@ -1545,7 +1580,7 @@ impl<'m> FnCtx<'m> {
             return Ty::StaticFn;
         }
         if let Some((t, _)) = self.module_decl_table.get(n) {
-            return t.clone();
+            return t.unlocal();
         }
         Ty::Unknown
     }
@@ -1617,7 +1652,9 @@ impl<'m> FnCtx<'m> {
                 Ok(owned(dst, Ty::Tuple(Some(item_tys))))
             }
             ExprKind::List(items) => {
-                let ctx = match &expect {
+                // `xs: list<int + local> = [...]` builds a local list.
+                let (top_local, shape) = split_local(&expect);
+                let ctx = match shape {
                     Some(Ty::List(t)) if **t != Ty::Unknown => Some((**t).clone()),
                     _ => None,
                 };
@@ -1630,14 +1667,16 @@ impl<'m> FnCtx<'m> {
                     args.push(Arg::new(r.reg, true, false, None));
                 }
                 let elem = self.literal_elem(ctx, &tys, "list element", e.span)?;
-                let ti = self.type_idx(TypeDesc::Builtin(Ctor::List, vec![self.elem_desc(&elem)]));
+                let d = TypeDesc::Builtin(Ctor::List, vec![self.elem_desc(&elem)]);
+                let ti = self.type_idx(if top_local { TypeDesc::Local(Box::new(d)) } else { d });
                 let al = self.arglist(ArgList { args, pins: false });
                 let dst = self.tmp_owned();
                 self.emit(Instr::BuildList { dst, args: al, ty: ti });
-                Ok(owned(dst, Ty::list(elem)))
+                Ok(owned(dst, Ty::list(elem).unlocal()))
             }
             ExprKind::Dict(items) => {
-                let (kctx, vctx) = match &expect {
+                let (top_local, shape) = split_local(&expect);
+                let (kctx, vctx) = match shape {
                     Some(Ty::Dict(k, v)) => (
                         (**k != Ty::Unknown).then(|| (**k).clone()),
                         (**v != Ty::Unknown).then(|| (**v).clone()),
@@ -1659,34 +1698,51 @@ impl<'m> FnCtx<'m> {
                 let kt = self.literal_elem(kctx, &ktys, "dict key", e.span)?;
                 let vt = self.literal_elem(vctx, &vtys, "dict value", e.span)?;
                 self.m.check_wf(&Ty::dict(kt.clone(), vt.clone()), &|n| self.pbounds(n), e.span)?;
-                let ti = self.type_idx(TypeDesc::Builtin(Ctor::Dict, vec![self.elem_desc(&kt), self.elem_desc(&vt)]));
+                let d = TypeDesc::Builtin(Ctor::Dict, vec![self.elem_desc(&kt), self.elem_desc(&vt)]);
+                let ti = self.type_idx(if top_local { TypeDesc::Local(Box::new(d)) } else { d });
                 let al = self.arglist(ArgList { args, pins: false });
                 let dst = self.tmp_owned();
                 self.emit(Instr::BuildDict { dst, args: al, ty: ti });
-                Ok(owned(dst, Ty::dict(kt, vt)))
+                Ok(owned(dst, Ty::dict(kt, vt).unlocal()))
             }
-            ExprKind::TypeApp(base, targs) => {
+            ExprKind::TypeApp(base, targs, local) => {
                 let ExprKind::Name(n) = &base.kind else {
                     return Err(syn_err("type arguments (`::<...>`) follow a type name", e.span));
                 };
-                if let Some((sig, _)) = self.static_sig(base).filter(|(s, _)| !s.tparams.is_empty()) {
-                    let tys = self.explicit_targs(targs, sig.tparams.len(), n, e.span)?;
-                    for (tp, t) in sig.tparams.iter().zip(&tys) {
-                        for b in &tp.bounds {
-                            let b = b.subst(&tparam_map(&sig.tparams, &tys));
-                            if !self.satisfies(t, &b) {
-                                return Err(type_err(format!("`{}` does not implement `{}` (required by `{}` of `{n}`)", t.name(), b.name(), tp.name), e.span));
+                let generic = self.static_sig(base).filter(|(s, _)| !s.tparams.is_empty()).map(|s| s.0);
+                let is_class = self.is_global_name(n) && self.m.classes.contains_key(n);
+                if generic.is_some() || is_class {
+                    let tys = match &generic {
+                        Some(sig) => {
+                            let tys = self.explicit_targs(targs, sig.tparams.len(), n, e.span)?;
+                            for (tp, t) in sig.tparams.iter().zip(&tys) {
+                                for b in &tp.bounds {
+                                    let b = b.subst(&tparam_map(&sig.tparams, &tys));
+                                    if !self.satisfies(t, &b) {
+                                        return Err(type_err(
+                                            format!("`{}` does not implement `{}` (required by `{}` of `{n}`)", t.name(), b.name(), tp.name),
+                                            e.span,
+                                        ));
+                                    }
+                                }
                             }
+                            tys
                         }
-                    }
-                    if self.m.classes.contains_key(n) {
-                        // `Stack::<int>`: the instantiated class type.
+                        None if targs.is_empty() => Vec::new(),
+                        None => return Err(type_err(format!("`{n}` does not take type arguments"), e.span)),
+                    };
+                    if is_class {
+                        // `Stack::<int>`, `Counter::<+local>`: the class type.
                         let ty = Ty::Instance(n.clone(), tys);
+                        let ty = if *local { Ty::Local(Box::new(ty)) } else { ty };
                         let d = self.ty_desc(&ty).ok_or_else(|| type_err(format!("cannot instantiate `{}` here", ty.name()), e.span))?;
                         let dst = self.tmp_owned();
                         let ti = self.type_idx(d);
                         self.emit(Instr::MakeType { dst, ty: ti });
                         return Ok(owned(dst, Ty::TypeVal(Box::new(ty))));
+                    }
+                    if *local {
+                        return Err(type_err(format!("`+ local` modifies types; `{n}` is a function"), e.span));
                     }
                     // `first::<str>`: the function with its type arguments bound.
                     let f = self.expr(base)?;
@@ -1700,6 +1756,7 @@ impl<'m> FnCtx<'m> {
                     return Err(type_err(format!("`{n}` does not take type arguments"), e.span));
                 }
                 let te = TypeExpr::Named(n.clone(), targs.clone(), e.span);
+                let te = if *local { TypeExpr::Local(Box::new(te)) } else { te };
                 let (ty, d) = self.resolve_type(&te)?;
                 let dst = self.tmp_owned();
                 let ti = self.type_idx(d);
@@ -1968,7 +2025,7 @@ impl<'m> FnCtx<'m> {
         if let Ty::Instance(c, args) = &o.ty {
             if let Some(ci) = self.m.classes.get(c) {
                 if let Some((_, fty, _)) = ci.fields.iter().find(|(n, _, _)| n == name) {
-                    ty = fty.subst(&class_map(ci, args));
+                    ty = fty.subst(&class_map(ci, args)).unlocal();
                 } else if ci.methods.contains_key(name) {
                     ty = Ty::Func;
                 } else {
@@ -2220,7 +2277,7 @@ impl<'m> FnCtx<'m> {
             // A field path: remember the narrowed type of `base.field`.
             let (base, field) = path.split_once('.').unwrap();
             let base_ty = self.local_ty(base);
-            if let Ok(Ty::Option(inner)) = self.field_ty(&base_ty, field, Span::default()) {
+            if let Ok(Ty::Option(inner)) = self.field_ty(&base_ty, field, Span::default()).map(|t| t.unlocal()) {
                 self.set_var(name, St::Live, *inner);
             }
             return;
@@ -2763,7 +2820,7 @@ impl<'m> FnCtx<'m> {
             }
         }
         let ty = match &decl {
-            Some((dty, _)) => dty.clone(),
+            Some((dty, _)) => dty.unlocal(),
             None => v.ty.clone(),
         };
         if self.is_module || (!self.locals.contains_key(n) && self.global_decls.contains(n)) {
@@ -2884,7 +2941,9 @@ impl<'m> FnCtx<'m> {
                 ));
             }
         }
-        Ok(matches!(container, Ty::List(_)) && elem == v.ty && elem.is_precise())
+        // A move-type value may be a local object (which the VM must reject
+        // from a non-local list), so only scalars and strings are proven.
+        Ok(matches!(container, Ty::List(_)) && elem == v.ty && elem.is_precise() && elem.never_local())
     }
 
     /// The runtime descriptor that checks values of static type `t`
@@ -2917,6 +2976,7 @@ impl<'m> FnCtx<'m> {
                 Some(TypeDesc::Global(idx, c.clone(), ds.unwrap_or_default()))
             }
             Ty::Param(n) => self.tscope.iter().find(|t| t.name == *n).map(|t| TypeDesc::Param(t.reg, n.clone())),
+            Ty::Local(t) => Some(TypeDesc::Local(Box::new(self.ty_desc(t)?))),
             Ty::Option(inner) => Some(TypeDesc::option(self.ty_desc(inner)?)),
         }
     }
@@ -2951,7 +3011,7 @@ impl<'m> FnCtx<'m> {
                     self.unnarrow(base, Some(field));
                 }
                 self.discard(&o);
-                Ok(Res { reg: dst, own: Own::Owned, ty: fty, root: None, desc: "value".into() })
+                Ok(Res { reg: dst, own: Own::Owned, ty: fty.unlocal(), root: None, desc: "value".into() })
             }
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
@@ -3057,25 +3117,39 @@ impl<'m> FnCtx<'m> {
         if let ExprKind::Attr(recv, mname) = &f.kind {
             return self.method_call(recv, mname, args, expect, span);
         }
-        // `name::<types>(...)` of a user generic: the type arguments are explicit.
-        let (base, turbofish) = match &f.kind {
-            ExprKind::TypeApp(b, ts) if matches!(&b.kind, ExprKind::Name(n) if self.static_sig(b).is_some_and(|(s, _)| !s.tparams.is_empty()) && !self.m.builtin_classes.contains(n)) => {
-                (&**b, Some(ts))
+        // `name::<types>(...)` of a user class or function: the signature is
+        // the name's; the type arguments (and `+ local`) are explicit.
+        let (base, turbofish, tlocal) = match &f.kind {
+            ExprKind::TypeApp(b, ts, loc)
+                if matches!(&b.kind, ExprKind::Name(n) if self.is_global_name(n) && (self.m.classes.contains_key(n) || self.m.funcs.contains_key(n))) =>
+            {
+                (&**b, Some(ts), *loc)
             }
-            _ => (f, None),
+            _ => (f, None, false),
         };
         let sig = self.static_sig(base);
         if let Some((s, _)) = &sig {
             if !s.tparams.is_empty() {
-                return self.generic_call(base, s.clone(), turbofish.map(|v| v.as_slice()), args, expect, span);
+                return self.generic_call(base, s.clone(), turbofish.map(|v| v.as_slice()), tlocal, args, expect, span);
             }
         }
+        // `c: Counter<+local> = Counter()`: the context makes the instance local.
+        let local_ctor = match (&f.kind, &expect) {
+            (ExprKind::Name(n), Some(Ty::Local(inner))) if self.is_global_name(n) && self.m.classes.contains_key(n) => {
+                matches!(&**inner, Ty::Instance(c, _) if c == n).then(|| n.clone())
+            }
+            _ => None,
+        };
         let mut builtin = self.builtin_call_info(f);
         // `list()`, `dict()`, `Channel()` build the type the context expects.
-        let ctor_ty = match (&builtin, &expect) {
-            (Some((_, n)), Some(t @ Ty::List(e))) if n == "list" && **e != Ty::Unknown => Some(t.clone()),
-            (Some((_, n)), Some(t @ Ty::Dict(k, v))) if n == "dict" && (**k != Ty::Unknown && **v != Ty::Unknown) => Some(t.clone()),
-            (Some((_, n)), Some(t @ Ty::Chan(e))) if n == "Channel" && **e != Ty::Unknown => Some(t.clone()),
+        let shape = expect.as_ref().map(|t| match t {
+            Ty::Local(inner) => &**inner,
+            t => t,
+        });
+        let ctor_ty = match (&builtin, shape) {
+            (Some((_, n)), Some(Ty::List(e))) if n == "list" && **e != Ty::Unknown => expect.clone(),
+            (Some((_, n)), Some(Ty::Dict(k, v))) if n == "dict" && (**k != Ty::Unknown && **v != Ty::Unknown) => expect.clone(),
+            (Some((_, n)), Some(Ty::Chan(e))) if n == "Channel" && **e != Ty::Unknown => expect.clone(),
             _ => None,
         };
         if ctor_ty.is_none() {
@@ -3091,6 +3165,7 @@ impl<'m> FnCtx<'m> {
                 }
             }
         }
+        let ctor_ty = ctor_ty.or_else(|| local_ctor.map(|n| Ty::Local(Box::new(Ty::Instance(n, Vec::new())))));
         let callee = match &ctor_ty {
             Some(t) => {
                 builtin = None;
@@ -3136,8 +3211,8 @@ impl<'m> FnCtx<'m> {
         self.after_call(&al);
         self.discard(&callee);
         let mut ty = match &callee.ty {
-            Ty::TypeVal(t) => (**t).clone(),
-            _ => sig.map(|s| s.1).unwrap_or(Ty::Unknown),
+            Ty::TypeVal(t) => t.unlocal(),
+            _ => sig.map(|s| s.1.unlocal()).unwrap_or(Ty::Unknown),
         };
         if let Some((_, n)) = &builtin {
             let arg = |i: usize| arg_tys.get(i).cloned().unwrap_or(Ty::Unknown);
@@ -3198,9 +3273,23 @@ impl<'m> FnCtx<'m> {
     /// A call of a generic function or a generic class's constructor:
     /// infers the type arguments and passes them (as hidden leading
     /// arguments of a function, or as the instantiated class type).
-    fn generic_call(&mut self, f: &Expr, sig: Sig, turbofish: Option<&[TypeExpr]>, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
+    #[allow(clippy::too_many_arguments)]
+    fn generic_call(
+        &mut self,
+        f: &Expr,
+        sig: Sig,
+        turbofish: Option<&[TypeExpr]>,
+        local: bool,
+        args: &[Expr],
+        expect: Option<Ty>,
+        span: Span,
+    ) -> R<Res> {
         let ExprKind::Name(name) = &f.kind else { unreachable!() };
         let class = self.m.classes.contains_key(name);
+        let local = local || matches!(&expect, Some(Ty::Local(i)) if matches!(&**i, Ty::Instance(c, _) if c == name));
+        if local && !class {
+            return Err(type_err(format!("`+ local` modifies types; `{name}` is a function"), span));
+        }
         if sig.params.len() != args.len() {
             return Err(type_err(
                 format!("`{name}()` takes {} argument{} but {} {} given", sig.params.len(), if sig.params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }),
@@ -3237,6 +3326,7 @@ impl<'m> FnCtx<'m> {
                     ));
                 };
                 let t = Ty::Instance(name.clone(), k);
+                let t = if local { Ty::Local(Box::new(t)) } else { t };
                 let Some(d) = self.ty_desc(&t) else {
                     return Err(type_err(format!("cannot instantiate `{}` here", t.name()), span));
                 };
@@ -3253,8 +3343,8 @@ impl<'m> FnCtx<'m> {
         self.discard(&callee);
         self.reg_ty.clear();
         let ty = match callee.ty {
-            Ty::TypeVal(t) => *t,
-            _ => ret,
+            Ty::TypeVal(t) => t.unlocal(),
+            _ => ret.unlocal(),
         };
         Ok(Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() })
     }
@@ -3441,7 +3531,7 @@ impl<'m> FnCtx<'m> {
                 self.emit(Instr::Drop { reg: r.reg });
             }
             self.reg_ty.clear();
-            return Ok(Res { reg: dst, own: Own::Owned, ty: ret, root: None, desc: "value".into() });
+            return Ok(Res { reg: dst, own: Own::Owned, ty: ret.unlocal(), root: None, desc: "value".into() });
         }
         if let Some(s) = &sig {
             if s.params.len() != args.len() {
@@ -3497,7 +3587,7 @@ impl<'m> FnCtx<'m> {
             self.emit(Instr::Drop { reg: r.reg });
         }
         let ty = match (&sig, mname, &r.ty) {
-            (Some(s), _, _) => s.ret.clone(),
+            (Some(s), _, _) => s.ret.unlocal(),
             (None, "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join", Ty::Str) => Ty::Str,
             (None, "split", Ty::Str) => Ty::list(Ty::Str),
             (None, "keys", Ty::Dict(k, _)) => Ty::List(k.clone()),
@@ -3904,6 +3994,9 @@ fn join_all(tys: Vec<Ty>) -> Ty {
 }
 
 fn ty_compatible(d: &Ty, v: &Ty) -> bool {
+    if d.mentions_local() || v.mentions_local() {
+        return ty_compatible(&d.unlocal(), &v.unlocal());
+    }
     // An `Unknown` element type is "some container" (or not inferred): the
     // runtime check decides. Known element types must match exactly.
     let inv = |a: &Ty, b: &Ty| a == b || *a == Ty::Unknown || *b == Ty::Unknown;
@@ -3928,6 +4021,14 @@ fn ty_compatible(d: &Ty, v: &Ty) -> bool {
         }
         (Ty::Func, Ty::StaticFn | Ty::Class(_) | Ty::TypeVal(_)) | (Ty::StaticFn, Ty::Func) => true,
         (a, b) => a == b,
+    }
+}
+
+/// Splits an expected type into "is local" and its shape.
+fn split_local(t: &Option<Ty>) -> (bool, Option<&Ty>) {
+    match t {
+        Some(Ty::Local(inner)) => (true, Some(&**inner)),
+        t => (false, t.as_ref()),
     }
 }
 
@@ -4129,7 +4230,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         let kind = if p.keep { LocalKind::Owned } else { LocalKind::Borrowed };
         let reg = preg[i];
         ctx.locals.insert(p.name.clone(), Local { reg, kind, decl: desc.clone().map(|d| (ty.clone(), d)) });
-        state.insert(p.name.clone(), Var { st: St::Live, ty: ty.clone() });
+        state.insert(p.name.clone(), Var { st: St::Live, ty: ty.unlocal() });
         if let Some(d) = &desc {
             checks.push((reg, d.clone(), p.name.clone()));
         }

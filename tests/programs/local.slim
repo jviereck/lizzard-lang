@@ -1,0 +1,102 @@
+# Thread locality: values of `+ local` types stay on the thread that created
+# them. Parameters and variables ignore locality; heap slots and thread
+# crossings check it.
+
+class Counter:
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+    def inc(self) -> int:
+        self.n += 1
+        self.n
+
+# A class with a local field is local itself.
+class Holder:
+    c: Counter<+local>
+    def __init__(self, c: Counter<+local> + keep) -> ():
+        self.c <- c
+
+class Box<T>:
+    value: T
+    def __init__(self, value: T + keep) -> ():
+        self.value <- value
+
+def bump(c: Counter) -> int:
+    c.inc()
+
+def make() -> Counter:
+    Counter::<+local>()
+
+def ticks() -> Iterator<int>:
+    c = Counter::<+local>()
+    yield c.inc()
+    yield c.inc()
+
+def main() -> ():
+    # A local instance passes to an ordinary parameter.
+    c = Counter::<+local>()
+    print(c, bump(c), bump(c))
+
+    # The context can make a new instance or container local.
+    d: Counter<+local> = Counter()
+    h = Holder(d)
+    print(h.c.inc())
+    xs: list<Counter<+local>> = [Counter::<+local>(), Counter()]
+    xs.append(c++)
+    print(len(xs), xs[2].inc())
+    names: list<str + local> = ["a"]
+    names.append("b")
+    print(names)
+
+    # A local type argument makes a generic instance local.
+    b = Box::<Counter<+local>>(Counter::<+local>())
+    print(b.value.inc())
+
+    # Non-local slots reject local values.
+    plain: list<Counter> = []
+    plain.append(Counter())
+    try:
+        plain.append(c++)
+    except TypeError as e:
+        print("error:", e)
+    try:
+        Box(Counter::<+local>())
+    except TypeError as e:
+        print("error:", e)
+    try:
+        h2 = Holder(Counter())
+        print("non-local counter in a local slot:", h2.c.inc())
+    except TypeError as e:
+        print("error:", e)
+
+    # Local values never cross threads.
+    try:
+        spawn(bump, c++)
+    except TypeError as e:
+        print("error:", e)
+    f = |k: int| c.inc() + k
+    try:
+        spawn(f, 1)
+    except TypeError as e:
+        print("error:", e)
+    print(f(100))
+    t = spawn(make)
+    try:
+        t.join()
+    except TypeError as e:
+        print("error:", e)
+
+    # A non-local generator cannot keep a local value across a yield.
+    try:
+        for x in ticks():
+            print(x)
+    except TypeError as e:
+        print("error:", e)
+
+main()
+
+# Module variables are shared between threads.
+try:
+    shared = Counter::<+local>()
+except TypeError as e:
+    print("error:", e)

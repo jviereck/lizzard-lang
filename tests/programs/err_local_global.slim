@@ -1,0 +1,7 @@
+# Module variables are shared between threads, so they cannot be local.
+class Counter:
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+
+counter: Counter<+local> = Counter()

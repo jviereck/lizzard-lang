@@ -53,6 +53,10 @@ pub enum Ty {
     Array(Option<Elem>),
     /// A type used as a value (`list::<int>`); calling it builds that type.
     TypeVal(Box<Ty>),
+    /// `T + local`: values confined to their thread. Only declared types
+    /// (and the expected types derived from them) carry it; the static type
+    /// of a value never does (parameters and variables ignore locality).
+    Local(Box<Ty>),
 }
 
 /// The slim type of an array element read.
@@ -73,12 +77,53 @@ fn read_ty(t: &Ty) -> Ty {
 }
 
 impl Ty {
+    /// The type with all locality removed.
+    pub fn unlocal(&self) -> Ty {
+        let b = |t: &Ty| Box::new(t.unlocal());
+        let v = |ts: &[Ty]| ts.iter().map(Ty::unlocal).collect::<Vec<_>>();
+        match self {
+            Ty::Local(t) => t.unlocal(),
+            Ty::List(t) => Ty::List(b(t)),
+            Ty::Dict(k, x) => Ty::Dict(b(k), b(x)),
+            Ty::Iter(t) => Ty::Iter(b(t)),
+            Ty::Chan(t) => Ty::Chan(b(t)),
+            Ty::Option(t) => Ty::Option(b(t)),
+            Ty::TypeVal(t) => Ty::TypeVal(b(t)),
+            Ty::Tuple(Some(ts)) => Ty::Tuple(Some(v(ts))),
+            Ty::Instance(c, a) => Ty::Instance(c.clone(), v(a)),
+            Ty::Trait(c, a) => Ty::Trait(c.clone(), v(a)),
+            t => t.clone(),
+        }
+    }
+
+    /// Whether `+ local` appears in the type.
+    pub fn mentions_local(&self) -> bool {
+        match self {
+            Ty::Local(_) => true,
+            Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) | Ty::TypeVal(t) => t.mentions_local(),
+            Ty::Dict(k, v) => k.mentions_local() || v.mentions_local(),
+            Ty::Tuple(Some(ts)) | Ty::Instance(_, ts) | Ty::Trait(_, ts) => ts.iter().any(Ty::mentions_local),
+            _ => false,
+        }
+    }
+
+    /// Values of this type are never local objects (scalars and strings).
+    pub fn never_local(&self) -> bool {
+        match self {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Str | Ty::Unit | Ty::NoneT | Ty::Array(_) => true,
+            Ty::Option(t) => t.never_local(),
+            Ty::Tuple(Some(ts)) => ts.iter().all(Ty::never_local),
+            _ => false,
+        }
+    }
+
     /// Replaces type parameters bound in `map` (others stay).
     pub fn subst(&self, map: &dyn Fn(&str) -> Option<Ty>) -> Ty {
         let b = |t: &Ty| Box::new(t.subst(map));
         let v = |ts: &[Ty]| ts.iter().map(|t| t.subst(map)).collect::<Vec<_>>();
         match self {
             Ty::Param(n) => map(n).unwrap_or_else(|| self.clone()),
+            Ty::Local(t) => Ty::Local(b(t)),
             Ty::List(t) => Ty::List(b(t)),
             Ty::Dict(k, x) => Ty::Dict(b(k), b(x)),
             Ty::Iter(t) => Ty::Iter(b(t)),
@@ -107,6 +152,7 @@ impl Ty {
     /// The element type produced by indexing (a borrow) or `None` if unknown.
     pub fn elem(&self) -> Option<Ty> {
         let t = match self {
+            Ty::Local(t) => return t.elem().map(|t| t.unlocal()),
             Ty::List(t) => read_ty(t),
             Ty::Dict(_, v) => read_ty(v),
             Ty::Array(Some(e)) => elem_ty(*e),
@@ -119,6 +165,7 @@ impl Ty {
     /// The type of the items a `for` loop over this type produces.
     pub fn item(&self) -> Ty {
         match self {
+            Ty::Local(t) => t.item().unlocal(),
             Ty::Dict(k, _) => read_ty(k),
             Ty::Iter(t) | Ty::Chan(t) => read_ty(t),
             Ty::Tuple(Some(ts)) => match ts.first() {
@@ -136,7 +183,7 @@ impl Ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Unit | Ty::NoneT | Ty::Class(_) | Ty::StaticFn | Ty::TypeVal(_) => {
                 Some(true)
             }
-            Ty::Option(t) => t.is_copy(),
+            Ty::Option(t) | Ty::Local(t) => t.is_copy(),
             _ => Some(false),
         }
     }
@@ -154,6 +201,7 @@ impl Ty {
             Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) => **t != Ty::Unknown && t.is_precise(),
             Ty::Dict(k, v) => k.is_precise() && v.is_precise(),
             Ty::Instance(_, args) | Ty::Trait(_, args) => args.iter().all(Ty::is_precise),
+            Ty::Local(t) => t.is_precise(),
             _ => true,
         }
     }
@@ -161,6 +209,9 @@ impl Ty {
     pub fn join(&self, other: &Ty) -> Ty {
         if self == other {
             return self.clone();
+        }
+        if self.mentions_local() || other.mentions_local() {
+            return self.unlocal().join(&other.unlocal());
         }
         match (self, other) {
             (Ty::NoneT, Ty::Option(_)) => other.clone(),
@@ -213,6 +264,13 @@ impl Ty {
             Ty::Array(None) => "array".into(),
             Ty::Array(Some(e)) => format!("array<{}>", e.name()),
             Ty::TypeVal(t) => format!("type {}", t.name()),
+            Ty::Local(t) => {
+                let n = t.name();
+                match n.strip_suffix('>') {
+                    Some(head) => format!("{head} + local>"),
+                    None => format!("{n}<+local>"),
+                }
+            }
         }
     }
 }
@@ -244,6 +302,16 @@ fn resolve_in(
 ) -> Result<(Ty, TypeDesc), String> {
     match t {
         TypeExpr::Unit(_) => Ok((Ty::Unit, TypeDesc::prim(Ctor::Unit))),
+        TypeExpr::Local(inner) => {
+            let (ty, d) = resolve_in(inner, lookup, nested)?;
+            match &ty {
+                Ty::List(_) | Ty::Dict(..) | Ty::Iter(_) | Ty::Tuple(_) | Ty::Instance(..) | Ty::Trait(..) | Ty::Func | Ty::Unknown | Ty::Any => {
+                    Ok((Ty::Local(Box::new(ty)), TypeDesc::Local(Box::new(d))))
+                }
+                Ty::Chan(_) => Err("channels connect threads and cannot be local".into()),
+                other => Err(format!("`{}` values cannot be local (only objects that hold references can)", other.name())),
+            }
+        }
         TypeExpr::Named(n, args, _) => {
             let arg = |i: usize| resolve_in(&args[i], lookup, true);
             let no_args = |ty: Ty, c: Ctor| -> Result<(Ty, TypeDesc), String> {

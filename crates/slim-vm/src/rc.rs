@@ -294,6 +294,34 @@ pub(crate) fn pop_ready(h: u64) -> Option<*mut Obj> {
     Some(o.pending.swap_remove(i).1 as *mut Obj)
 }
 
+/// Takes this thread's deferred decrements of local values, its queued local
+/// objects, and every cascade entry (for `Thread::rc_free_local`).
+pub(crate) fn take_local() -> (Vec<Value>, Vec<*mut Obj>) {
+    RC.with(|rc| {
+        let mut rc = rc.borrow_mut();
+        let mut decs = Vec::new();
+        rc.deferred.retain(|&(_, v)| {
+            if v.is_local() {
+                decs.push(v);
+                false
+            } else {
+                true
+            }
+        });
+        let mut objs: Vec<*mut Obj> = std::mem::take(&mut rc.cascade);
+        rc.pending.retain(|&(_, p)| {
+            // SAFETY: queued objects stay allocated until freed by `rc_run`.
+            if unsafe { (*p).is_local() } {
+                objs.push(p);
+                false
+            } else {
+                true
+            }
+        });
+        (decs, objs)
+    })
+}
+
 /// Objects queued for freeing plus deferred decrements on this thread.
 pub fn pending_count() -> usize {
     RC.with(|rc| {

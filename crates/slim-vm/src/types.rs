@@ -29,6 +29,7 @@ pub fn materialize(th: &Thread, d: &TypeDesc, env: &dyn Fn(u16) -> Value) -> Res
             v => Ok(v),
         },
         TypeDesc::Resolved(v) => Ok(*v),
+        TypeDesc::Local(t) => Ok(rtype::local_of(rtype::as_type(materialize(th, t, env)?).unwrap())),
     }
 }
 
@@ -116,6 +117,7 @@ pub fn pre_resolve(th: &Thread, d: &TypeDesc) -> Result<TypeDesc, String> {
             };
             TypeDesc::Builtin(c, args)
         }
+        TypeDesc::Local(t) => TypeDesc::Local(Box::new(pre_resolve(th, t)?)),
         other => other.clone(),
     })
 }
@@ -130,8 +132,12 @@ pub fn value_type_name(v: Value) -> String {
     }
 }
 
-/// `TypeError` for storing `v` in a container of type `container`.
-pub fn elem_error(th: &mut Thread, v: Value, container: &str) -> crate::interp::Raised {
+/// `TypeError` for storing `v` as an element of type `elem` in a container
+/// of type `container`.
+pub fn elem_error(th: &mut Thread, v: Value, elem: &RtType, container: &str) -> crate::interp::Raised {
+    if rtype::has_type(v, elem) && !rtype::local_ok(v, elem) {
+        return th.raise("TypeError", format!("cannot store local `{}` in non-local `{container}`", value_type_name(v)));
+    }
     th.raise("TypeError", format!("cannot store `{}` in `{container}`", value_type_name(v)))
 }
 
@@ -143,7 +149,7 @@ pub fn key_type_error(th: &mut Thread, k: Value, container: &str) -> crate::inte
 /// Checks (and coerces) an owned value for storage as an element of type
 /// `elem` in a container of type `container`. On error `v` is untouched.
 pub fn admit(th: &mut Thread, v: Value, elem: &RtType, container: &RtType) -> VResult<Value> {
-    rtype::admit(v, elem).ok_or_else(|| elem_error(th, v, &container.name))
+    rtype::admit(v, elem).ok_or_else(|| elem_error(th, v, elem, &container.name))
 }
 
 /// Checks (and coerces) owned items as elements of type `elem`. On error
@@ -155,7 +161,7 @@ pub fn admit_all(th: &mut Thread, items: Vec<Value>, elem: &RtType, container: &
         match rtype::admit(v, elem) {
             Some(v) => out.push(v),
             None => {
-                let e = elem_error(th, v, &container.name);
+                let e = elem_error(th, v, elem, &container.name);
                 v.decref();
                 out.into_iter().chain(it).for_each(|x| x.decref());
                 return Err(e);

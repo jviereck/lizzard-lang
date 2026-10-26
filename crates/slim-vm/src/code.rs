@@ -23,6 +23,8 @@ pub enum TypeDesc {
     Param(u16, String),
     /// An already resolved type value.
     Resolved(Value),
+    /// `T + local`: the local version of the inner type.
+    Local(Box<TypeDesc>),
 }
 
 impl TypeDesc {
@@ -48,6 +50,17 @@ impl TypeDesc {
             TypeDesc::Param(..) => true,
             TypeDesc::Resolved(_) => false,
             TypeDesc::Builtin(_, a) | TypeDesc::Global(_, _, a) => a.iter().any(TypeDesc::has_params),
+            TypeDesc::Local(t) => t.has_params(),
+        }
+    }
+
+    /// Mentions `+ local` (so values of the type are always local).
+    pub fn mentions_local(&self) -> bool {
+        match self {
+            TypeDesc::Local(_) => true,
+            TypeDesc::Param(..) => false,
+            TypeDesc::Resolved(v) => crate::rtype::as_type(*v).is_some_and(|t| t.local),
+            TypeDesc::Builtin(_, a) | TypeDesc::Global(_, _, a) => a.iter().any(TypeDesc::mentions_local),
         }
     }
 }
@@ -56,6 +69,13 @@ impl fmt::Display for TypeDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeDesc::Param(_, n) => f.write_str(n),
+            TypeDesc::Local(t) => {
+                let s = t.to_string();
+                match s.strip_suffix('>') {
+                    Some(head) => write!(f, "{head} + local>"),
+                    None => write!(f, "{s}<+local>"),
+                }
+            }
             TypeDesc::Resolved(v) => f.write_str(crate::rtype::name(*v)),
             TypeDesc::Global(_, n, args) => {
                 f.write_str(n)?;

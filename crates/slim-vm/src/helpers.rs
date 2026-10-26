@@ -654,6 +654,18 @@ pub extern "C" fn f_take_global(th: &mut Thread, frame: &mut Frame, dst: u32, id
 
 pub extern "C" fn f_store_global(th: &mut Thread, frame: &mut Frame, idx: u32, src: u32, _: u32, _: u32) -> u32 {
     let v = frame.reg(src as Reg);
+    if v.is_local() {
+        // Module variables are shared by all threads.
+        th.raise(
+            "TypeError",
+            format!(
+                "cannot store local `{}` in module variable `{}` (module variables are shared between threads)",
+                types::value_type_name(v),
+                th.vm.global_names[idx as usize]
+            ),
+        );
+        return RAISED;
+    }
     frame.set(src as Reg, Value::MOVED);
     let old = Value(th.vm.globals[idx as usize].swap(v.0, Ordering::AcqRel));
     rc::defer_decref(old);
@@ -940,9 +952,11 @@ fn unify(th: &Thread, d: &TypeDesc, t: &'static rtype::RtType, regs: &mut [Value
     match d {
         TypeDesc::Param(r, _) => {
             if regs[*r as usize] == Value::UNINIT {
-                regs[*r as usize] = t.value();
+                // Locality is not part of an inferred type argument.
+                regs[*r as usize] = rtype::base(t).value();
             }
         }
+        TypeDesc::Local(inner) => unify(th, inner, t, regs),
         TypeDesc::Builtin(Ctor::Option, args) if t.ctor != Ctor::Option => unify(th, &args[0], t, regs),
         TypeDesc::Builtin(c, args) => {
             if *c == t.ctor && args.len() == t.args.len() {
@@ -1258,6 +1272,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         .iter()
         .map(|f| Field::new(f.name.clone(), f.ty.clone(), slot_kind(&f.ty)))
         .collect();
+    let always_local = s.fields.iter().any(|f| f.ty.mentions_local());
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
     Ok(Obj::alloc_immortal(Body::Class(Class {
         name: s.name.clone(),
@@ -1268,6 +1283,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         traits,
         trait_args,
         is_exception,
+        always_local,
         canonical: std::sync::OnceLock::new(),
     })))
 }
@@ -1441,6 +1457,12 @@ fn check_store(th: &mut Thread, inst: &Instance, i: usize, v: Value, mode: Store
         return Err(th.raise(
             "TypeError",
             format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, t.name, types::value_type_name(v)),
+        ));
+    }
+    if !rtype::local_ok(v, t) {
+        return Err(th.raise(
+            "TypeError",
+            format!("cannot store local `{}` in non-local field `{}.{}` of type `{}`", types::value_type_name(v), class.name, f.name, t.name),
         ));
     }
     if mode == StoreMode::Copy && !v.is_copy() {

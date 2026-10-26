@@ -169,58 +169,89 @@ impl Thread {
             // SAFETY: the object was queued when its count reached zero and
             // its grace period passed, so no borrow taken before that can be
             // live; `free_check` catches borrows that revived it since.
-            let obj = unsafe { &mut *p };
-            match obj.free_check() {
-                FreeCheck::Free => {}
-                FreeCheck::Requeue => {
-                    rc::requeue(p);
-                    continue;
-                }
-                FreeCheck::Skip => continue,
+            if unsafe { self.free_queued(p) } {
+                freed += 1;
             }
-            if let Body::Instance(inst) = &obj.body {
-                if let Some(&m) = inst.class().methods.get("__drop__") {
-                    let me = Value(p as u64);
-                    // Hold a temporary reference while the destructor runs.
-                    obj.hold_for_drop();
-                    let saved = self.exc.take();
-                    match crate::helpers::call_simple(self, m, Some(me), &[]) {
-                        Ok(v) => v.decref(),
-                        Err(Raised) => {
-                            let file = match m.body() {
-                                Some(Body::Function(f)) => f.code.filename.to_string(),
-                                _ => "<drop>".into(),
-                            };
-                            let msg = self.format_exception(&file);
-                            eprintln!("Exception ignored in __drop__ of {}:\n{msg}", me.type_name());
-                            if let Some(e) = self.exc.take() {
-                                e.value.decref();
-                                e.cause.decref();
-                            }
-                        }
-                    }
-                    self.exc = saved;
-                    if !obj.release_after_drop() {
-                        // Resurrected: the destructor stored a new reference.
-                        continue;
-                    }
-                }
-            }
-            rc::set_cascade(true);
-            obj.release_children();
-            rc::set_cascade(false);
-            #[cfg(debug_assertions)]
-            let leak = Obj::poison(p);
-            #[cfg(not(debug_assertions))]
-            let leak = false;
-            if !leak {
-                // SAFETY: allocated by `Obj::alloc` as a Box.
-                drop(unsafe { Box::from_raw(p) });
-            }
-            rc::note_free();
-            freed += 1;
         }
         freed
+    }
+
+    /// Frees a queued zero-count object (running its `__drop__`). Returns
+    /// false if it was revived or resurrected instead.
+    ///
+    /// # Safety
+    /// No borrow of the object taken before it reached zero may be live.
+    unsafe fn free_queued(&mut self, p: *mut Obj) -> bool {
+        let obj = unsafe { &mut *p };
+        match obj.free_check() {
+            FreeCheck::Free => {}
+            FreeCheck::Requeue => {
+                rc::requeue(p);
+                return false;
+            }
+            FreeCheck::Skip => return false,
+        }
+        if let Body::Instance(inst) = &obj.body {
+            if let Some(&m) = inst.class().methods.get("__drop__") {
+                let me = Value(p as u64);
+                // Hold a temporary reference while the destructor runs.
+                obj.hold_for_drop();
+                let saved = self.exc.take();
+                match crate::helpers::call_simple(self, m, Some(me), &[]) {
+                    Ok(v) => v.decref(),
+                    Err(Raised) => {
+                        let file = match m.body() {
+                            Some(Body::Function(f)) => f.code.filename.to_string(),
+                            _ => "<drop>".into(),
+                        };
+                        let msg = self.format_exception(&file);
+                        eprintln!("Exception ignored in __drop__ of {}:\n{msg}", me.type_name());
+                        if let Some(e) = self.exc.take() {
+                            e.value.decref();
+                            e.cause.decref();
+                        }
+                    }
+                }
+                self.exc = saved;
+                if !obj.release_after_drop() {
+                    // Resurrected: the destructor stored a new reference.
+                    return false;
+                }
+            }
+        }
+        rc::set_cascade(true);
+        obj.release_children();
+        rc::set_cascade(false);
+        #[cfg(debug_assertions)]
+        let leak = Obj::poison(p);
+        #[cfg(not(debug_assertions))]
+        let leak = false;
+        if !leak {
+            // SAFETY: allocated by `Obj::alloc` as a Box.
+            drop(unsafe { Box::from_raw(p) });
+        }
+        rc::note_free();
+        true
+    }
+
+    /// Frees this thread's local objects before it exits: only their own
+    /// thread may destroy them. No borrow is live any more and no other
+    /// thread can reach a local object, so no grace period is needed.
+    pub fn rc_free_local(&mut self) {
+        loop {
+            let (decs, objs) = rc::take_local();
+            if decs.is_empty() && objs.is_empty() {
+                break;
+            }
+            for v in decs {
+                v.decref();
+            }
+            for p in objs {
+                // SAFETY: see above; cascade entries were only reachable
+                // through objects freed here.
+                unsafe { self.free_queued(p) };
+            }
+        }
     }
 
     pub fn maybe_auto_rc(&mut self) {

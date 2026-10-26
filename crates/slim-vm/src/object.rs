@@ -16,7 +16,11 @@ const IMMORTAL: u64 = 1 << 63;
 const REVIVED: u64 = 1 << 62;
 /// The object has an entry in a pending-free queue.
 const QUEUED: u64 = 1 << 61;
-const FLAGS: u64 = IMMORTAL | REVIVED | QUEUED;
+/// The object is confined to the thread that created it (`+local`): it may
+/// only be referenced from that thread's frames and from other local
+/// objects. Set at creation and never changed.
+const LOCAL: u64 = 1 << 60;
+const FLAGS: u64 = IMMORTAL | REVIVED | QUEUED | LOCAL;
 /// Count word of a freed object in poison mode (`SLIM_POISON=1`, debug builds).
 #[cfg(debug_assertions)]
 const POISONED: u64 = 0x0BAD_F00D_DEAD_0000;
@@ -119,6 +123,8 @@ pub struct Class {
     /// Type arguments of generic implemented traits (`impl Iterable<T>`).
     pub trait_args: Vec<(Value, Vec<TypeDesc>)>,
     pub is_exception: bool,
+    /// Some field has a local type, so every instance is local.
+    pub always_local: bool,
     /// The type of instances of a non-generic class.
     pub canonical: std::sync::OnceLock<Value>,
 }
@@ -195,6 +201,32 @@ fn poison_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SLIM_POISON").is_some_and(|v| v != "0"))
 }
 
+/// Whether a new object must be local: its type is local, or it references
+/// a local object (no non-local object may reference a local one).
+fn body_is_local(body: &Body) -> bool {
+    let ty_local = |t: Value| crate::rtype::as_type(t).is_some_and(|t| t.local);
+    match body {
+        Body::Instance(i) => ty_local(i.ty),
+        Body::List(l) => ty_local(l.ty),
+        Body::Dict(d) => ty_local(d.ty),
+        Body::Generator(g) => ty_local(g.ty),
+        Body::Iter(it) => {
+            ty_local(it.ty)
+                || match &*it.k.lock().unwrap_or_else(|e| e.into_inner()) {
+                    crate::builtins::IterKind::List { list, .. } => list.is_local(),
+                    crate::builtins::IterKind::Items { items } => items.as_slice().iter().any(|v| v.is_local()),
+                    crate::builtins::IterKind::Object { obj } => obj.is_local(),
+                    _ => false,
+                }
+        }
+        Body::Tuple(items) => items.iter().any(|v| v.is_local()),
+        Body::Function(f) => f.captures.iter().any(|v| v.is_local()),
+        Body::BoundMethod { recv, func } => recv.is_local() || func.is_local(),
+        Body::Instantiated { func, .. } => func.is_local(),
+        _ => false,
+    }
+}
+
 #[cfg(debug_assertions)]
 #[inline(always)]
 fn check_poison(w: u64) {
@@ -210,7 +242,8 @@ impl Obj {
     }
 
     pub fn alloc(body: Body) -> Value {
-        let b = Box::new(Obj { rc: AtomicU64::new(1), body });
+        let rc = if body_is_local(&body) { 1 | LOCAL } else { 1 };
+        let b = Box::new(Obj { rc: AtomicU64::new(rc), body });
         let p = Box::into_raw(b) as u64;
         debug_assert!(p & 7 == 0);
         crate::rc::note_alloc();
@@ -220,6 +253,12 @@ impl Obj {
     pub fn alloc_immortal(body: Body) -> Value {
         let b = Box::new(Obj { rc: AtomicU64::new(IMMORTAL), body });
         Value(Box::into_raw(b) as u64)
+    }
+
+    /// Whether the object is confined to its creating thread.
+    #[inline(always)]
+    pub fn is_local(&self) -> bool {
+        self.rc.load(Ordering::Relaxed) & LOCAL != 0
     }
 
     #[inline(always)]

@@ -13,6 +13,7 @@ use crate::helpers::{self, CallArg};
 use crate::interp::{Raised, Thread, VResult};
 use crate::object::{Body, Obj};
 use crate::rc;
+use crate::types;
 use crate::value::Value;
 
 /// Result of a finished thread: its return value or its exception (owned).
@@ -94,10 +95,17 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     let fargs: Vec<Value> = args[1..].to_vec();
     if !matches!(
         f.body(),
-        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_))
+        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_) | Body::Instantiated { .. } | Body::Type(_))
     ) {
         fargs.iter().for_each(|v| v.decref());
         return Err(th.raise("TypeError", format!("spawn() needs a function, got '{}'", f.type_name())));
+    }
+    // Local values never leave their thread.
+    if let Some((i, v)) = std::iter::once(&f).chain(&fargs).enumerate().find(|(_, v)| v.is_local()) {
+        let what = if i == 0 { "the function".to_string() } else { format!("argument {i}") };
+        let msg = format!("spawn(): {what} is local (`{}`) and cannot be sent to another thread", types::value_type_name(*v));
+        fargs.iter().for_each(|v| v.decref());
+        return Err(th.raise("TypeError", msg));
     }
     f.incref();
     let keeps = keep_flags(f, fargs.len());
@@ -123,7 +131,7 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
             }
         }
         f.decref();
-        let outcome = match r {
+        let mut outcome = match r {
             Ok(v) => Ok(v),
             Err(Raised) => {
                 let e = t.exc.take().expect("raised without exception");
@@ -131,10 +139,27 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
                 Err(e.value)
             }
         };
+        // A local result or exception cannot leave the thread: it is freed
+        // here and the joiner gets a `TypeError` instead.
+        let leaving = match &outcome {
+            Ok(v) | Err(v) => *v,
+        };
+        if leaving.is_local() {
+            let what = if outcome.is_ok() { "result" } else { "exception" };
+            let msg = format!("the thread's {what} is local (`{}`) and cannot leave its thread", types::value_type_name(leaving));
+            leaving.decref();
+            let _ = t.raise("TypeError", msg);
+            let e = t.exc.take().expect("raised");
+            e.cause.decref();
+            outcome = Err(e.value);
+        }
         *st2.0.lock().unwrap() = Some(outcome);
         st2.1.notify_all();
-        // Free what this thread can; the rest is handed to the orphan queue.
+        // Free what this thread can; local objects are freed now (only this
+        // thread may run their destructors); the rest is handed to the
+        // orphan queue.
         t.rc_run(None);
+        t.rc_free_local();
         let (n, cv) = &RUNNING;
         *n.lock().unwrap() -= 1;
         cv.notify_all();

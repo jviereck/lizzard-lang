@@ -154,6 +154,12 @@ impl Value {
     pub fn is_dead(self) -> bool {
         self == Value::MOVED || self == Value::UNINIT
     }
+
+    /// Whether the value is a local object (confined to its thread).
+    #[inline]
+    pub fn is_local(self) -> bool {
+        self.is_ptr() && self.obj().is_some_and(|o| o.is_local())
+    }
 }
 
 impl std::fmt::Debug for Value {

@@ -595,17 +595,35 @@ impl Parser {
             return Ok(TypeExpr::Unit(span));
         }
         let (name, span) = self.name("a type")?;
+        let (args, local) = if self.eat(&Tok::Lt) { self.angle_args()? } else { (Vec::new(), false) };
+        let t = TypeExpr::Named(name, args, span);
+        Ok(if local { TypeExpr::Local(Box::new(t)) } else { t })
+    }
+
+    /// The rest of `<A, B + local>` after the `<`: the type arguments and
+    /// whether a trailing `+ local` makes the enclosing type local.
+    fn angle_args(&mut self) -> R<(Vec<TypeExpr>, bool)> {
         let mut args = Vec::new();
-        if self.eat(&Tok::Lt) {
-            loop {
-                args.push(self.type_expr()?);
-                if !self.eat(&Tok::Comma) {
-                    break;
+        let mut local = false;
+        loop {
+            if self.eat(&Tok::Plus) {
+                let (m, sp) = self.name("`local` after `+`")?;
+                if m != "local" {
+                    return Err(Error::syntax(format!("unknown type modifier `{m}` (only `+ local` is allowed here)"), sp));
                 }
+                local = true;
+                break;
             }
-            self.close_angle()?;
+            args.push(self.type_expr()?);
+            if !self.eat(&Tok::Comma) {
+                if self.at(&Tok::Plus) {
+                    continue;
+                }
+                break;
+            }
         }
-        Ok(TypeExpr::Named(name, args, span))
+        self.close_angle()?;
+        Ok((args, local))
     }
 
     /// Consumes one `>`, splitting `>>` and `>=` tokens when needed.
@@ -890,15 +908,8 @@ impl Parser {
                 Tok::ColonColon => {
                     let span = self.advance().span;
                     self.expect(&Tok::Lt, "`<` after `::` (type arguments: `f::<T>`)")?;
-                    let mut args = Vec::new();
-                    loop {
-                        args.push(self.type_expr()?);
-                        if !self.eat(&Tok::Comma) {
-                            break;
-                        }
-                    }
-                    self.close_angle()?;
-                    e = Expr { kind: ExprKind::TypeApp(Box::new(e), args), span };
+                    let (args, local) = self.angle_args()?;
+                    e = Expr { kind: ExprKind::TypeApp(Box::new(e), args, local), span };
                 }
                 _ => return Ok(e),
             }
