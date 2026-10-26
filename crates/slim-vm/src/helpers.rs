@@ -893,10 +893,27 @@ pub fn invoke(
             vals.extend(args.iter().map(|a| a.v));
             crate::native::call(th, nf, &vals)
         }
+        Some(Body::NativeClass(c)) if c.is_family() => Err(th.raise(
+            "TypeError",
+            format!("cannot infer the type arguments of `{}`; write `{}::<{}>(...)`", c.name, c.name, c.tparams.join(", ")),
+        )),
         Some(Body::NativeClass(c)) => match c.init {
             Some(init) => invoke(th, caller, init, None, None, args),
             None => Err(th.raise("TypeError", format!("cannot create `{}` objects from slim", c.name))),
         },
+        // `Stack::<int>(...)` of a generic native class: the instantiation
+        // registered for these type arguments.
+        Some(Body::Type(t)) if matches!(t.ctor, Ctor::Class(c) if matches!(c.body(), Some(Body::NativeClass(_)))) => {
+            let Ctor::Class(fv) = t.ctor else { unreachable!() };
+            let Some(Body::NativeClass(fam)) = fv.body() else { unreachable!() };
+            if !fam.is_family() {
+                return invoke(th, caller, fv, None, None, args);
+            }
+            match fam.instance_for(t.value()) {
+                Some(c) => invoke(th, caller, c, None, None, args),
+                None => Err(th.raise("TypeError", format!("`{}` is not available: `{}` supports {}", t.name, fam.name, fam.instance_names()))),
+            }
+        }
         Some(Body::Instantiated { func, targs }) => {
             let mut full: Vec<CallArg> = targs.iter().map(|t| CallArg::borrowed(*t)).collect();
             full.extend_from_slice(args);

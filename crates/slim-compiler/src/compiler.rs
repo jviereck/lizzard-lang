@@ -84,6 +84,10 @@ pub struct ClassInfo {
     /// Implemented traits with their type arguments (in terms of the class's
     /// type parameters), including the traits they imply.
     pub impls: Vec<(String, Vec<Ty>)>,
+    /// A generic native class: its supported instantiations (type
+    /// arguments, the instantiation's class). The family itself has no
+    /// methods; see `ModInfo::class_info`.
+    pub instances: Vec<(Vec<Ty>, ClassInfo)>,
 }
 
 pub struct TraitInfo {
@@ -142,6 +146,17 @@ pub struct ModInfo {
 }
 
 impl ModInfo {
+    /// The class of `c<args>`: for a generic native class, the instantiation
+    /// for these type arguments (`None` if they are not known statically or
+    /// not supported: its members are then looked up at runtime).
+    fn class_info(&self, c: &str, args: &[Ty]) -> Option<&ClassInfo> {
+        let ci = self.classes.get(c)?;
+        if ci.instances.is_empty() {
+            return Some(ci);
+        }
+        ci.instances.iter().find(|(a, _)| a == args).map(|(_, i)| i)
+    }
+
     fn type_lookup(&self, n: &str, scope: &Scope) -> Option<(u32, TypeName)> {
         if let Some((_, k)) = scope.iter().find(|(s, _)| s == n) {
             return Some((0, TypeName::Param(*k)));
@@ -310,6 +325,15 @@ impl ModInfo {
                 },
                 span,
             )),
+            Ty::Instance(c, args)
+                if self.classes.get(c).is_some_and(|ci| !ci.instances.is_empty() && ci.tparams.len() == args.len())
+                    && args.iter().all(Ty::is_concrete)
+                    && self.class_info(c, args).is_none() =>
+            {
+                let ci = &self.classes[c];
+                let names: Vec<String> = ci.instances.iter().map(|(a, _)| format!("`{}`", Ty::Instance(c.clone(), a.clone()).name())).collect();
+                Err(type_err(format!("`{}` is not available: `{c}` supports {}", t.name(), names.join(", ")), span))
+            }
             Ty::Instance(c, args) | Ty::Trait(c, args) => {
                 let tps = match self.classes.get(c) {
                     Some(ci) => ci.tparams.clone(),
@@ -353,7 +377,16 @@ impl ModInfo {
         match t {
             Ty::Local(_) => true,
             Ty::Param(n) => param_local(n),
-            Ty::Instance(c, args) => self.classes.get(c).is_some_and(|ci| ci.local) || args.iter().any(rec),
+            Ty::Instance(c, args) => {
+                args.iter().any(rec)
+                    || match (self.classes.get(c), self.class_info(c, args)) {
+                        (_, Some(ci)) => ci.local,
+                        // A generic native class with unknown arguments: any
+                        // instantiation.
+                        (Some(ci), None) => ci.instances.iter().any(|(_, i)| i.local),
+                        (None, None) => false,
+                    }
+            }
             Ty::List(x) | Ty::Iter(x) | Ty::Option(x) | Ty::TypeVal(x) => rec(x),
             Ty::Dict(k, v) => rec(k) || rec(v),
             Ty::Tuple(Some(ts)) | Ty::Trait(_, ts) => ts.iter().any(rec),
@@ -397,7 +430,7 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
 /// The static type of a native's parameter or result. `Any` and `Func` are
 /// `any` and `function`, which may hold values that are not `Send`: handles
 /// are `!Send`, so the Rust side cannot move them to another thread either.
-fn ntype_ty(t: &NType, classes: &HashMap<std::any::TypeId, String>) -> Ty {
+fn ntype_ty(t: &NType, classes: &NativeNames) -> Ty {
     let b = |t: &NType| Box::new(ntype_ty(t, classes));
     match t {
         NType::Int => Ty::Int,
@@ -411,11 +444,28 @@ fn ntype_ty(t: &NType, classes: &HashMap<std::any::TypeId, String>) -> Ty {
         NType::Dict(k, v) => Ty::Dict(b(k), b(v)),
         NType::Option(x) => Ty::Option(b(x)),
         NType::Array(e) => Ty::Array(Some(*e)),
-        NType::Class(id) => classes.get(id).map(|n| Ty::Instance(n.clone(), Vec::new())).unwrap_or(Ty::Unknown),
+        NType::Class(id) => match classes.get(id) {
+            Some((n, args)) => Ty::Instance(n.clone(), args.iter().map(|a| ntype_ty(a, classes)).collect()),
+            None => Ty::Unknown,
+        },
     }
 }
 
-fn native_sig(f: &FnSpec, classes: &HashMap<std::any::TypeId, String>) -> Sig {
+/// The slim name and type arguments of the native class over each Rust
+/// type (`geom.Stack`, `[int]` for an instantiation of a generic class).
+type NativeNames = HashMap<std::any::TypeId, (String, Vec<NType>)>;
+
+fn native_class_info(c: &slim_vm::native::ClassSpec, names: &NativeNames) -> ClassInfo {
+    let mut methods: HashMap<String, Sig> = c.methods.iter().map(|f| (f.name.clone(), native_sig(f, names))).collect();
+    if let Some(init) = &c.init {
+        methods.insert("__init__".into(), native_sig(init, names));
+    }
+    let instances = c.instances.iter().map(|(a, i)| (a.iter().map(|t| ntype_ty(t, names)).collect(), native_class_info(i, names))).collect();
+    let tparams = c.tparams.iter().map(|n| TParamSig { name: n.clone(), bounds: Vec::new() }).collect();
+    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls: Vec::new(), instances }
+}
+
+fn native_sig(f: &FnSpec, classes: &NativeNames) -> Sig {
     let params = f
         .params
         .iter()
@@ -481,20 +531,19 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
         filename: filename.into(),
     };
     // Native classes and functions of the imported modules.
-    let mut native_names: HashMap<std::any::TypeId, String> = HashMap::new();
+    let mut native_names: NativeNames = HashMap::new();
     for m in &used {
         for c in &m.classes {
-            native_names.insert(c.type_id, format!("{}.{}", m.name, c.name));
+            let n = format!("{}.{}", m.name, c.name);
+            for (args, i) in &c.instances {
+                native_names.insert(i.type_id, (n.clone(), args.clone()));
+            }
+            native_names.insert(c.type_id, (n, Vec::new()));
         }
     }
     for m in &used {
         for c in &m.classes {
-            let mut methods: HashMap<String, Sig> = c.methods.iter().map(|f| (f.name.clone(), native_sig(f, &native_names))).collect();
-            if let Some(init) = &c.init {
-                methods.insert("__init__".into(), native_sig(init, &native_names));
-            }
-            let ci = ClassInfo { local: c.local, tparams: Vec::new(), fields: Vec::new(), methods, impls: Vec::new() };
-            info.classes.insert(format!("{}.{}", m.name, c.name), ci);
+            info.classes.insert(format!("{}.{}", m.name, c.name), native_class_info(c, &native_names));
         }
         for f in &m.functions {
             info.funcs.insert(format!("{}.{}", m.name, f.name), native_sig(f, &native_names));
@@ -510,7 +559,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 if builtin_names.contains(&c.name) {
                     return Err(syn_err(format!("cannot redefine builtin `{}`", c.name), c.span));
                 }
-                let ci = ClassInfo { local: false, tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new() };
+                let ci = ClassInfo { local: false, tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new(), instances: Vec::new() };
                 info.classes.insert(c.name.clone(), ci);
             }
             StmtKind::Trait(t) => {
@@ -2203,7 +2252,7 @@ impl<'m> FnCtx<'m> {
         self.option_check(&o, &format!("accessing `.{name}`"), span)?;
         let mut ty = Ty::Unknown;
         if let Ty::Instance(c, args) = &o.ty {
-            if let Some(ci) = self.m.classes.get(c) {
+            if let Some(ci) = self.m.class_info(c, args) {
                 if let Some((_, fty, _)) = ci.fields.iter().find(|(n, _, _)| n == name) {
                     ty = fty.subst(&class_map(ci, args)).as_value();
                 } else if ci.methods.contains_key(name) {
@@ -2930,7 +2979,7 @@ impl<'m> FnCtx<'m> {
     fn field_ty(&self, obj_ty: &Ty, field: &str, span: Span) -> R<Ty> {
         match obj_ty {
             Ty::Instance(c, args) => {
-                if let Some(ci) = self.m.classes.get(c) {
+                if let Some(ci) = self.m.class_info(c, args) {
                     return match ci.fields.iter().find(|(n, _, _)| n == field) {
                         Some((_, t, _)) => Ok(t.subst(&class_map(ci, args))),
                         None => Err(Error::new("AttributeError", format!("class `{c}` has no field `{field}`"), span)),
@@ -3487,6 +3536,9 @@ impl<'m> FnCtx<'m> {
     ) -> R<Res> {
         let ExprKind::Name(name) = &f.kind else { unreachable!() };
         let class = self.m.classes.contains_key(name);
+        if class && !self.m.classes[name].instances.is_empty() {
+            return self.native_generic_call(name, turbofish, args, expect, span);
+        }
         if sig.params.len() != args.len() {
             return Err(type_err(
                 format!("`{name}()` takes {} argument{} but {} {} given", sig.params.len(), if sig.params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }),
@@ -3543,6 +3595,61 @@ impl<'m> FnCtx<'m> {
             _ => ret.as_value(),
         };
         Ok(Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() })
+    }
+
+    /// `Name::<args>(...)` of a generic native class (or with the type
+    /// arguments from the expected type): checked against the instantiation's
+    /// constructor when the arguments are known; otherwise the runtime picks
+    /// the instantiation (`TypeError` if there is none).
+    fn native_generic_call(&mut self, name: &str, turbofish: Option<&[TypeExpr]>, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
+        let n = self.m.classes[name].tparams.len();
+        let targs = match turbofish {
+            Some(ts) => self.explicit_targs(ts, n, name, span)?,
+            None => match expect.as_ref().map(|t| t.peel()) {
+                Some(Ty::Instance(c, a)) if c == name && a.len() == n => a.clone(),
+                _ => {
+                    let names: Vec<&str> = self.m.classes[name].tparams.iter().map(|t| t.name.as_str()).collect();
+                    return Err(type_err(
+                        format!("cannot infer the type arguments of `{name}`; write `{name}::<{}>(...)` or annotate the variable", names.join(", ")),
+                        span,
+                    ));
+                }
+            },
+        };
+        let t = Ty::Instance(name.into(), targs);
+        self.m.check_wf(&t, &|n| self.pbounds(n), span)?;
+        let Some(d) = self.ty_desc(&t) else {
+            return Err(type_err(format!("cannot instantiate `{}` here", t.name()), span));
+        };
+        let init = match &t {
+            Ty::Instance(c, a) => self.m.class_info(c, a).map(|ci| ci.methods.get("__init__").cloned()),
+            _ => None,
+        };
+        let sig = match init {
+            Some(Some(s)) => Some(s),
+            Some(None) => return Err(type_err(format!("cannot create `{}` objects from slim", t.name()), span)),
+            None => None,
+        };
+        if let Some(s) = &sig {
+            if s.params.len() != args.len() {
+                return Err(type_err(
+                    format!("`{}()` takes {} argument{} but {} {} given", t.name(), s.params.len(), if s.params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }),
+                    span,
+                ));
+            }
+        }
+        let callee = self.tmp_owned();
+        let ti = self.type_idx(d);
+        self.emit(Instr::MakeType { dst: callee, ty: ti });
+        // Native parameters are borrowed.
+        let al = self.call_args(args, &|_| Some(false), &|i| sig.as_ref().and_then(|s| s.params.get(i)).map(|p| (p.name.clone(), p.ty.clone())), None, span)?;
+        let dst = self.tmp_owned();
+        let a = self.arglist(al.clone());
+        self.emit(Instr::Call { dst, func: callee, args: a });
+        self.after_call(&al);
+        self.emit(Instr::Drop { reg: callee });
+        self.reg_ty.clear();
+        Ok(Res { reg: dst, own: Own::Owned, ty: t, root: None, desc: "value".into() })
     }
 
     /// Evaluates call arguments. `keep_of(i)` is the static keep flag of
@@ -3673,7 +3780,7 @@ impl<'m> FnCtx<'m> {
         let mut sig: Option<Sig> = None;
         match &r.ty {
             Ty::Instance(c, cargs) => {
-                if let Some(ci) = self.m.classes.get(c) {
+                if let Some(ci) = self.m.class_info(c, cargs) {
                     match ci.methods.get(mname) {
                         Some(s) => sig = Some(s.subst(&class_map(ci, cargs))),
                         None => {

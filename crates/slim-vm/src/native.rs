@@ -20,6 +20,12 @@
 //! A call that conflicts with a running one (a `&mut self` method while
 //! another method runs) raises `BorrowError`, or waits for it to finish if
 //! the class is [`ClassBuilder::locked`].
+//!
+//! A generic class ([`Module::generic_class`]) lists the instantiations it
+//! supports, each an ordinary native class over its own Rust type
+//! (`Stack<i64>`, `Stack<String>`). Slim sees one generic class `Stack<T>`;
+//! constructing `Stack<int>` dispatches to the Rust class registered for
+//! `int`, and other type arguments raise `TypeError`.
 
 use std::any::TypeId;
 use std::cell::UnsafeCell;
@@ -970,7 +976,7 @@ pub enum Mode {
     Local,
 }
 
-/// A native class (an immortal object).
+/// A native class (an immortal object), or the family of a generic one.
 pub struct NativeClass {
     pub name: String,
     pub module: String,
@@ -982,6 +988,50 @@ pub struct NativeClass {
     pub methods: HashMap<String, Value>,
     repr: Option<ReprFn>,
     pub canonical: OnceLock<Value>,
+    /// A generic family: its type parameters and the native classes of its
+    /// supported instantiations (it has no init or methods of its own).
+    pub tparams: Vec<String>,
+    pub instances: Vec<Value>,
+    /// An instantiation of a generic family: the family and the type
+    /// arguments (its instances have type `family<args>`).
+    pub family: OnceLock<Value>,
+    pub type_args: Vec<NType>,
+}
+
+/// Marks generic families, which wrap no Rust type.
+struct Family;
+
+impl NativeClass {
+    pub fn is_family(&self) -> bool {
+        !self.tparams.is_empty()
+    }
+
+    /// The instantiation of this family for instance type `t` (`Stack<int>`).
+    pub fn instance_for(&self, t: Value) -> Option<Value> {
+        self.instances.iter().copied().find(|c| rtype::class_type(*c) == t)
+    }
+
+    /// Whether instances of this family with type arguments `args` are not
+    /// `Send`. (Compares the arguments without interning the instance type,
+    /// which this is part of computing.)
+    pub fn local_for(&self, args: &[Value]) -> bool {
+        self.instances.iter().any(|c| {
+            let Some(Body::NativeClass(c)) = c.body() else { return false };
+            c.mode == Mode::Local && c.type_args.len() == args.len() && c.type_args.iter().zip(args).all(|(n, a)| n.rt() == *a)
+        })
+    }
+
+    /// The supported instantiations, as written (`Stack<int>, Stack<str>`).
+    pub fn instance_names(&self) -> String {
+        let names: Vec<String> = self.instances.iter().map(|c| format!("`{}`", rtype::name(rtype::class_type(*c)))).collect();
+        names.join(", ")
+    }
+
+    /// Whether `obj` (an instance's class) is this class or one of its
+    /// instantiations.
+    pub fn covers(&self, this: Value, class: Value) -> bool {
+        class == this || matches!(class.body(), Some(Body::NativeClass(c)) if c.family.get() == Some(&this))
+    }
 }
 
 const EXCL: u32 = u32::MAX;
@@ -1103,7 +1153,7 @@ impl NativeObj {
                 }
             }
         }
-        format!("<{} object>", c.name)
+        format!("<{} object>", rtype::name(self.ty))
     }
 }
 
@@ -1193,6 +1243,30 @@ impl<T: 'static> IntoSlim for Native<T> {
     }
     fn into_slim(self) -> Result<Value, SlimError> {
         Ok(self.h.into_value())
+    }
+}
+
+/// The type arguments of a generic class's instantiation: a [`SlimType`]
+/// for one parameter, a tuple of them for several.
+pub trait TypeArgs {
+    fn ntypes() -> Vec<NType>;
+}
+
+impl<T: SlimType> TypeArgs for T {
+    fn ntypes() -> Vec<NType> {
+        vec![T::ntype()]
+    }
+}
+
+impl<A: SlimType, B: SlimType> TypeArgs for (A, B) {
+    fn ntypes() -> Vec<NType> {
+        vec![A::ntype(), B::ntype()]
+    }
+}
+
+impl<A: SlimType, B: SlimType, C: SlimType> TypeArgs for (A, B, C) {
+    fn ntypes() -> Vec<NType> {
+        vec![A::ntype(), B::ntype(), C::ntype()]
     }
 }
 
@@ -1399,6 +1473,10 @@ pub struct ClassSpec {
     pub local: bool,
     pub init: Option<FnSpec>,
     pub methods: Vec<FnSpec>,
+    /// A generic family: its type parameters and instantiations (type
+    /// arguments, class).
+    pub tparams: Vec<String>,
+    pub instances: Vec<(Vec<NType>, ClassSpec)>,
 }
 
 /// A native module's items, for the compiler.
@@ -1450,21 +1528,47 @@ impl Module {
     }
 
     fn add_class<T: 'static>(&mut self, name: &str, mode: Mode, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
-        let mut b = ClassBuilder::<T> { name: name.into(), locked: false, init: None, methods: HashMap::new(), repr: None, _t: PhantomData };
-        build(&mut b);
-        let class = Obj::alloc_immortal(Body::NativeClass(NativeClass {
+        let class = new_class(&self.name, name, mode, Vec::new(), build);
+        self.classes.push((name.into(), class));
+        self
+    }
+
+    /// Adds a generic class `name<tparams>` whose supported instantiations
+    /// are registered by `build`, each over its own Rust type:
+    ///
+    /// ```ignore
+    /// m.generic_class("Stack", &["T"], |g| {
+    ///     g.class::<i64, _>(stack::<i64>);       // Stack<int>
+    ///     g.class::<String, _>(stack::<String>); // Stack<str>
+    /// });
+    /// ```
+    ///
+    /// Constructing another instantiation from slim is a compile error when
+    /// the type arguments are known statically, and a `TypeError` otherwise.
+    pub fn generic_class(&mut self, name: &str, tparams: &[&str], build: impl FnOnce(&mut GenericBuilder)) -> &mut Self {
+        assert!(!tparams.is_empty(), "generic class `{name}` needs type parameters");
+        let mut g = GenericBuilder { module: self.name.clone(), name: name.into(), arity: tparams.len(), instances: Vec::new() };
+        build(&mut g);
+        let family = Obj::alloc_immortal(Body::NativeClass(NativeClass {
             name: name.into(),
             module: self.name.clone(),
-            type_id: TypeId::of::<T>(),
-            mode,
-            locked: b.locked,
-            init: b.init.map(|f| Obj::alloc_immortal(Body::NativeFn(f))),
-            methods: b.methods.into_iter().map(|(n, f)| (n, Obj::alloc_immortal(Body::NativeFn(f)))).collect(),
-            repr: b.repr,
+            type_id: TypeId::of::<Family>(),
+            mode: Mode::Sync,
+            locked: false,
+            init: None,
+            methods: HashMap::new(),
+            repr: None,
             canonical: OnceLock::new(),
+            tparams: tparams.iter().map(|t| t.to_string()).collect(),
+            instances: g.instances.clone(),
+            family: OnceLock::new(),
+            type_args: Vec::new(),
         }));
-        registry().write().unwrap().insert(TypeId::of::<T>(), class);
-        self.classes.push((name.into(), class));
+        for c in &g.instances {
+            let Some(Body::NativeClass(c)) = c.body() else { unreachable!() };
+            let _ = c.family.set(family);
+        }
+        self.classes.push((name.into(), family));
         self
     }
 
@@ -1476,12 +1580,7 @@ impl Module {
             classes: self
                 .classes
                 .iter()
-                .map(|(n, v)| {
-                    let Some(Body::NativeClass(c)) = v.body() else { unreachable!() };
-                    let mut methods: Vec<FnSpec> = c.methods.iter().map(|(m, f)| fn_spec(m, *f)).collect();
-                    methods.sort_by(|a, b| a.name.cmp(&b.name));
-                    ClassSpec { name: n.clone(), type_id: c.type_id, local: c.mode == Mode::Local, init: c.init.map(|f| fn_spec("__init__", f)), methods }
-                })
+                .map(|(n, v)| class_spec(n, *v))
                 .collect(),
         }
     }
@@ -1489,6 +1588,89 @@ impl Module {
     /// The module's globals: (`module.item`, value).
     pub fn globals(&self) -> Vec<(String, Value)> {
         self.functions.iter().chain(&self.classes).map(|(n, v)| (format!("{}.{n}", self.name), *v)).collect()
+    }
+}
+
+fn class_spec(name: &str, v: Value) -> ClassSpec {
+    let Some(Body::NativeClass(c)) = v.body() else { unreachable!() };
+    let mut methods: Vec<FnSpec> = c.methods.iter().map(|(m, f)| fn_spec(m, *f)).collect();
+    methods.sort_by(|a, b| a.name.cmp(&b.name));
+    ClassSpec {
+        name: name.into(),
+        type_id: c.type_id,
+        local: c.mode == Mode::Local,
+        init: c.init.map(|f| fn_spec("__init__", f)),
+        methods,
+        tparams: c.tparams.clone(),
+        instances: c
+            .instances
+            .iter()
+            .map(|i| {
+                let Some(Body::NativeClass(ic)) = i.body() else { unreachable!() };
+                (ic.type_args.clone(), class_spec(name, *i))
+            })
+            .collect(),
+    }
+}
+
+/// A new native class over `T` (registered as `T`'s class).
+fn new_class<T: 'static>(module: &str, name: &str, mode: Mode, type_args: Vec<NType>, build: impl FnOnce(&mut ClassBuilder<T>)) -> Value {
+    let mut b = ClassBuilder::<T> { name: name.into(), locked: false, init: None, methods: HashMap::new(), repr: None, _t: PhantomData };
+    build(&mut b);
+    let class = Obj::alloc_immortal(Body::NativeClass(NativeClass {
+        name: name.into(),
+        module: module.into(),
+        type_id: TypeId::of::<T>(),
+        mode,
+        locked: b.locked,
+        init: b.init.map(|f| Obj::alloc_immortal(Body::NativeFn(f))),
+        methods: b.methods.into_iter().map(|(n, f)| (n, Obj::alloc_immortal(Body::NativeFn(f)))).collect(),
+        repr: b.repr,
+        canonical: OnceLock::new(),
+        tparams: Vec::new(),
+        instances: Vec::new(),
+        family: OnceLock::new(),
+        type_args,
+    }));
+    registry().write().unwrap().insert(TypeId::of::<T>(), class);
+    class
+}
+
+/// Registers the instantiations of a generic class (see
+/// [`Module::generic_class`]). `A` gives the type arguments ([`TypeArgs`]);
+/// the Rust type's auto traits choose the mode as for [`Module::class`].
+pub struct GenericBuilder {
+    module: String,
+    name: String,
+    arity: usize,
+    instances: Vec<Value>,
+}
+
+impl GenericBuilder {
+    /// An instantiation whose methods may run concurrently (`T: Send + Sync`).
+    pub fn class<A: TypeArgs, T: Send + Sync + 'static>(&mut self, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
+        self.add::<A, T>(Mode::Sync, build)
+    }
+
+    /// An instantiation whose calls are exclusive (`T: Send`).
+    pub fn class_send<A: TypeArgs, T: Send + 'static>(&mut self, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
+        self.add::<A, T>(Mode::Send, build)
+    }
+
+    /// An instantiation over a Rust type that is not `Send`: its instances
+    /// are not `Send` either.
+    pub fn class_not_send<A: TypeArgs, T: 'static>(&mut self, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
+        self.add::<A, T>(Mode::Local, build)
+    }
+
+    fn add<A: TypeArgs, T: 'static>(&mut self, mode: Mode, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
+        let args = A::ntypes();
+        assert!(args.len() == self.arity, "`{}` takes {} type argument(s), got {} for `{}`", self.name, self.arity, args.len(), std::any::type_name::<T>());
+        let dup = self.instances.iter().any(|c| matches!(c.body(), Some(Body::NativeClass(c)) if c.type_args == args));
+        assert!(!dup, "`{}` instantiation {args:?} is registered twice", self.name);
+        let c = new_class(&self.module, &self.name, mode, args, build);
+        self.instances.push(c);
+        self
     }
 }
 

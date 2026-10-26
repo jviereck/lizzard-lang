@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use slim::{ListRef, Runtime, SlimError};
+use slim::{ClassBuilder, FromSlim, IntoSlim, ListRef, Runtime, SlimError};
 
 /// Shared between threads: methods take `&self`.
 struct Counter(AtomicI64);
@@ -26,6 +26,18 @@ impl Polygon {
     }
 }
 
+/// A generic Rust type: slim sees `Stack<T>` for the registered `T`s.
+struct Stack<T> {
+    items: Vec<T>,
+}
+
+fn stack<T: FromSlim + IntoSlim + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) {
+    c.init(|| Stack { items: Vec::new() });
+    c.method_mut("push", |s: &mut Stack<T>, x: T| s.items.push(x));
+    c.method_mut("pop", |s: &mut Stack<T>| s.items.pop());
+    c.method("len", |s: &Stack<T>| s.items.len() as i64);
+}
+
 fn main() {
     let mut rt = Runtime::new();
     rt.module("geom", |m| {
@@ -45,6 +57,10 @@ fn main() {
             c.method_mut("add", |p: &mut Polygon, x: f64, y: f64| p.points.push((x, y)));
             c.method("area", |p: &Polygon| p.area());
             c.repr(|p: &Polygon| format!("Polygon({} points)", p.points.len()));
+        });
+        m.generic_class("Stack", &["T"], |g| {
+            g.class::<i64, _>(stack::<i64>);
+            g.class::<String, _>(stack::<String>);
         });
     });
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/geom.slim");

@@ -108,6 +108,7 @@ fn implied_local(ctor: Ctor, args: &[Value]) -> bool {
     args.iter().any(|a| as_type(*a).is_some_and(|t| t.local))
         || matches!(ctor, Ctor::Class(c) if match c.body() {
             Some(Body::Class(c)) => c.always_local,
+            Some(Body::NativeClass(c)) if c.is_family() => c.local_for(args),
             Some(Body::NativeClass(c)) => c.mode == crate::native::Mode::Local,
             _ => false,
         })
@@ -221,14 +222,17 @@ pub fn subst(d: &TypeDesc, env: &[Value]) -> Option<Value> {
     })
 }
 
-/// The type of instances of a non-generic class.
+/// The type of instances of a non-generic class, or of an instantiation of
+/// a generic native class (`Stack<int>`).
 pub fn class_type(c: Value) -> Value {
-    let cell = match c.body() {
-        Some(Body::Class(k)) => &k.canonical,
-        Some(Body::NativeClass(k)) => &k.canonical,
+    match c.body() {
+        Some(Body::Class(k)) => *k.canonical.get_or_init(|| intern(Ctor::Class(c), &[])),
+        Some(Body::NativeClass(k)) => *k.canonical.get_or_init(|| match k.family.get() {
+            Some(f) => intern(Ctor::Class(*f), &k.type_args.iter().map(|t| t.rt()).collect::<Vec<_>>()),
+            None => intern(Ctor::Class(c), &[]),
+        }),
         _ => panic!("not a class"),
-    };
-    *cell.get_or_init(|| intern(Ctor::Class(c), &[]))
+    }
 }
 
 /// The trait types a class type implements, with its type arguments
@@ -532,7 +536,7 @@ pub fn has_shape(v: Value, t: &RtType) -> bool {
         Ctor::Thread => matches!(v.body(), Some(Body::Thread(_))),
         Ctor::Class(c) => match v.body() {
             Some(Body::Instance(i)) => i.class == c && (t.is_bare() || same(i.ty, t)),
-            Some(Body::Native(n)) => n.class == c,
+            Some(Body::Native(n)) => n.class == c || (n.class().family.get() == Some(&c) && (t.is_bare() || n.ty == t.value())),
             _ => false,
         },
         Ctor::Trait(tr) => match v.body() {

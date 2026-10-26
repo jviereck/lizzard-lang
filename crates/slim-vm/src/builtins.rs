@@ -651,7 +651,7 @@ fn b_isinstance(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     let (v, t) = (args[0], args[1]);
     let r = match t.body() {
         Some(Body::Class(_)) => v.as_instance().is_some_and(|i| i.class == t),
-        Some(Body::NativeClass(_)) => matches!(v.body(), Some(Body::Native(n)) if n.class == t),
+        Some(Body::NativeClass(c)) => matches!(v.body(), Some(Body::Native(n)) if c.covers(t, n.class)),
         Some(Body::Trait(_)) => v.as_instance().is_some_and(|i| i.class().implements(t)),
         _ => return Err(th.raise("TypeError", "isinstance() arg 2 must be a class or trait")),
     };

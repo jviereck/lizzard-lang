@@ -315,7 +315,7 @@ pub trait Backend {
 8. **Lock-free-read `list` and `dict`;** no negative indexes.
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
-10. **Rust bindings** (static embedding).
+10. **Rust bindings** (static embedding). **10b:** generic native classes.
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**
@@ -435,9 +435,26 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     | `class_not_send` | any `T` | the slim class is not `Send` either: instances never leave their thread; each call also checks the owner thread (`ThreadError`) as a safety net |
 
     Access is tracked by an atomic borrow counter on the object. A call that conflicts with a running call, such as a re-entrant `&mut self` call from a callback, raises `BorrowError`. A class registered with `c.locked()` waits instead: it goes offline and yields until the conflicting call finishes. Waiting is only useful across threads; a re-entrant conflict on one thread would never finish.
+  - **Generic classes (10b).** A generic Rust type is registered once per supported instantiation. `T` may be any `SlimType` (scalars, `String`, `Native<P>`, ...), and a tuple `(A, B)` gives several type arguments:
+
+    ```rust
+    fn stack<T: FromSlim + IntoSlim + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) { c.init(..); c.method_mut("push", ..); }
+    m.generic_class("Stack", &["T"], |g| {
+        g.class::<i64, _>(stack::<i64>);                              // Stack<int>
+        g.class::<String, _>(stack::<String>);                        // Stack<str>
+        g.class_not_send::<Native<Point>, _>(stack::<Native<Point>>); // Stack<Point>: handles are !Send
+    });
+    ```
+
+    - **Classes.** Each instantiation is an ordinary native class over its own Rust type, with its own methods and mode (`class`/`class_send`/`class_not_send`, chosen by the Rust type's auto traits as above). Slim sees one generic class `Stack<T>`, a family object that is the global `geom.Stack` and has no constructor or methods of its own.
+    - **Types and checks.** An instance's runtime type is `Stack<int>` (`Ctor::Class(family)` with the type arguments), so `isinstance(s, Stack)`, annotations and runtime checks work as for slim generics. `Send` follows the instantiation: `Stack<int>` is `Send`, `Stack<Point>` is not.
+    - **Construction.** `Stack::<int>()`, or `s: Stack<str> = Stack()` with the arguments taken from the expected type, dispatches to the instantiation for those arguments. When they are known statically, the call is checked against that instantiation's constructor and its methods' signatures, and an unsupported instantiation, written or annotated, is a compile error: "`geom.Stack<float>` is not available: `geom.Stack` supports `geom.Stack<int>`, `geom.Stack<str>`". Inside a generic function (`Stack::<T>()`), the runtime picks the instantiation and raises `TypeError` for an unsupported one; method calls on such a value are dynamic.
+    - **Natives.** A native function may take or return `Native<Stack<i64>>`, which slim sees as `geom.Stack<int>`.
+    - **Registration errors panic:** a wrong number of type arguments, or the same instantiation registered twice.
   - **Imports.** `import geom [as g]` and `from geom import dot [as d], Point` are only allowed at module level. Before compiling, imports are resolved by an AST rewrite (`crates/slim-compiler/src/imports.rs`): every name an import binds (`dot`, `g.dot`) becomes the qualified global `geom.dot`, and the compiler registers the native signatures under those names. A function's parameters and locals shadow imported names. Redefining an imported name at module level is an error, and so is using a module as a value. Unknown modules and items are compile-time `NameError`s.
   - **Limitations.**
-    - Native classes are not generic and cannot implement slim traits.
+    - Native classes cannot implement slim traits.
+    - A generic native class supports only its registered instantiations: there is no generic Rust code behind `Stack<T>` for an arbitrary `T`, and each instantiation's values are converted (`FromSlim`/`IntoSlim`) when they cross into Rust.
     - Annotations need the class imported by name (`from m import C`); dotted type names (`m.C`) are not supported.
     - Error messages show qualified names such as `geom.Point`.
     - `ThreadError` cannot be reached from slim code, since a local value never reaches another thread; the check exists for misuse from Rust.

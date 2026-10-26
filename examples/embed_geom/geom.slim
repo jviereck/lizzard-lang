@@ -1,4 +1,4 @@
-from geom import dot, Counter, Polygon
+from geom import dot, Counter, Polygon, Stack
 
 print("dot:", dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
 try:
@@ -24,3 +24,21 @@ square.add(2.0, 0.0)
 square.add(2.0, 2.0)
 square.add(0.0, 2.0)
 print(square, "area:", square.area())
+
+words: Stack<str> = Stack()
+words.push("hello")
+words.push("slim")
+print("stack:", words.len(), words.pop().some_or(""))
+
+# Type arguments known only at runtime pick the Rust class then;
+# `Stack::<float>()` written directly is a compile error.
+def stack_of<T>(x: T + keep) -> Stack<T>:
+    s = Stack::<T>()
+    s.push(x)
+    s
+
+print("stack:", stack_of(42).len())
+try:
+    stack_of(1.5)
+except TypeError as e:
+    print("error:", e)

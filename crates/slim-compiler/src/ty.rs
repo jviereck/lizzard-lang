@@ -94,6 +94,18 @@ impl Ty {
         }
     }
 
+    /// Whether the type is fully known: it mentions no type parameter and
+    /// no unknown part.
+    pub fn is_concrete(&self) -> bool {
+        match self {
+            Ty::Unknown | Ty::Param(_) | Ty::Tuple(None) => false,
+            Ty::Local(t) | Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) | Ty::TypeVal(t) => t.is_concrete(),
+            Ty::Dict(k, v) => k.is_concrete() && v.is_concrete(),
+            Ty::Tuple(Some(ts)) | Ty::Instance(_, ts) | Ty::Trait(_, ts) => ts.iter().all(Ty::is_concrete),
+            _ => true,
+        }
+    }
+
     /// Replaces type parameters bound in `map` (others stay).
     pub fn subst(&self, map: &dyn Fn(&str) -> Option<Ty>) -> Ty {
         let b = |t: &Ty| Box::new(t.subst(map));

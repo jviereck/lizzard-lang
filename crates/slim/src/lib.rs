@@ -11,7 +11,8 @@
 //! ```
 
 pub use slim_vm::native::{
-    Any, ArrayElem, ArrayRef, ClassBuilder, Ctx, DictRef, FromSlim, Func, IntoSlim, ListRef, Module, NType, Native, SlimError, SlimType,
+    Any, ArrayElem, ArrayRef, ClassBuilder, Ctx, DictRef, FromSlim, Func, GenericBuilder, IntoSlim, ListRef, Module, NType, Native, SlimError,
+    SlimType, TypeArgs,
 };
 
 /// A slim interpreter with native modules.

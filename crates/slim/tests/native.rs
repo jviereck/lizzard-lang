@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use slim::{ArrayRef, Ctx, DictRef, Func, ListRef, Native, Runtime, SlimError};
+use slim::{ArrayRef, ClassBuilder, Ctx, DictRef, FromSlim, Func, IntoSlim, ListRef, Native, Runtime, SlimError};
 
 type Log = Arc<Mutex<Vec<String>>>;
 
@@ -105,6 +105,14 @@ fn runtime() -> (Runtime, Log) {
             c.method("get", |c: &Cell| c.0.get());
             c.method("set", |c: &Cell, v: i64| c.0.set(v));
         });
+        // Generic: one Rust class per supported type argument. Handles
+        // (`Native<Point>`) are not `Send`, so neither is `Stack<Point>`.
+        m.generic_class("Stack", &["T"], |g| {
+            g.class::<i64, _>(stack::<i64>);
+            g.class::<String, _>(stack::<String>);
+            g.class_not_send::<Native<Point>, _>(stack::<Native<Point>>);
+        });
+        m.function("countdown", |n: i64| -> Result<Native<Stack<i64>>, SlimError> { Native::new(Stack { items: (1..=n).rev().collect() }) });
     });
     (rt, log)
 }
@@ -117,6 +125,18 @@ struct Hits(AtomicI64);
 struct Acc(i64);
 struct Acc2(i64);
 struct Cell(std::rc::Rc<std::cell::Cell<i64>>);
+struct Stack<T> {
+    items: Vec<T>,
+}
+
+fn stack<T: FromSlim + IntoSlim + Clone + 'static>(c: &mut ClassBuilder<Stack<T>>) {
+    c.init(|| Stack { items: Vec::new() });
+    c.method_mut("push", |s: &mut Stack<T>, x: T| s.items.push(x));
+    c.method_mut("pop", |s: &mut Stack<T>| s.items.pop());
+    c.method("peek", |s: &Stack<T>| s.items.last().cloned());
+    c.method("len", |s: &Stack<T>| s.items.len() as i64);
+    c.locked();
+}
 
 /// Runs `src`; returns the log, or the error text.
 fn run(src: &str) -> Result<Vec<String>, String> {
@@ -308,4 +328,82 @@ main()
     assert!(e.contains("spawn(): argument 1 is not `Send` (`geom.Cell`) and cannot be sent to another thread"), "{e}");
     let e = err("from geom import Cell\nshared = Cell(1)\n");
     assert!(e.contains("cannot store `geom.Cell`, which is not `Send`, in module variable `shared`"), "{e}");
+
+    // Generic classes: each instantiation is its own Rust class.
+    let l = ok(r#"
+from util import log
+from geom import Stack, Point, countdown
+def main() -> ():
+    s = Stack::<int>()
+    s.push(1)
+    s.push(2)
+    log(str(s.len()) + " " + str(s.pop()) + " " + str(s.peek()))
+    t: Stack<str> = Stack()
+    t.push("a")
+    log(t.pop().some_or("none") + " " + str(t.pop()))
+    p = Stack::<Point>()
+    p.push(Point(1.0, 2.0))
+    log(str(p.peek()))
+    log(str(isinstance(s, Stack)) + " " + str(isinstance(Point(0.0, 0.0), Stack)))
+    c = countdown(3)
+    log(str(c.pop()) + " " + str(c.len()))
+    log(str(s))
+main()
+"#);
+    assert_eq!(l, ["2 2 1", "a None", "Point(1, 2)", "True False", "1 2", "<Stack<int> object>"]);
+
+    // Type arguments only known at runtime pick the instantiation then.
+    let l = ok(r#"
+from util import log
+from geom import Stack
+def make<T>(x: T + keep) -> Stack<T>:
+    s = Stack::<T>()
+    s.push(x)
+    s
+def main() -> ():
+    log(str(make(7).len()))
+    log(str(make("x").peek()))
+    try:
+        make(1.5)
+    except TypeError as e:
+        log(str(e))
+main()
+"#);
+    assert_eq!(l, ["1", "x", "`Stack<float>` is not available: `Stack` supports `Stack<int>`, `Stack<str>`, `Stack<Point>`"]);
+
+    // Statically known: checked at compile time.
+    let e = err("from geom import Stack\ns = Stack::<float>()\n");
+    assert!(e.contains("`geom.Stack<float>` is not available: `geom.Stack` supports `geom.Stack<int>`, `geom.Stack<str>`, `geom.Stack<geom.Point>`"), "{e}");
+    let e = err("from geom import Stack\ndef f(s: Stack<bool>) -> ():\n    s.len()\n");
+    assert!(e.contains("`geom.Stack<bool>` is not available"), "{e}");
+    let e = err("from geom import Stack\ns = Stack::<int>()\ns.push(\"x\")\n");
+    assert!(e.contains("argument `#1` expects `int`, got `str`"), "{e}");
+    let e = err("from geom import Stack\ns = Stack()\n");
+    assert!(e.contains("cannot infer the type arguments of `geom.Stack`"), "{e}");
+    let e = err("from geom import Stack\ns = Stack::<int>()\ns.nope()\n");
+    assert!(e.contains("has no method `nope`"), "{e}");
+
+    // `Send` follows the instantiation: `Stack<int>` crosses threads,
+    // `Stack<Point>` does not.
+    let l = ok(r#"
+from util import log
+from geom import Stack
+def work(s: Stack<int>, n: int) -> ():
+    for i in range(n):
+        s.push(i)
+def main() -> ():
+    s = Stack::<int>()
+    ts: list<Thread> = []
+    for i in range(4):
+        ts.append(spawn(work, s++, 100))
+    for t in ts:
+        t.join()
+    log(str(s.len()))
+main()
+"#);
+    assert_eq!(l, ["400"]);
+    let e = err("from geom import Stack, Point\ndef show(s: Stack<Point>) -> int:\n    s.len()\ndef main() -> ():\n    spawn(show, Stack::<Point>())\nmain()\n");
+    assert!(e.contains("is not `Send` (`geom.Stack<geom.Point>`)"), "{e}");
+    let e = err("from geom import Stack, Point\ndef untyped(x):\n    x++\ndef main() -> ():\n    xs: list<any + Send> = []\n    xs.append(untyped(Stack::<Point>()))\nmain()\n");
+    assert!(e.contains("cannot store `Stack<Point>`, which is not `Send`, in `list<any + Send>`"), "{e}");
 }
