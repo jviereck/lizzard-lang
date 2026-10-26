@@ -413,9 +413,37 @@ impl Parser {
         Ok(params)
     }
 
+    /// `<T, U: Ord + Hash>` after a class, trait or function name.
+    fn type_params(&mut self) -> R<Vec<TypeParam>> {
+        let mut out: Vec<TypeParam> = Vec::new();
+        if !self.eat(&Tok::Lt) {
+            return Ok(out);
+        }
+        loop {
+            let (name, span) = self.name("type parameter name")?;
+            if out.iter().any(|p| p.name == name) {
+                return Err(Error::syntax(format!("duplicate type parameter `{name}`"), span));
+            }
+            let mut bounds = Vec::new();
+            if self.eat(&Tok::Colon) {
+                bounds.push(self.type_expr()?);
+                while self.eat(&Tok::Plus) {
+                    bounds.push(self.type_expr()?);
+                }
+            }
+            out.push(TypeParam { name, bounds, span });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.close_angle()?;
+        Ok(out)
+    }
+
     fn funcdef(&mut self) -> R<FuncDef> {
         let span = self.expect(&Tok::Def, "`def`")?;
         let (name, _) = self.name("function name")?;
+        let tparams = self.type_params()?;
         self.expect(&Tok::LParen, "`(`")?;
         let params = self.params(&Tok::RParen)?;
         self.expect(&Tok::RParen, "`)`")?;
@@ -423,12 +451,13 @@ impl Parser {
         self.expect(&Tok::Colon, "`:`")?;
         let body = self.suite()?;
         let body = if is_ellipsis_body(&body) { None } else { Some(body) };
-        Ok(FuncDef { name, params, ret, body, is_lambda: false, span })
+        Ok(FuncDef { name, tparams, params, ret, body, is_lambda: false, span })
     }
 
     fn classdef(&mut self) -> R<ClassDef> {
         let span = self.expect(&Tok::Class, "`class`")?;
         let (name, _) = self.name("class name")?;
+        let tparams = self.type_params()?;
         let mut traits = Vec::new();
         if self.eat(&Tok::LParen) {
             if !self.at(&Tok::RParen) {
@@ -441,7 +470,18 @@ impl Parser {
                 self.advance();
                 loop {
                     self.eat(&Tok::Impl);
-                    traits.push(self.name("trait name")?);
+                    let (tname, tspan) = self.name("trait name")?;
+                    let mut targs = Vec::new();
+                    if self.eat(&Tok::Lt) {
+                        loop {
+                            targs.push(self.type_expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.close_angle()?;
+                    }
+                    traits.push((tname, targs, tspan));
                     if !self.eat(&Tok::Comma) || self.at(&Tok::RParen) {
                         break;
                     }
@@ -496,12 +536,13 @@ impl Parser {
             }
         }
         self.eat(&Tok::Dedent);
-        Ok(ClassDef { name, traits, fields, methods, span })
+        Ok(ClassDef { name, tparams, traits, fields, methods, span })
     }
 
     fn traitdef(&mut self) -> R<TraitDef> {
         let span = self.expect(&Tok::Trait, "`trait`")?;
         let (name, _) = self.name("trait name")?;
+        let tparams = self.type_params()?;
         self.expect(&Tok::Colon, "`:`")?;
         let mut methods = Vec::new();
         self.expect(&Tok::Newline, "newline")?;
@@ -522,7 +563,7 @@ impl Parser {
             }
         }
         self.eat(&Tok::Dedent);
-        Ok(TraitDef { name, methods, span })
+        Ok(TraitDef { name, tparams, methods, span })
     }
 
     fn target_list(&mut self) -> R<Expr> {
@@ -650,6 +691,7 @@ impl Parser {
             Block { stmts: vec![Stmt { kind: StmtKind::Expr(e), span: s }] }
         };
         let f = FuncDef {
+            tparams: Vec::new(),
             name: "<lambda>".into(),
             params,
             ret: None,

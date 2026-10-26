@@ -1,0 +1,5 @@
+  File "err_bound_unsatisfied.slim", line 12
+    bad = SortedBag::<list<int>>()
+                                ^
+TypeError: `list<int>` does not implement `Ord` (required by `T` of `SortedBag`)
+[exit 1]

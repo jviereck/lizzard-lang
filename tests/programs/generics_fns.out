@@ -1,0 +1,13 @@
+9 pear None
+1.5 ['ab', 'ab', 'ab'] [1.0, 1.0]
+6 0.75
+['a', 'b'] (1, 'x') 5 2
+['w', 'w', 'z']
+only
+error: argument `xs` of `first()` expected `list<str>`, got `list<int>`
+4 [2.5, 2.5]
+error: `list<int>` does not implement `Ord` (required by `T` of `max_of()`)
+error: `str` does not implement `Num` (required by `T` of `total()`)
+error: argument `zero` of `total()` expected `int`, got `float`
+rc-audit: ok
+[exit 0]

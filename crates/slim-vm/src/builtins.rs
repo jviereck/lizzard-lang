@@ -888,13 +888,25 @@ const FUNCTIONS: &[BuiltinDef] = &[
     def("Channel", b_channel, 0, 0, 0),
 ];
 
-/// Builtin traits: (name, implied traits).
-const TRAITS: &[(&str, &[&str])] = &[
-    ("Exception", &[]),
-    ("LookupError", &["Exception"]),
-    ("ArithmeticError", &["Exception"]),
-    ("Iterator", &[]),
+/// Builtin traits: (name, implied traits, required methods, type parameters).
+/// `Ord`, `Num`, `Hash`, `Len`, `Iterable` and `Iterator` are the bounds that
+/// unlock operations on a type parameter (`T: Ord` allows `<`).
+const TRAITS: &[(&str, &[&str], &[&str], usize)] = &[
+    ("Exception", &[], &[], 0),
+    ("LookupError", &["Exception"], &[], 0),
+    ("ArithmeticError", &["Exception"], &[], 0),
+    ("Iterable", &[], &["__iter__"], 1),
+    ("Iterator", &[], &["__next__"], 1),
+    ("Ord", &[], &["__lt__"], 0),
+    ("Num", &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"], 0),
+    ("Hash", &[], &[], 0),
+    ("Len", &[], &["__len__"], 0),
 ];
+
+/// Names of the builtin traits.
+pub fn trait_names() -> Vec<&'static str> {
+    TRAITS.iter().map(|t| t.0).collect()
+}
 
 /// Builtin exception classes: (name, implemented traits).
 const EXCEPTIONS: &[(&str, &[&str])] = &[
@@ -946,12 +958,13 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
     use std::sync::atomic::Ordering;
     let mut all: Vec<(&'static str, Value)> = FUNCTIONS.iter().map(|d| (d.name, builtin_value(d))).collect();
     let mut traits: Vec<(&'static str, Value)> = Vec::new();
-    for (name, implies) in TRAITS {
+    for (name, implies, required, nparams) in TRAITS {
         let implies = implies.iter().map(|n| traits.iter().find(|(m, _)| m == n).unwrap().1).collect();
-        let methods = if *name == "Iterator" { vec![("__next__".to_string(), None)] } else { Vec::new() };
+        let methods = required.iter().map(|m| (m.to_string(), None)).collect();
         let t = Obj::alloc_immortal(Body::Trait(Trait {
             name: name.to_string(),
             id: next_id.fetch_add(1, Ordering::Relaxed),
+            nparams: *nparams,
             methods,
             implies,
         }));
@@ -963,10 +976,13 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
         let c = Obj::alloc_immortal(Body::Class(Class {
             name: name.to_string(),
             id: next_id.fetch_add(1, Ordering::Relaxed),
+            tparams: Vec::new(),
             fields: vec![Field::new("msg".into(), TypeDesc::prim(Ctor::Str), SlotKind::Value)],
             methods: HashMap::new(),
             traits: tr,
+            trait_args: Vec::new(),
             is_exception: true,
+            canonical: std::sync::OnceLock::new(),
         }));
         classes.push((*name, c));
     }

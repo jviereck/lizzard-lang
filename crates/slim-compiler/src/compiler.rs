@@ -12,6 +12,7 @@ use slim_syntax::ast::*;
 use slim_syntax::{Error, Span};
 use slim_vm::code::{
     Arg, ArgList, ClassSpec, Code, Ctor, ExcEntry, FieldSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
+    TypeParamInfo,
 };
 use slim_vm::object::{Body, Obj};
 use slim_vm::ops::{BinKind, Instr, StoreMode, UnKind};
@@ -47,63 +48,267 @@ pub struct ParamSig {
     pub ty: Ty,
 }
 
+/// A type parameter with its bounds (`Ty::Trait`s).
+#[derive(Clone, Debug)]
+pub struct TParamSig {
+    pub name: String,
+    pub bounds: Vec<Ty>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sig {
+    /// The function's own type parameters (hidden leading arguments).
+    pub tparams: Vec<TParamSig>,
     pub params: Vec<ParamSig>,
     pub ret: Ty,
 }
 
+impl Sig {
+    fn subst(&self, map: &dyn Fn(&str) -> Option<Ty>) -> Sig {
+        Sig {
+            tparams: self.tparams.iter().map(|t| TParamSig { name: t.name.clone(), bounds: t.bounds.iter().map(|b| b.subst(map)).collect() }).collect(),
+            params: self.params.iter().map(|p| ParamSig { ty: p.ty.subst(map), ..p.clone() }).collect(),
+            ret: self.ret.subst(map),
+        }
+    }
+}
+
 pub struct ClassInfo {
+    pub tparams: Vec<TParamSig>,
     pub fields: Vec<(String, Ty, TypeDesc)>,
+    pub methods: HashMap<String, Sig>,
+    /// Implemented traits with their type arguments (in terms of the class's
+    /// type parameters), including the traits they imply.
+    pub impls: Vec<(String, Vec<Ty>)>,
+}
+
+pub struct TraitInfo {
+    pub tparams: Vec<TParamSig>,
     pub methods: HashMap<String, Sig>,
 }
 
+/// Type parameters in scope: name -> environment index (a class type
+/// argument index for fields, a register in code).
+type Scope = [(String, u16)];
+
+/// Builtin traits: (name, type parameters, implied traits, methods).
+const BUILTIN_TRAITS: &[(&str, usize, &[&str], &[&str])] = &[
+    ("Exception", 0, &[], &[]),
+    ("LookupError", 0, &["Exception"], &[]),
+    ("ArithmeticError", 0, &["Exception"], &[]),
+    ("Iterable", 1, &[], &["__iter__"]),
+    ("Iterator", 1, &["Iterable"], &["__next__"]),
+    ("Ord", 0, &[], &["__lt__"]),
+    ("Num", 0, &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"]),
+    ("Hash", 0, &[], &[]),
+    ("Len", 0, &[], &["__len__"]),
+];
+
+fn builtin_trait(n: &str) -> Option<&'static (&'static str, usize, &'static [&'static str], &'static [&'static str])> {
+    BUILTIN_TRAITS.iter().find(|t| t.0 == n)
+}
+
 pub struct ModInfo {
-    pub globals: Vec<String>,
     pub gindex: HashMap<String, u32>,
     pub module_vars: HashSet<String>,
     pub funcs: HashMap<String, Sig>,
     pub classes: HashMap<String, ClassInfo>,
-    pub traits: HashMap<String, HashMap<String, Sig>>,
+    pub traits: HashMap<String, TraitInfo>,
     pub builtin_classes: HashSet<String>,
     pub builtin_traits: HashSet<String>,
     pub filename: Arc<str>,
 }
 
 impl ModInfo {
-    fn type_lookup(&self, n: &str) -> Option<(u32, TypeName)> {
+    fn type_lookup(&self, n: &str, scope: &Scope) -> Option<(u32, TypeName)> {
+        if let Some((_, k)) = scope.iter().find(|(s, _)| s == n) {
+            return Some((0, TypeName::Param(*k)));
+        }
         let idx = *self.gindex.get(n)?;
-        if self.classes.contains_key(n) || self.builtin_classes.contains(n) {
-            Some((idx, TypeName::Class))
-        } else if self.traits.contains_key(n) || self.builtin_traits.contains(n) {
-            Some((idx, TypeName::Trait))
+        if let Some(ci) = self.classes.get(n) {
+            Some((idx, TypeName::Class(ci.tparams.len())))
+        } else if self.builtin_classes.contains(n) {
+            Some((idx, TypeName::Class(0)))
+        } else if let Some(t) = self.traits.get(n) {
+            Some((idx, TypeName::Trait(t.tparams.len())))
+        } else if self.builtin_traits.contains(n) {
+            Some((idx, TypeName::Trait(builtin_trait(n).map_or(0, |t| t.1))))
         } else {
             None
         }
     }
 
-    fn resolve_type(&self, t: &TypeExpr) -> R<(Ty, TypeDesc)> {
-        resolve(t, &|n| self.type_lookup(n)).map_err(|m| type_err(m, t.span()))
+    fn resolve_scoped(&self, t: &TypeExpr, scope: &Scope) -> R<(Ty, TypeDesc)> {
+        resolve(t, &|n| self.type_lookup(n, scope)).map_err(|m| type_err(m, t.span()))
     }
 
-    fn sig_of(&self, f: &FuncDef, skip_self: bool) -> R<Sig> {
+    /// Resolves the bounds of type parameters `tps` (with `scope` in view).
+    fn tparam_sigs(&self, tps: &[TypeParam], scope: &Scope) -> R<Vec<TParamSig>> {
+        let mut out = Vec::new();
+        for tp in tps {
+            if scope.iter().filter(|(n, _)| *n == tp.name).count() > 1 || self.gindex.contains_key(&tp.name) && self.type_lookup(&tp.name, &[]).is_some() {
+                return Err(type_err(format!("type parameter `{}` shadows another type", tp.name), tp.span));
+            }
+            let mut bounds = Vec::new();
+            for b in &tp.bounds {
+                let (ty, _) = self.resolve_scoped(b, scope)?;
+                if !matches!(ty, Ty::Trait(..)) {
+                    return Err(type_err(format!("bound `{}` of `{}` is not a trait", ty.name(), tp.name), b.span()));
+                }
+                bounds.push(ty);
+            }
+            out.push(TParamSig { name: tp.name.clone(), bounds });
+        }
+        Ok(out)
+    }
+
+    /// `outer`: type parameters of the enclosing class or trait.
+    fn sig_of(&self, f: &FuncDef, skip_self: bool, outer: &[TParamSig]) -> R<Sig> {
+        let scope: Vec<(String, u16)> =
+            outer.iter().map(|t| t.name.clone()).chain(f.tparams.iter().map(|t| t.name.clone())).map(|n| (n, 0)).collect();
+        for tp in &f.tparams {
+            if outer.iter().any(|o| o.name == tp.name) {
+                return Err(type_err(format!("type parameter `{}` shadows the enclosing one", tp.name), tp.span));
+            }
+        }
+        let tparams = self.tparam_sigs(&f.tparams, &scope)?;
         let mut params = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
             if skip_self && i == 0 {
                 continue;
             }
             let ty = match &p.ty {
-                Some(t) => self.resolve_type(t)?.0,
+                Some(t) => self.resolve_scoped(t, &scope)?.0,
                 None => Ty::Unknown,
             };
             params.push(ParamSig { name: p.name.clone(), keep: p.keep, ty });
         }
         let ret = match &f.ret {
-            Some(t) => self.resolve_type(t)?.0,
+            Some(t) => self.resolve_scoped(t, &scope)?.0,
             None => Ty::Unknown,
         };
-        Ok(Sig { params, ret })
+        Ok(Sig { tparams, params, ret })
     }
+
+    /// Type parameters of a trait (empty for builtin and unknown traits).
+    fn trait_tparams(&self, t: &str) -> Vec<TParamSig> {
+        self.traits.get(t).map(|t| t.tparams.clone()).unwrap_or_default()
+    }
+
+    /// The traits a class instance implements, with arguments substituted.
+    fn impls_of(&self, c: &str, args: &[Ty]) -> Vec<(String, Vec<Ty>)> {
+        if self.builtin_classes.contains(c) {
+            return vec![("Exception".into(), Vec::new())];
+        }
+        let Some(ci) = self.classes.get(c) else { return Vec::new() };
+        let map = class_map(ci, args);
+        ci.impls.iter().map(|(t, a)| (t.clone(), a.iter().map(|x| x.subst(&map)).collect())).collect()
+    }
+
+    /// Whether `t` implements trait `bound` (`Ty::Trait`). `pb` gives the
+    /// bounds of type parameters in scope. Unknown types pass (the runtime
+    /// checks them).
+    fn satisfies(&self, t: &Ty, bound: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>) -> bool {
+        let Ty::Trait(b, bargs) = bound else { return true };
+        let args_match = |got: &[Ty]| bargs.is_empty() || got.len() == bargs.len() && got.iter().zip(bargs).all(|(x, y)| ty_compatible(y, x) && ty_compatible(x, y));
+        let item = |it: Ty| args_match(&[it]);
+        match t {
+            Ty::Unknown | Ty::Any => true,
+            Ty::Param(n) => pb(n).iter().any(|pbound| self.trait_implies(pbound, b, bargs)),
+            Ty::Instance(c, cargs) => self.impls_of(c, cargs).iter().any(|(tn, ta)| tn == b && args_match(ta)),
+            Ty::Trait(tn, ta) => self.trait_implies(&Ty::Trait(tn.clone(), ta.clone()), b, bargs),
+            _ => match b.as_str() {
+                "Ord" => match t {
+                    Ty::Int | Ty::Float | Ty::BigInt | Ty::Bool | Ty::Str | Ty::Tuple(None) => true,
+                    Ty::Tuple(Some(ts)) => ts.iter().all(|x| self.satisfies(x, bound, pb)),
+                    _ => false,
+                },
+                "Num" => matches!(t, Ty::Int | Ty::Float | Ty::BigInt),
+                "Hash" => match t {
+                    Ty::List(_) | Ty::Dict(..) | Ty::Array(_) => false,
+                    Ty::Tuple(Some(ts)) => ts.iter().all(|x| self.satisfies(x, bound, pb)),
+                    Ty::Option(x) => self.satisfies(x, bound, pb),
+                    _ => true,
+                },
+                "Len" => matches!(t, Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Array(_) | Ty::Tuple(_) | Ty::Chan(_)),
+                "Iterable" => match t {
+                    Ty::List(x) | Ty::Iter(x) | Ty::Dict(x, _) => **x == Ty::Unknown || item((**x).clone()),
+                    Ty::Str => item(Ty::Str),
+                    Ty::Array(Some(e)) => item(elem_ty(*e)),
+                    Ty::Array(None) | Ty::Tuple(_) => true,
+                    _ => false,
+                },
+                "Iterator" => match t {
+                    Ty::Iter(x) => **x == Ty::Unknown || item((**x).clone()),
+                    _ => false,
+                },
+                _ => false,
+            },
+        }
+    }
+
+    /// Checks that the type arguments in `t` satisfy their bounds and that
+    /// dict keys are hashable.
+    fn check_wf(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>, span: Span) -> R<()> {
+        match t {
+            Ty::Instance(c, args) | Ty::Trait(c, args) => {
+                let tps = match self.classes.get(c) {
+                    Some(ci) => ci.tparams.clone(),
+                    None => self.trait_tparams(c),
+                };
+                let map = tparam_map(&tps, args);
+                for (tp, a) in tps.iter().zip(args) {
+                    for b in &tp.bounds {
+                        let b = b.subst(&map);
+                        if !self.satisfies(a, &b, pb) {
+                            return Err(type_err(
+                                format!("`{}` does not implement `{}` (required by `{}` of `{c}`)", a.name(), b.name(), tp.name),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                args.iter().try_for_each(|a| self.check_wf(a, pb, span))
+            }
+            Ty::Dict(k, v) => {
+                if !self.satisfies(k, &Ty::Trait("Hash".into(), Vec::new()), pb) {
+                    return Err(type_err(format!("`{}` cannot be a dict key: it does not implement `Hash`", k.name()), span));
+                }
+                self.check_wf(k, pb, span)?;
+                self.check_wf(v, pb, span)
+            }
+            Ty::List(x) | Ty::Iter(x) | Ty::Chan(x) | Ty::Option(x) | Ty::TypeVal(x) => self.check_wf(x, pb, span),
+            Ty::Tuple(Some(ts)) => ts.iter().try_for_each(|a| self.check_wf(a, pb, span)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a bound `have` (`Ty::Trait`) provides trait `want<wargs>`.
+    fn trait_implies(&self, have: &Ty, want: &str, wargs: &[Ty]) -> bool {
+        let Ty::Trait(h, hargs) = have else { return false };
+        if h == want {
+            return wargs.is_empty() || hargs == wargs || hargs.is_empty();
+        }
+        builtin_trait(h).is_some_and(|(_, _, implies, _)| implies.iter().any(|i| *i == want && (wargs.is_empty() || hargs == wargs)))
+    }
+
+    /// The methods a value of type `t` is statically known to have, from a
+    /// trait type. `None` when nothing is known.
+    fn trait_methods(&self, t: &str, args: &[Ty]) -> Option<HashMap<String, Sig>> {
+        let ti = self.traits.get(t)?;
+        let map = tparam_map(&ti.tparams, args);
+        Some(ti.methods.iter().map(|(n, s)| (n.clone(), s.subst(&map))).collect())
+    }
+}
+
+/// Substitution of a class's type parameters by `args` (`Unknown` when the
+/// instance's arguments are not known).
+fn class_map<'a>(ci: &'a ClassInfo, args: &'a [Ty]) -> impl Fn(&str) -> Option<Ty> + 'a {
+    tparam_map(&ci.tparams, args)
+}
+
+fn tparam_map<'a>(tps: &'a [TParamSig], args: &'a [Ty]) -> impl Fn(&str) -> Option<Ty> + 'a {
+    move |n| tps.iter().position(|t| t.name == n).map(|k| args.get(k).cloned().unwrap_or(Ty::Unknown))
 }
 
 /// Compiles a parsed module. Returns the module code and the global names.
@@ -142,10 +347,8 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
         .filter(|n| *n != "LookupError" && *n != "ArithmeticError")
         .map(String::from)
         .collect();
-    let builtin_traits: HashSet<String> =
-        ["Exception", "LookupError", "ArithmeticError", "Iterator"].iter().map(|s| s.to_string()).collect();
+    let builtin_traits: HashSet<String> = BUILTIN_TRAITS.iter().map(|t| t.0.to_string()).collect();
     let mut info = ModInfo {
-        globals: globals.clone(),
         gindex,
         module_vars: module_vars.iter().cloned().collect(),
         funcs: HashMap::new(),
@@ -155,17 +358,38 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
         builtin_traits,
         filename: filename.into(),
     };
-    // Register class and trait names first so annotations can refer to them.
+    let names = |tps: &[TypeParam]| tps.iter().map(|t| TParamSig { name: t.name.clone(), bounds: Vec::new() }).collect::<Vec<_>>();
+    let scope_of = |tps: &[TypeParam]| tps.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect::<Vec<_>>();
+    // Register class and trait names (and arities) first so annotations can
+    // refer to them.
     for s in &module.body.stmts {
         match &s.kind {
             StmtKind::Class(c) => {
                 if builtin_names.contains(&c.name) {
                     return Err(syn_err(format!("cannot redefine builtin `{}`", c.name), c.span));
                 }
-                info.classes.insert(c.name.clone(), ClassInfo { fields: Vec::new(), methods: HashMap::new() });
+                let ci = ClassInfo { tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new() };
+                info.classes.insert(c.name.clone(), ci);
             }
             StmtKind::Trait(t) => {
-                info.traits.insert(t.name.clone(), HashMap::new());
+                if builtin_names.contains(&t.name) {
+                    return Err(syn_err(format!("cannot redefine builtin `{}`", t.name), t.span));
+                }
+                info.traits.insert(t.name.clone(), TraitInfo { tparams: names(&t.tparams), methods: HashMap::new() });
+            }
+            _ => {}
+        }
+    }
+    // Bounds of class and trait type parameters.
+    for s in &module.body.stmts {
+        match &s.kind {
+            StmtKind::Class(c) => {
+                let tps = info.tparam_sigs(&c.tparams, &scope_of(&c.tparams))?;
+                info.classes.get_mut(&c.name).unwrap().tparams = tps;
+            }
+            StmtKind::Trait(t) => {
+                let tps = info.tparam_sigs(&t.tparams, &scope_of(&t.tparams))?;
+                info.traits.get_mut(&t.name).unwrap().tparams = tps;
             }
             _ => {}
         }
@@ -173,24 +397,27 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
     for s in &module.body.stmts {
         match &s.kind {
             StmtKind::Def(f) => {
-                let sig = info.sig_of(f, false)?;
+                let sig = info.sig_of(f, false, &[])?;
                 info.funcs.insert(f.name.clone(), sig);
             }
             StmtKind::Trait(t) => {
+                let tps = info.trait_tparams(&t.name);
                 let mut ms = HashMap::new();
                 for m in &t.methods {
                     check_method_typing(m)?;
-                    ms.insert(m.name.clone(), info.sig_of(m, true)?);
+                    ms.insert(m.name.clone(), info.sig_of(m, true, &tps)?);
                 }
-                info.traits.insert(t.name.clone(), ms);
+                info.traits.get_mut(&t.name).unwrap().methods = ms;
             }
             StmtKind::Class(c) => {
+                let tps = info.classes[&c.name].tparams.clone();
+                let scope = scope_of(&c.tparams);
                 let mut fields = Vec::new();
                 for f in &c.fields {
                     if fields.iter().any(|(n, _, _): &(String, Ty, TypeDesc)| *n == f.name) {
                         return Err(syn_err(format!("duplicate field `{}`", f.name), f.span));
                     }
-                    let (ty, d) = info.resolve_type(&f.ty)?;
+                    let (ty, d) = info.resolve_scoped(&f.ty, &scope)?;
                     fields.push((f.name.clone(), ty, d));
                 }
                 let mut methods = HashMap::new();
@@ -199,38 +426,75 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
                     if fields.iter().any(|(n, _, _)| *n == m.name) {
                         return Err(syn_err(format!("`{}` is both a field and a method", m.name), m.span));
                     }
-                    methods.insert(m.name.clone(), info.sig_of(m, true)?);
+                    methods.insert(m.name.clone(), info.sig_of(m, true, &tps)?);
                 }
-                info.classes.insert(c.name.clone(), ClassInfo { fields, methods });
+                let mut impls: Vec<(String, Vec<Ty>)> = Vec::new();
+                for (tname, targs, tspan) in &c.traits {
+                    let arity = match (info.traits.get(tname), builtin_trait(tname)) {
+                        (Some(t), _) => t.tparams.len(),
+                        (None, Some(b)) => b.1,
+                        (None, None) => {
+                            if info.classes.contains_key(tname) || info.builtin_classes.contains(tname) {
+                                return Err(type_err(
+                                    format!("`{tname}` is a class, not a trait; classes cannot inherit (use a field and delegate by hand)"),
+                                    *tspan,
+                                ));
+                            }
+                            return Err(name_err(format!("unknown trait `{tname}`"), *tspan));
+                        }
+                    };
+                    if targs.len() != arity {
+                        return Err(type_err(
+                            match arity {
+                                0 => format!("trait `{tname}` does not take type arguments"),
+                                n => format!("trait `{tname}` takes {n} type argument{}: `impl {tname}<...>`", if n == 1 { "" } else { "s" }),
+                            },
+                            *tspan,
+                        ));
+                    }
+                    if impls.iter().any(|(t, _)| t == tname) {
+                        return Err(type_err(format!("class `{}` implements `{tname}` twice", c.name), *tspan));
+                    }
+                    let mut args = Vec::new();
+                    for a in targs {
+                        args.push(info.resolve_scoped(a, &scope)?.0);
+                    }
+                    impls.push((tname.clone(), args.clone()));
+                    if let Some((_, _, implies, _)) = builtin_trait(tname) {
+                        for i in implies.iter() {
+                            if !impls.iter().any(|(t, _)| t == i) {
+                                let a = if builtin_trait(i).is_some_and(|b| b.1 == args.len()) { args.clone() } else { Vec::new() };
+                                impls.push((i.to_string(), a));
+                            }
+                        }
+                    }
+                }
+                let ci = info.classes.get_mut(&c.name).unwrap();
+                ci.fields = fields;
+                ci.methods = methods;
+                ci.impls = impls;
             }
             _ => {}
         }
     }
-    // Trait default methods become available on implementing classes.
+    // Trait default methods become available on implementing classes, with
+    // the trait's type parameters replaced by the impl's arguments.
     for s in &module.body.stmts {
         if let StmtKind::Class(c) = &s.kind {
-            for (tname, tspan) in &c.traits {
-                if let Some(tm) = info.traits.get(tname) {
-                    let tm = tm.clone();
+            let impls = info.classes[&c.name].impls.clone();
+            for (tname, targs) in impls {
+                if let Some(tm) = info.trait_methods(&tname, &targs) {
                     let ci = info.classes.get_mut(&c.name).unwrap();
                     for (n, sig) in tm {
                         ci.methods.entry(n).or_insert(sig);
                     }
-                } else if !info.builtin_traits.contains(tname) {
-                    if info.classes.contains_key(tname) || info.builtin_classes.contains(tname) {
-                        return Err(type_err(
-                            format!("`{tname}` is a class, not a trait; classes cannot inherit (use a field and delegate by hand)"),
-                            *tspan,
-                        ));
-                    }
-                    return Err(name_err(format!("unknown trait `{tname}`"), *tspan));
                 }
             }
         }
     }
     for s in &module.body.stmts {
         if let StmtKind::Class(c) = &s.kind {
-            for (tname, _) in &c.traits {
+            for (tname, _, _) in &c.traits {
                 let Some(tdef) = module.body.stmts.iter().find_map(|s| match &s.kind {
                     StmtKind::Trait(t) if t.name == *tname => Some(t),
                     _ => None,
@@ -450,6 +714,21 @@ struct FnCtx<'m> {
     yield_tys: Vec<Ty>,
     /// The declared item type of this generator (`-> Iterator<T>`).
     yield_decl: Option<Ty>,
+    /// Type parameters in scope, with the registers holding their types.
+    tscope: Vec<TPar>,
+    /// This function's own type parameters (hidden leading parameters).
+    code_tparams: Vec<TypeParamInfo>,
+    /// Static types of the arguments of the last `call_args`.
+    last_arg_tys: Vec<Ty>,
+}
+
+/// A type parameter in scope: its name, the register holding its runtime
+/// type, and its bounds.
+#[derive(Clone, Debug)]
+struct TPar {
+    name: String,
+    reg: Reg,
+    bounds: Vec<Ty>,
 }
 
 impl<'m> FnCtx<'m> {
@@ -495,6 +774,9 @@ impl<'m> FnCtx<'m> {
             expect: None,
             yield_tys: Vec::new(),
             yield_decl: None,
+            tscope: Vec::new(),
+            code_tparams: Vec::new(),
+            last_arg_tys: Vec::new(),
         }
     }
 
@@ -533,6 +815,7 @@ impl<'m> FnCtx<'m> {
             arglists: self.arglists,
             types: self.types,
             type_cache,
+            tparams: self.code_tparams,
             yield_ty,
             codes: self.codes,
             classes: self.classes,
@@ -639,6 +922,196 @@ impl<'m> FnCtx<'m> {
 
     fn load_imm(&mut self, dst: Reg, v: Value) {
         self.emit(Instr::LoadImm { dst, bits: v.0 as i64 as i32 });
+    }
+
+    // ------------------------------------------------------------ types
+
+    fn scope(&self) -> Vec<(String, u16)> {
+        self.tscope.iter().map(|t| (t.name.clone(), t.reg)).collect()
+    }
+
+    /// The bounds of type parameter `n` (empty if it is not in scope).
+    fn pbounds(&self, n: &str) -> Vec<Ty> {
+        self.tscope.iter().find(|t| t.name == n).map(|t| t.bounds.clone()).unwrap_or_default()
+    }
+
+    /// Resolves an annotation with the type parameters in scope, checking
+    /// that its type arguments satisfy their bounds.
+    fn resolve_type(&self, t: &TypeExpr) -> R<(Ty, TypeDesc)> {
+        let r = self.m.resolve_scoped(t, &self.scope())?;
+        self.m.check_wf(&r.0, &|n| self.pbounds(n), t.span())?;
+        Ok(r)
+    }
+
+    fn satisfies(&self, t: &Ty, bound: &Ty) -> bool {
+        self.m.satisfies(t, bound, &|n| self.pbounds(n))
+    }
+
+    /// Whether a value of static type `v` may be used where `d` is expected
+    /// (trait types are checked against the traits `v` implements).
+    fn compatible(&self, d: &Ty, v: &Ty) -> bool {
+        match (d, v) {
+            (Ty::Trait(..), v) if !matches!(v, Ty::Unknown | Ty::Any | Ty::NoneT) => self.satisfies(v, d),
+            (Ty::Option(a), Ty::Option(b)) => self.compatible(a, b),
+            (Ty::Option(a), b) if !matches!(b, Ty::NoneT) => self.compatible(a, b),
+            _ => ty_compatible(d, v),
+        }
+    }
+
+    /// The type arguments with which a value of type `t` provides trait `b`
+    /// (`list<int>` provides `Iterable<int>`).
+    fn trait_args_of(&self, t: &Ty, b: &str) -> Option<Vec<Ty>> {
+        let iter_like = b == "Iterable" || b == "Iterator";
+        match t {
+            Ty::Instance(c, args) => self.m.impls_of(c, args).into_iter().find(|(n, _)| n == b).map(|(_, a)| a),
+            Ty::Trait(n, args) if n == b || (n == "Iterator" && b == "Iterable") => Some(args.clone()),
+            Ty::Param(n) => self.pbounds(n).into_iter().find_map(|x| match x {
+                Ty::Trait(bn, args) if bn == b || (bn == "Iterator" && b == "Iterable") => Some(args),
+                _ => None,
+            }),
+            Ty::Iter(x) if iter_like => Some(vec![(**x).clone()]),
+            Ty::List(x) | Ty::Dict(x, _) | Ty::Chan(x) if b == "Iterable" => Some(vec![(**x).clone()]),
+            Ty::Str if b == "Iterable" => Some(vec![Ty::Str]),
+            Ty::Array(Some(e)) if b == "Iterable" => Some(vec![elem_ty(*e)]),
+            _ => None,
+        }
+    }
+
+    /// The type of the items a `for` loop over a `t` produces.
+    fn item_ty(&self, t: &Ty, span: Span) -> R<Ty> {
+        match t {
+            Ty::Param(n) => match self.trait_args_of(t, "Iterable") {
+                Some(a) => Ok(a.into_iter().next().unwrap_or(Ty::Unknown)),
+                None => Err(type_err(format!("iterating over `{n}` requires a bound `{n}: Iterable<...>`"), span)),
+            },
+            Ty::Instance(..) | Ty::Trait(..) => {
+                Ok(self.trait_args_of(t, "Iterable").and_then(|a| a.into_iter().next()).map(|t| if t == Ty::Any { Ty::Unknown } else { t }).unwrap_or(Ty::Unknown))
+            }
+            _ => Ok(t.item()),
+        }
+    }
+
+    /// Requires that a value of type parameter type `t` implements `tr` for
+    /// operation `what` (strict bounds in generic code).
+    fn require(&self, t: &Ty, tr: &str, what: &str, span: Span) -> R<()> {
+        if let Ty::Param(n) = t {
+            if !self.satisfies(t, &Ty::Trait(tr.into(), Vec::new())) {
+                return Err(type_err(format!("{what} on `{n}` requires a bound `{n}: {tr}`"), span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds type parameters `tps` in `out` by matching parameter type `p`
+    /// against argument type `a`.
+    fn unify(&self, p: &Ty, a: &Ty, tps: &[TParamSig], out: &mut [Option<Ty>]) {
+        match (p, a) {
+            (Ty::Param(n), _) => {
+                if let Some(k) = tps.iter().position(|t| t.name == *n) {
+                    if out[k].is_none() && a.is_precise() && !matches!(a, Ty::NoneT | Ty::Any) {
+                        out[k] = Some(a.clone());
+                    }
+                }
+            }
+            (Ty::List(x), Ty::List(y)) | (Ty::Iter(x), Ty::Iter(y)) | (Ty::Chan(x), Ty::Chan(y)) | (Ty::Option(x), Ty::Option(y)) => {
+                self.unify(x, y, tps, out)
+            }
+            (Ty::Option(x), y) => self.unify(x, y, tps, out),
+            (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => {
+                self.unify(k1, k2, tps, out);
+                self.unify(v1, v2, tps, out);
+            }
+            (Ty::Tuple(Some(xs)), Ty::Tuple(Some(ys))) if xs.len() == ys.len() => {
+                for (x, y) in xs.iter().zip(ys) {
+                    self.unify(x, y, tps, out);
+                }
+            }
+            (Ty::Instance(c1, xs), Ty::Instance(c2, ys)) if c1 == c2 && xs.len() == ys.len() => {
+                for (x, y) in xs.iter().zip(ys) {
+                    self.unify(x, y, tps, out);
+                }
+            }
+            (Ty::Trait(b, xs), _) if !xs.is_empty() => {
+                if let Some(ys) = self.trait_args_of(a, b) {
+                    for (x, y) in xs.iter().zip(&ys) {
+                        self.unify(x, y, tps, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Compiles the arguments of a call of generic `sig` and infers its type
+    /// parameters from `explicit` (a turbofish), the expected result type and
+    /// the argument types. Returns the arguments, the type arguments (`None`
+    /// where not inferred) and the result type.
+    #[allow(clippy::too_many_arguments)]
+    fn generic_call_args(
+        &mut self,
+        sig: &Sig,
+        explicit: Option<Vec<Ty>>,
+        expect: Option<&Ty>,
+        args: &[Expr],
+        recv_root: Option<Reg>,
+        what: &str,
+        span: Span,
+    ) -> R<(ArgList, Vec<Option<Ty>>, Ty)> {
+        let tps = &sig.tparams;
+        let mut known: Vec<Option<Ty>> = match explicit {
+            Some(v) => v.into_iter().map(Some).collect(),
+            None => vec![None; tps.len()],
+        };
+        if let Some(e) = expect {
+            self.unify(&sig.ret, e, tps, &mut known);
+        }
+        let full = |known: &[Option<Ty>]| {
+            let k = known.to_vec();
+            move |n: &str| tps.iter().position(|t| t.name == n).map(|i| k[i].clone().unwrap_or(Ty::Unknown))
+        };
+        let pre = sig.subst(&full(&known));
+        let keep_of = |i: usize| pre.params.get(i).map(|p| p.keep);
+        let ty_of = |i: usize| pre.params.get(i).map(|p| (p.name.clone(), p.ty.clone()));
+        let al = self.call_args(args, &keep_of, &ty_of, recv_root, span)?;
+        let arg_tys = std::mem::take(&mut self.last_arg_tys);
+        for (p, a) in sig.params.iter().zip(&arg_tys) {
+            self.unify(&p.ty, a, tps, &mut known);
+        }
+        let post = sig.subst(&full(&known));
+        for ((p, a), e) in post.params.iter().zip(&arg_tys).zip(args) {
+            if !self.compatible(&p.ty, a) {
+                return Err(type_err(format!("argument `{}` expects `{}`, got `{}`", p.name, p.ty.name(), a.name()), e.span));
+            }
+        }
+        for (k, tp) in post.tparams.iter().enumerate() {
+            if let Some(t) = &known[k] {
+                for b in &tp.bounds {
+                    if !self.satisfies(t, b) {
+                        return Err(type_err(
+                            format!("`{}` does not implement `{}` (required by `{}` of `{what}`)", t.name(), b.name(), tp.name),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        self.last_arg_tys = arg_tys;
+        Ok((al, known, post.ret))
+    }
+
+    /// Loads the runtime types `tys` into fresh registers.
+    fn make_types(&mut self, tys: &[Ty]) -> Option<Vec<Reg>> {
+        let ds: Vec<TypeDesc> = tys.iter().map(|t| self.ty_desc(t)).collect::<Option<_>>()?;
+        Some(
+            ds.into_iter()
+                .map(|d| {
+                    let dst = self.tmp_borrow();
+                    let ti = self.type_idx(d);
+                    self.emit(Instr::MakeType { dst, ty: ti });
+                    dst
+                })
+                .collect(),
+        )
     }
 
     // ------------------------------------------------------------ state helpers
@@ -795,7 +1268,7 @@ impl<'m> FnCtx<'m> {
                 let ExprKind::Name(n) = &target.kind else {
                     return Err(syn_err("only simple names can be annotated", target.span));
                 };
-                let (ty, d) = self.m.resolve_type(ann)?;
+                let (ty, d) = self.resolve_type(ann)?;
                 if let Some(l) = self.locals.get_mut(n) {
                     l.decl = Some((ty.clone(), d.clone()));
                 } else if self.is_module {
@@ -1185,6 +1658,7 @@ impl<'m> FnCtx<'m> {
                 }
                 let kt = self.literal_elem(kctx, &ktys, "dict key", e.span)?;
                 let vt = self.literal_elem(vctx, &vtys, "dict value", e.span)?;
+                self.m.check_wf(&Ty::dict(kt.clone(), vt.clone()), &|n| self.pbounds(n), e.span)?;
                 let ti = self.type_idx(TypeDesc::Builtin(Ctor::Dict, vec![self.elem_desc(&kt), self.elem_desc(&vt)]));
                 let al = self.arglist(ArgList { args, pins: false });
                 let dst = self.tmp_owned();
@@ -1195,11 +1669,38 @@ impl<'m> FnCtx<'m> {
                 let ExprKind::Name(n) = &base.kind else {
                     return Err(syn_err("type arguments (`::<...>`) follow a type name", e.span));
                 };
+                if let Some((sig, _)) = self.static_sig(base).filter(|(s, _)| !s.tparams.is_empty()) {
+                    let tys = self.explicit_targs(targs, sig.tparams.len(), n, e.span)?;
+                    for (tp, t) in sig.tparams.iter().zip(&tys) {
+                        for b in &tp.bounds {
+                            let b = b.subst(&tparam_map(&sig.tparams, &tys));
+                            if !self.satisfies(t, &b) {
+                                return Err(type_err(format!("`{}` does not implement `{}` (required by `{}` of `{n}`)", t.name(), b.name(), tp.name), e.span));
+                            }
+                        }
+                    }
+                    if self.m.classes.contains_key(n) {
+                        // `Stack::<int>`: the instantiated class type.
+                        let ty = Ty::Instance(n.clone(), tys);
+                        let d = self.ty_desc(&ty).ok_or_else(|| type_err(format!("cannot instantiate `{}` here", ty.name()), e.span))?;
+                        let dst = self.tmp_owned();
+                        let ti = self.type_idx(d);
+                        self.emit(Instr::MakeType { dst, ty: ti });
+                        return Ok(owned(dst, Ty::TypeVal(Box::new(ty))));
+                    }
+                    // `first::<str>`: the function with its type arguments bound.
+                    let f = self.expr(base)?;
+                    let regs = self.make_types(&tys).ok_or_else(|| type_err("cannot instantiate this function here", e.span))?;
+                    let al = self.arglist(ArgList { args: regs.into_iter().map(|r| Arg::new(r, false, false, None)).collect(), pins: false });
+                    let dst = self.tmp_owned();
+                    self.emit(Instr::Instantiate { dst, func: f.reg, targs: al });
+                    return Ok(owned(dst, Ty::Func));
+                }
                 if !matches!(n.as_str(), "list" | "dict" | "Channel") || !self.is_global_name(n) || self.m.module_vars.contains(n) {
                     return Err(type_err(format!("`{n}` does not take type arguments"), e.span));
                 }
                 let te = TypeExpr::Named(n.clone(), targs.clone(), e.span);
-                let (ty, d) = self.m.resolve_type(&te)?;
+                let (ty, d) = self.resolve_type(&te)?;
                 let dst = self.tmp_owned();
                 let ti = self.type_idx(d);
                 self.emit(Instr::MakeType { dst, ty: ti });
@@ -1208,6 +1709,9 @@ impl<'m> FnCtx<'m> {
             ExprKind::Attr(obj, name) => self.attr_expr(obj, name, e.span),
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
+                if let Ty::Param(n) = &o.ty {
+                    return Err(type_err(format!("cannot index a value of type parameter `{n}`"), e.span));
+                }
                 let i = self.expr(idx)?;
                 if let Ty::Array(e) = o.ty {
                     // Array elements are scalars: read an owned copy.
@@ -1246,6 +1750,13 @@ impl<'m> FnCtx<'m> {
             }
             ExprKind::Unary(op, x) => {
                 let r = self.expr(x)?;
+                if let Ty::Param(n) = &r.ty {
+                    match op {
+                        UnOp::Not => {}
+                        UnOp::Neg | UnOp::Pos => self.require(&r.ty, "Num", &format!("unary `{}`", if *op == UnOp::Neg { "-" } else { "+" }), e.span)?,
+                        UnOp::Invert => return Err(type_err(format!("`~` is not supported on type parameter `{n}`"), e.span)),
+                    }
+                }
                 let dst = self.tmp_owned();
                 let ty = match op {
                     UnOp::Not => {
@@ -1260,7 +1771,7 @@ impl<'m> FnCtx<'m> {
                         };
                         self.emit(Instr::Unary { dst, op: k, src: r.reg });
                         match r.ty {
-                            Ty::Int | Ty::Float | Ty::BigInt => r.ty.clone(),
+                            Ty::Int | Ty::Float | Ty::BigInt | Ty::Param(_) => r.ty.clone(),
                             _ => Ty::Unknown,
                         }
                     }
@@ -1271,6 +1782,7 @@ impl<'m> FnCtx<'m> {
             ExprKind::Binary(op, a, b) => {
                 let x = self.expr(a)?;
                 let y = self.expr(b)?;
+                let pty = self.param_binop(*op, &x.ty, &y.ty, e.span)?;
                 let dst = self.tmp_owned();
                 let ins = match op {
                     BinOp::Add => Instr::Add { dst, a: x.reg, b: y.reg },
@@ -1292,7 +1804,7 @@ impl<'m> FnCtx<'m> {
                     }
                 };
                 self.emit(ins);
-                let ty = binop_ty(*op, &x.ty, &y.ty);
+                let ty = pty.unwrap_or_else(|| binop_ty(*op, &x.ty, &y.ty));
                 self.discard(&y);
                 self.discard(&x);
                 Ok(owned(dst, ty))
@@ -1364,7 +1876,7 @@ impl<'m> FnCtx<'m> {
                     }
                 };
                 if let Some(d) = &self.yield_decl {
-                    if !ty_compatible(d, &ty) {
+                    if !self.compatible(d, &ty) {
                         return Err(type_err(format!("`{}` yields `{}`, not `{}`", self.name, d.name(), ty.name()), e.span));
                     }
                 }
@@ -1378,9 +1890,9 @@ impl<'m> FnCtx<'m> {
                     return Err(syn_err("`yield from` outside of a function", e.span));
                 }
                 let s = self.expr(sub)?;
-                let item = s.ty.item();
+                let item = self.item_ty(&s.ty, sub.span)?;
                 if let Some(d) = &self.yield_decl {
-                    if !ty_compatible(d, &item) {
+                    if !self.compatible(d, &item) {
                         return Err(type_err(format!("`{}` yields `{}`, not `{}`", self.name, d.name(), item.name()), e.span));
                     }
                 }
@@ -1412,7 +1924,7 @@ impl<'m> FnCtx<'m> {
         let (lit, example) = if what.starts_with("list") { ("[]", "xs: list<int> = []") } else { ("{}", "d: dict<str, int> = {}") };
         if let Some(t) = ctx {
             for (it, sp) in items {
-                if !ty_compatible(&t, it) {
+                if !self.compatible(&t, it) {
                     return Err(type_err(format!("cannot use a `{}` as a {what} of type `{}`", it.name(), t.name()), *sp));
                 }
             }
@@ -1453,10 +1965,10 @@ impl<'m> FnCtx<'m> {
         let o = self.expr(obj)?;
         self.option_check(&o, &format!("accessing `.{name}`"), span)?;
         let mut ty = Ty::Unknown;
-        if let Ty::Instance(c) = &o.ty {
+        if let Ty::Instance(c, args) = &o.ty {
             if let Some(ci) = self.m.classes.get(c) {
                 if let Some((_, fty, _)) = ci.fields.iter().find(|(n, _, _)| n == name) {
-                    ty = fty.clone();
+                    ty = fty.subst(&class_map(ci, args));
                 } else if ci.methods.contains_key(name) {
                     ty = Ty::Func;
                 } else {
@@ -1464,8 +1976,14 @@ impl<'m> FnCtx<'m> {
                 }
             }
         }
+        if let Ty::Param(n) = &o.ty {
+            if self.param_method(n, name).is_none() {
+                return Err(type_err(param_field_msg(n, name), span));
+            }
+            ty = Ty::Func;
+        }
         if ty == Ty::Unknown && name == "msg" {
-            if let Ty::Instance(c) = &o.ty {
+            if let Ty::Instance(c, _) = &o.ty {
                 if self.m.builtin_classes.contains(c) {
                     ty = Ty::Str;
                 }
@@ -1538,6 +2056,7 @@ impl<'m> FnCtx<'m> {
                 let narrowing = self.narrowing_of(first, *op, rhs);
                 let l = self.expr(first)?;
                 let r = self.expr(rhs)?;
+                self.check_cmp(*op, &l.ty, &r.ty, e.span)?;
                 let t = self.tmp_owned();
                 self.emit_cmp(*op, t, l.reg, r.reg);
                 self.discard(&r);
@@ -1586,6 +2105,7 @@ impl<'m> FnCtx<'m> {
         let mut stubs: Vec<(usize, Option<Reg>)> = Vec::new();
         for (i, (op, rhs)) in rest.iter().enumerate() {
             let right = self.expr(rhs)?;
+            self.check_cmp(*op, &left.ty, &right.ty, rhs.span)?;
             self.emit_cmp(*op, dst, left.reg, right.reg);
             self.discard(&left);
             if i + 1 < rest.len() {
@@ -1610,6 +2130,52 @@ impl<'m> FnCtx<'m> {
             self.patch(j, h);
         }
         Ok(dst)
+    }
+
+    /// Comparisons of type-parameter values need an `Ord` bound (`==`,
+    /// `!=` and `is` work on every value).
+    fn check_cmp(&self, op: CmpOp, a: &Ty, b: &Ty, span: Span) -> R<()> {
+        let sym = match op {
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+            CmpOp::In | CmpOp::NotIn => {
+                if let Ty::Param(n) = b {
+                    return Err(type_err(format!("`in` is not supported on type parameter `{n}`"), span));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let p = match (a, b) {
+            (Ty::Param(n), _) | (_, Ty::Param(n)) => n,
+            _ => return Ok(()),
+        };
+        if a != b && !matches!(a, Ty::Unknown) && !matches!(b, Ty::Unknown) {
+            return Err(type_err(format!("`{sym}` between `{}` and `{}`: both operands must be `{p}`", a.name(), b.name()), span));
+        }
+        let t = if matches!(a, Ty::Param(_)) { a } else { b };
+        self.require(t, "Ord", &format!("`{sym}`"), span)
+    }
+
+    /// Arithmetic on type-parameter values: `T op T -> T` with `T: Num`.
+    /// `None` when neither operand is a type parameter.
+    fn param_binop(&self, op: BinOp, a: &Ty, b: &Ty, span: Span) -> R<Option<Ty>> {
+        let p = match (a, b) {
+            (Ty::Param(n), _) | (_, Ty::Param(n)) => n.clone(),
+            _ => return Ok(None),
+        };
+        let sym = op.symbol();
+        if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) {
+            return Err(type_err(format!("`{sym}` is not supported on type parameter `{p}`"), span));
+        }
+        if a != b {
+            return Err(type_err(format!("`{sym}` between `{}` and `{}`: both operands must be `{p}`", a.name(), b.name()), span));
+        }
+        self.require(a, "Num", &format!("`{sym}`"), span)?;
+        // `/` of ints is a float.
+        Ok(Some(if op == BinOp::Div { Ty::Unknown } else { a.clone() }))
     }
 
     fn emit_cmp(&mut self, op: CmpOp, dst: Reg, a: Reg, b: Reg) {
@@ -1885,7 +2451,7 @@ impl<'m> FnCtx<'m> {
         {
             let mark = self.mark();
             let src = self.expr(iter)?;
-            item_ty = src.ty.item();
+            item_ty = self.item_ty(&src.ty, iter.span)?;
             self.emit(Instr::GetIter { dst: it_reg, src: src.reg });
             self.discard(&src);
             self.end_stmt(mark);
@@ -2060,6 +2626,7 @@ impl<'m> FnCtx<'m> {
                         span,
                     ));
                 }
+                self.check_field_store(&fty, field, &v.ty, value.span)?;
                 let v = self.to_owned(v, value.span, "a field")?;
                 let n = self.name_idx(field);
                 self.emit(Instr::StoreField { obj: o.reg, name: n, src: v.reg, mode: StoreMode::Copy });
@@ -2124,15 +2691,28 @@ impl<'m> FnCtx<'m> {
     }
 
     fn field_ty(&self, obj_ty: &Ty, field: &str, span: Span) -> R<Ty> {
-        if let Ty::Instance(c) = obj_ty {
-            if let Some(ci) = self.m.classes.get(c) {
-                return match ci.fields.iter().find(|(n, _, _)| n == field) {
-                    Some((_, t, _)) => Ok(t.clone()),
-                    None => Err(Error::new("AttributeError", format!("class `{c}` has no field `{field}`"), span)),
-                };
+        match obj_ty {
+            Ty::Instance(c, args) => {
+                if let Some(ci) = self.m.classes.get(c) {
+                    return match ci.fields.iter().find(|(n, _, _)| n == field) {
+                        Some((_, t, _)) => Ok(t.subst(&class_map(ci, args))),
+                        None => Err(Error::new("AttributeError", format!("class `{c}` has no field `{field}`"), span)),
+                    };
+                }
+                Ok(Ty::Unknown)
             }
+            Ty::Param(n) => Err(type_err(param_field_msg(n, field), span)),
+            _ => Ok(Ty::Unknown),
         }
-        Ok(Ty::Unknown)
+    }
+
+    /// A statically wrong store into a typed field is an error (the VM
+    /// checks every store).
+    fn check_field_store(&self, fty: &Ty, field: &str, v: &Ty, span: Span) -> R<()> {
+        if !self.compatible(fty, v) {
+            return Err(type_err(format!("cannot store a `{}` in field `{field}` of type `{}`", v.name(), fty.name()), span));
+        }
+        Ok(())
     }
 
     /// Stores an owned value into a name or tuple target.
@@ -2178,7 +2758,7 @@ impl<'m> FnCtx<'m> {
             self.module_decl_table.get(n).cloned()
         };
         if let Some((dty, _)) = &decl {
-            if !ty_compatible(dty, &v.ty) {
+            if !self.compatible(dty, &v.ty) {
                 return Err(type_err(format!("`{n}` is declared `{}` but assigned a `{}`", dty.name(), v.ty.name()), span));
             }
         }
@@ -2262,7 +2842,8 @@ impl<'m> FnCtx<'m> {
             ExprKind::Name(_) => self.assign_owned(t, cur, span),
             ExprKind::Attr(obj, field) => {
                 let o = self.expr(obj)?;
-                self.field_ty(&o.ty, field, t.span)?;
+                let fty = self.field_ty(&o.ty, field, t.span)?;
+                self.check_field_store(&fty, field, &cur.ty, value.span)?;
                 let n = self.name_idx(field);
                 self.emit(Instr::StoreField { obj: o.reg, name: n, src: cur.reg, mode: StoreMode::Move });
                 if let ExprKind::Name(base) = &obj.kind {
@@ -2290,12 +2871,13 @@ impl<'m> FnCtx<'m> {
     /// the static types prove the check would pass, so it can be skipped.
     fn check_elem_store(&mut self, container: &Ty, k: &Res, v: &Res, span: Span) -> R<bool> {
         let (key, elem) = match container {
+            Ty::Param(n) => return Err(type_err(format!("cannot index a value of type parameter `{n}`"), span)),
             Ty::List(t) => (Ty::Unknown, (**t).clone()),
             Ty::Dict(k, v) => ((**k).clone(), (**v).clone()),
             _ => return Ok(false),
         };
         for (want, got, what) in [(&key, k, "key"), (&elem, v, "element")] {
-            if !ty_compatible(want, &got.ty) {
+            if !self.compatible(want, &got.ty) {
                 return Err(type_err(
                     format!("cannot store `{}` as {what} of `{}`", got.ty.name(), container.name()),
                     span,
@@ -2327,7 +2909,14 @@ impl<'m> FnCtx<'m> {
             Ty::Array(e) => prim(Ctor::Array(*e)),
             Ty::Func | Ty::StaticFn => prim(Ctor::Function),
             Ty::Opaque(n) => prim(if n == "Lock" { Ctor::Lock } else { Ctor::Thread }),
-            Ty::Instance(c) | Ty::Trait(c) => Some(TypeDesc::Global(*self.m.gindex.get(c)?, c.clone())),
+            Ty::Instance(c, args) | Ty::Trait(c, args) => {
+                let idx = *self.m.gindex.get(c)?;
+                // Unknown type arguments: any instantiation.
+                let ds: Option<Vec<TypeDesc>> =
+                    args.iter().map(|a| if *a == Ty::Unknown { None } else { self.ty_desc(a) }).collect();
+                Some(TypeDesc::Global(idx, c.clone(), ds.unwrap_or_default()))
+            }
+            Ty::Param(n) => self.tscope.iter().find(|t| t.name == *n).map(|t| TypeDesc::Param(t.reg, n.clone())),
             Ty::Option(inner) => Some(TypeDesc::option(self.ty_desc(inner)?)),
         }
     }
@@ -2355,6 +2944,7 @@ impl<'m> FnCtx<'m> {
             ExprKind::Attr(obj, field) => {
                 let o = self.expr(obj)?;
                 let fty = self.field_ty(&o.ty, field, t.span)?;
+                self.check_field_store(&fty, field, &v.ty, span)?;
                 let n = self.name_idx(field);
                 self.emit(Instr::SwapField { dst, obj: o.reg, name: n, src: v.reg });
                 if let ExprKind::Name(base) = &obj.kind {
@@ -2417,24 +3007,25 @@ impl<'m> FnCtx<'m> {
 
     // ------------------------------------------------------------ calls
 
-    /// Static signature of a call target, if known.
+    /// Static signature of a call target, if known, with its result type.
+    /// A generic class's constructor has the class's type parameters.
     fn static_sig(&self, f: &Expr) -> Option<(Sig, Ty)> {
         match &f.kind {
             ExprKind::Name(n) if self.is_global_name(n) => {
                 if let Some(s) = self.m.funcs.get(n) {
-                    if !self.m.module_vars.contains(n) || self.m.funcs.contains_key(n) {
-                        return Some((s.clone(), s.ret.clone()));
-                    }
+                    return Some((s.clone(), s.ret.clone()));
                 }
                 if let Some(ci) = self.m.classes.get(n) {
-                    let sig = ci.methods.get("__init__").cloned().unwrap_or(Sig { params: Vec::new(), ret: Ty::Unit });
-                    return Some((sig, Ty::Instance(n.clone())));
+                    let mut sig =
+                        ci.methods.get("__init__").cloned().unwrap_or(Sig { tparams: Vec::new(), params: Vec::new(), ret: Ty::Unit });
+                    sig.tparams = ci.tparams.clone();
+                    let ret = Ty::Instance(n.clone(), ci.tparams.iter().map(|t| Ty::Param(t.name.clone())).collect());
+                    sig.ret = ret.clone();
+                    return Some((sig, ret));
                 }
                 if self.m.builtin_classes.contains(n) {
-                    return Some((
-                        Sig { params: vec![ParamSig { name: "msg".into(), keep: false, ty: Ty::Unknown }], ret: Ty::Unknown },
-                        Ty::Instance(n.clone()),
-                    ));
+                    let params = vec![ParamSig { name: "msg".into(), keep: false, ty: Ty::Unknown }];
+                    return Some((Sig { tparams: Vec::new(), params, ret: Ty::Unknown }, Ty::Instance(n.clone(), Vec::new())));
                 }
                 None
             }
@@ -2451,11 +3042,34 @@ impl<'m> FnCtx<'m> {
         None
     }
 
+    /// Resolves turbofish type arguments for a generic with `n` parameters.
+    fn explicit_targs(&self, targs: &[TypeExpr], n: usize, what: &str, span: Span) -> R<Vec<Ty>> {
+        if targs.len() != n {
+            return Err(type_err(
+                format!("`{what}` takes {n} type argument{} but {} {} given", if n == 1 { "" } else { "s" }, targs.len(), if targs.len() == 1 { "was" } else { "were" }),
+                span,
+            ));
+        }
+        targs.iter().map(|t| self.resolve_type(t).map(|r| r.0)).collect()
+    }
+
     fn call_expr(&mut self, f: &Expr, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
         if let ExprKind::Attr(recv, mname) = &f.kind {
-            return self.method_call(recv, mname, args, span);
+            return self.method_call(recv, mname, args, expect, span);
         }
-        let sig = self.static_sig(f);
+        // `name::<types>(...)` of a user generic: the type arguments are explicit.
+        let (base, turbofish) = match &f.kind {
+            ExprKind::TypeApp(b, ts) if matches!(&b.kind, ExprKind::Name(n) if self.static_sig(b).is_some_and(|(s, _)| !s.tparams.is_empty()) && !self.m.builtin_classes.contains(n)) => {
+                (&**b, Some(ts))
+            }
+            _ => (f, None),
+        };
+        let sig = self.static_sig(base);
+        if let Some((s, _)) = &sig {
+            if !s.tparams.is_empty() {
+                return self.generic_call(base, s.clone(), turbofish.map(|v| v.as_slice()), args, expect, span);
+            }
+        }
         let mut builtin = self.builtin_call_info(f);
         // `list()`, `dict()`, `Channel()` build the type the context expects.
         let ctor_ty = match (&builtin, &expect) {
@@ -2488,6 +3102,9 @@ impl<'m> FnCtx<'m> {
             }
             None => self.expr(f)?,
         };
+        if let Ty::Param(n) = &callee.ty {
+            return Err(type_err(format!("cannot call a value of type parameter `{n}`"), span));
+        }
         if let Some((s, _)) = &sig {
             if s.params.len() != args.len() && !matches!(&f.kind, ExprKind::Name(n) if self.m.builtin_classes.contains(n)) {
                 return Err(type_err(
@@ -2509,6 +3126,10 @@ impl<'m> FnCtx<'m> {
             sig.as_ref().and_then(|(s, _)| s.params.get(i)).map(|p| (p.name.clone(), p.ty.clone()))
         };
         let al = self.call_args(args, &keep_of, &arg_ty, None, span)?;
+        let arg_tys = std::mem::take(&mut self.last_arg_tys);
+        if let Some((_, n)) = &builtin {
+            self.check_builtin_bounds(n, &arg_tys, span)?;
+        }
         let dst = self.tmp_owned();
         let a = self.arglist(al.clone());
         self.emit(Instr::Call { dst, func: callee.reg, args: a });
@@ -2519,7 +3140,8 @@ impl<'m> FnCtx<'m> {
             _ => sig.map(|s| s.1).unwrap_or(Ty::Unknown),
         };
         if let Some((_, n)) = &builtin {
-            let arg_item = |i: usize| al.args.get(i).and_then(|a| self.reg_ty.get(&a.reg)).map(|t| t.item()).unwrap_or(Ty::Unknown);
+            let arg = |i: usize| arg_tys.get(i).cloned().unwrap_or(Ty::Unknown);
+            let arg_item = |i: usize| self.item_ty(&arg(i), span).unwrap_or(Ty::Unknown);
             ty = match n.as_str() {
                 "str" | "repr" | "chr" => Ty::Str,
                 "int" | "len" | "ord" | "hash" | "rc_run" | "rc_pending" | "rc_live" => Ty::Int,
@@ -2543,14 +3165,97 @@ impl<'m> FnCtx<'m> {
                     _ => None,
                 }),
                 "print" | "rc_auto" => Ty::Unit,
-                "Some" => match al.args.first().and_then(|a| self.reg_ty.get(&a.reg)).cloned() {
-                    Some(t) => Ty::Option(Box::new(t)),
-                    None => Ty::Unknown,
+                "Some" => match arg(0) {
+                    Ty::Unknown => Ty::Unknown,
+                    t => Ty::Option(Box::new(t)),
                 },
+                "min" | "max" if args.len() == 1 => match arg_item(0) {
+                    t @ Ty::Param(_) => t,
+                    _ => Ty::Unknown,
+                },
+                "min" | "max" if arg_tys.iter().all(|t| matches!(t, Ty::Param(_)) && *t == arg_tys[0]) => arg(0),
                 _ => Ty::Unknown,
             };
         }
         self.reg_ty.clear();
+        Ok(Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() })
+    }
+
+    /// Builtins that need a bound on type-parameter arguments.
+    fn check_builtin_bounds(&self, n: &str, arg_tys: &[Ty], span: Span) -> R<()> {
+        let item = |i: usize| arg_tys.get(i).map(|t| self.item_ty(t, span)).transpose().map(|t| t.unwrap_or(Ty::Unknown));
+        match n {
+            "len" => self.require(arg_tys.first().unwrap_or(&Ty::Unknown), "Len", "`len()`", span),
+            "hash" => self.require(arg_tys.first().unwrap_or(&Ty::Unknown), "Hash", "`hash()`", span),
+            "sorted" => self.require(&item(0)?, "Ord", "`sorted()`", span),
+            "sum" => self.require(&item(0)?, "Num", "`sum()`", span),
+            "min" | "max" if arg_tys.len() == 1 => self.require(&item(0)?, "Ord", &format!("`{n}()`"), span),
+            "min" | "max" => arg_tys.iter().try_for_each(|t| self.require(t, "Ord", &format!("`{n}()`"), span)),
+            _ => Ok(()),
+        }
+    }
+
+    /// A call of a generic function or a generic class's constructor:
+    /// infers the type arguments and passes them (as hidden leading
+    /// arguments of a function, or as the instantiated class type).
+    fn generic_call(&mut self, f: &Expr, sig: Sig, turbofish: Option<&[TypeExpr]>, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
+        let ExprKind::Name(name) = &f.kind else { unreachable!() };
+        let class = self.m.classes.contains_key(name);
+        if sig.params.len() != args.len() {
+            return Err(type_err(
+                format!("`{name}()` takes {} argument{} but {} {} given", sig.params.len(), if sig.params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }),
+                span,
+            ));
+        }
+        let explicit = match turbofish {
+            Some(ts) => Some(self.explicit_targs(ts, sig.tparams.len(), name, span)?),
+            None => None,
+        };
+        // A function value is loaded before its arguments are evaluated.
+        let callee = if class { None } else { Some(self.expr(f)?) };
+        let what = if class { name.clone() } else { format!("{name}()") };
+        let (mut al, targs, ret) = self.generic_call_args(&sig, explicit, expect.as_ref(), args, None, &what, span)?;
+        let known: Option<Vec<Ty>> = targs.iter().cloned().collect();
+        let callee = match callee {
+            Some(c) => {
+                // Statically known type arguments are passed; otherwise the
+                // callee infers them from the arguments at runtime.
+                if let Some(regs) = known.as_ref().and_then(|k| self.make_types(k)) {
+                    let mut full: Vec<Arg> = regs.into_iter().map(|r| Arg::new(r, false, false, None)).collect();
+                    full.append(&mut al.args);
+                    al.args = full;
+                }
+                c
+            }
+            None => {
+                let ci = &self.m.classes[name];
+                let Some(k) = known else {
+                    let names: Vec<&str> = ci.tparams.iter().map(|t| t.name.as_str()).collect();
+                    return Err(type_err(
+                        format!("cannot infer the type arguments of `{name}`; write `{name}::<{}>(...)` or annotate the variable", names.join(", ")),
+                        span,
+                    ));
+                };
+                let t = Ty::Instance(name.clone(), k);
+                let Some(d) = self.ty_desc(&t) else {
+                    return Err(type_err(format!("cannot instantiate `{}` here", t.name()), span));
+                };
+                let dst = self.tmp_owned();
+                let ti = self.type_idx(d);
+                self.emit(Instr::MakeType { dst, ty: ti });
+                Res { reg: dst, own: Own::Owned, ty: Ty::TypeVal(Box::new(t)), root: None, desc: "value".into() }
+            }
+        };
+        let dst = self.tmp_owned();
+        let a = self.arglist(al.clone());
+        self.emit(Instr::Call { dst, func: callee.reg, args: a });
+        self.after_call(&al);
+        self.discard(&callee);
+        self.reg_ty.clear();
+        let ty = match callee.ty {
+            Ty::TypeVal(t) => *t,
+            _ => ret,
+        };
         Ok(Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() })
     }
 
@@ -2565,6 +3270,7 @@ impl<'m> FnCtx<'m> {
         span: Span,
     ) -> R<ArgList> {
         let mut out = Vec::new();
+        let mut arg_tys = Vec::new();
         let mut moved_locals: Vec<(String, Reg, Span)> = Vec::new();
         let mut borrowed_roots: Vec<Reg> = recv_root.into_iter().collect();
         for (i, a) in args.iter().enumerate() {
@@ -2573,7 +3279,7 @@ impl<'m> FnCtx<'m> {
             let r = self.expr_expect(a, param.as_ref().map(|p| p.1.clone()))?;
             // An unnamed parameter only gives context (its store is checked later).
             if let Some((pname, pty)) = param.as_ref().filter(|p| !p.0.is_empty()) {
-                if !ty_compatible(pty, &r.ty) {
+                if !self.compatible(pty, &r.ty) {
                     return Err(type_err(
                         format!("argument `{pname}` expects `{}`, got `{}`", pty.name(), r.ty.name()),
                         a.span,
@@ -2581,6 +3287,7 @@ impl<'m> FnCtx<'m> {
                 }
             }
             self.reg_ty.insert(r.reg, r.ty.clone());
+            arg_tys.push(r.ty.clone());
             match &r.own {
                 Own::Owned => out.push(Arg::new(r.reg, true, false, None)),
                 Own::Local(n) => {
@@ -2640,6 +3347,7 @@ impl<'m> FnCtx<'m> {
             }
         }
         let _ = span;
+        self.last_arg_tys = arg_tys;
         Ok(ArgList { args: out, pins: self.heap_borrows > 0 })
     }
 
@@ -2651,17 +3359,37 @@ impl<'m> FnCtx<'m> {
         }
     }
 
-    fn method_call(&mut self, recv: &Expr, mname: &str, args: &[Expr], span: Span) -> R<Res> {
+    /// A method of a value of type parameter `n`, from its bounds:
+    /// `Some(Some(sig))` for a user trait's method, `Some(None)` for a
+    /// builtin trait's, `None` if no bound provides it.
+    fn param_method(&self, n: &str, mname: &str) -> Option<Option<Sig>> {
+        for b in self.pbounds(n) {
+            let Ty::Trait(bn, bargs) = &b else { continue };
+            if let Some(ms) = self.m.trait_methods(bn, bargs) {
+                if let Some(s) = ms.get(mname) {
+                    return Some(Some(s.clone()));
+                }
+            } else if let Some((_, _, implies, methods)) = builtin_trait(bn) {
+                let implied = implies.iter().filter_map(|i| builtin_trait(i)).any(|t| t.3.contains(&mname));
+                if methods.contains(&mname) || implied {
+                    return Some(None);
+                }
+            }
+        }
+        None
+    }
+
+    fn method_call(&mut self, recv: &Expr, mname: &str, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
         let r = self.expr(recv)?;
         if mname != "some_or" {
             self.option_check(&r, &format!("calling `.{mname}()`"), span)?;
         }
         let mut sig: Option<Sig> = None;
         match &r.ty {
-            Ty::Instance(c) => {
+            Ty::Instance(c, cargs) => {
                 if let Some(ci) = self.m.classes.get(c) {
                     match ci.methods.get(mname) {
-                        Some(s) => sig = Some(s.clone()),
+                        Some(s) => sig = Some(s.subst(&class_map(ci, cargs))),
                         None => {
                             if !ci.fields.iter().any(|(n, _, _)| n == mname) {
                                 return Err(Error::new("AttributeError", format!("class `{c}` has no method `{mname}`"), span));
@@ -2670,15 +3398,50 @@ impl<'m> FnCtx<'m> {
                     }
                 }
             }
-            Ty::Trait(t) => {
-                if let Some(tm) = self.m.traits.get(t) {
+            Ty::Trait(t, targs) => {
+                if let Some(tm) = self.m.trait_methods(t, targs) {
                     match tm.get(mname) {
                         Some(s) => sig = Some(s.clone()),
                         None => return Err(Error::new("AttributeError", format!("trait `{t}` has no method `{mname}`"), span)),
                     }
                 }
             }
+            Ty::Param(n) => match self.param_method(n, mname) {
+                Some(s) => sig = s,
+                None => {
+                    return Err(type_err(
+                        format!("type parameter `{n}` has no method `{mname}`; add a bound whose trait provides it (`{n}: SomeTrait`)"),
+                        span,
+                    ))
+                }
+            },
             _ => {}
+        }
+        if let Some(s) = sig.clone().filter(|s| !s.tparams.is_empty()) {
+            // A generic method: infer its own type arguments.
+            if s.params.len() != args.len() {
+                return Err(type_err(
+                    format!("`{mname}()` takes {} argument{} but {} {} given", s.params.len(), if s.params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }),
+                    span,
+                ));
+            }
+            let what = format!("{mname}()");
+            let (mut al, targs, ret) = self.generic_call_args(&s, None, expect.as_ref(), args, r.root, &what, span)?;
+            if let Some(regs) = targs.iter().cloned().collect::<Option<Vec<Ty>>>().and_then(|k| self.make_types(&k)) {
+                let mut full: Vec<Arg> = regs.into_iter().map(|r| Arg::new(r, false, false, None)).collect();
+                full.append(&mut al.args);
+                al.args = full;
+            }
+            let dst = self.tmp_owned();
+            let a = self.arglist(al.clone());
+            let n = self.name_idx(mname);
+            self.emit(Instr::CallMethod { dst, recv: r.reg, name: n, args: a });
+            self.after_call(&al);
+            if r.own == Own::Owned {
+                self.emit(Instr::Drop { reg: r.reg });
+            }
+            self.reg_ty.clear();
+            return Ok(Res { reg: dst, own: Own::Owned, ty: ret, root: None, desc: "value".into() });
         }
         if let Some(s) = &sig {
             if s.params.len() != args.len() {
@@ -2719,7 +3482,7 @@ impl<'m> FnCtx<'m> {
         let al = self.call_args(args, &keep_of, &arg_ty, r.root, span)?;
         if let ("append" | "insert", Ty::List(_)) = (mname, &r.ty) {
             if let Some(arg) = al.args.last() {
-                let ty = self.reg_ty.get(&arg.reg).cloned().unwrap_or(Ty::Unknown);
+                let ty = self.last_arg_tys.last().cloned().unwrap_or(Ty::Unknown);
                 let v = Res { reg: arg.reg, own: Own::Owned, ty, root: None, desc: "value".into() };
                 let none = Res { reg: arg.reg, own: Own::Owned, ty: Ty::Unknown, root: None, desc: String::new() };
                 self.check_elem_store(&r.ty, &none, &v, span)?;
@@ -2878,7 +3641,7 @@ impl<'m> FnCtx<'m> {
                     continue;
                 }
                 for ty in &h.types {
-                    let (_, d) = self.m.resolve_type(ty)?;
+                    let (_, d) = self.resolve_type(ty)?;
                     let ti = self.type_idx(d);
                     matches.push((i, self.emit(Instr::MatchException { exc: e, ty: ti, target: u32::MAX })));
                 }
@@ -2899,7 +3662,7 @@ impl<'m> FnCtx<'m> {
                 let exc_reg = match &h.name {
                     Some(n) => {
                         let ety = match h.types.as_slice() {
-                            [TypeExpr::Named(n, _, _)] if self.m.classes.contains_key(n) || self.m.builtin_classes.contains(n) => Ty::Instance(n.clone()),
+                            [TypeExpr::Named(n, _, _)] if self.m.classes.contains_key(n) || self.m.builtin_classes.contains(n) => Ty::Instance(n.clone(), Vec::new()),
                             _ => Ty::Unknown,
                         };
                         let t = self.tmp_owned();
@@ -2993,7 +3756,7 @@ impl<'m> FnCtx<'m> {
     fn def_stmt(&mut self, f: &FuncDef) -> R<()> {
         let dst = self.tmp_owned();
         if self.is_module {
-            let code = compile_function(self.m, f, None, &[])?;
+            let code = compile_function(self.m, f, Owner::None, &[], &[])?;
             self.codes.push(Arc::new(code));
             let ci = (self.codes.len() - 1) as u32;
             let al = self.arglist(ArgList::default());
@@ -3044,7 +3807,16 @@ impl<'m> FnCtx<'m> {
                 caps.push((n.clone(), ty));
             }
         }
-        let code = compile_function(self.m, f, None, &caps)?;
+        // Type parameters in scope are captured (type values are immortal).
+        let mut outer = Vec::new();
+        for tp in self.tscope.clone() {
+            let o = self.tmp_owned();
+            self.emit(Instr::Dup { dst: o, src: tp.reg });
+            cap_args.push(Arg::new(o, true, false, None));
+            caps.push((format!("<{}>", tp.name), Ty::Unknown));
+            outer.push(TParamSig { name: tp.name.clone(), bounds: tp.bounds.clone() });
+        }
+        let code = compile_function(self.m, f, Owner::None, &caps, &outer)?;
         self.codes.push(Arc::new(code));
         let ci = (self.codes.len() - 1) as u32;
         let al = self.arglist(ArgList { args: cap_args, pins: false });
@@ -3057,12 +3829,22 @@ impl<'m> FnCtx<'m> {
             return Err(syn_err("classes must be defined at module level", c.span));
         }
         let info = &self.m.classes[&c.name];
+        let pb = |n: &str| info.tparams.iter().find(|t| t.name == n).map(|t| t.bounds.clone()).unwrap_or_default();
+        for ((_, ty, _), f) in info.fields.iter().zip(&c.fields) {
+            self.m.check_wf(ty, &pb, f.span)?;
+        }
+        for ((_, args), (_, _, sp)) in info.impls.iter().zip(&c.traits) {
+            args.iter().try_for_each(|a| self.m.check_wf(a, &pb, *sp))?;
+        }
         let mut methods = Vec::new();
         for m in &c.methods {
             if m.name == "__init__" {
                 check_init_assigns(c, m)?;
+                if !m.tparams.is_empty() {
+                    return Err(type_err(format!("`__init__` cannot have type parameters; declare them on the class (`class {}<...>`)", c.name), m.span));
+                }
             }
-            let code = compile_function(self.m, m, Some(&c.name), &[])?;
+            let code = compile_function(self.m, m, Owner::Class(&c.name), &[], &[])?;
             self.codes.push(Arc::new(code));
             methods.push((m.name.clone(), (self.codes.len() - 1) as u32));
         }
@@ -3070,8 +3852,14 @@ impl<'m> FnCtx<'m> {
             return Err(syn_err(format!("class `{}` has fields and needs an `__init__` that assigns them", c.name), c.span));
         }
         let fields = info.fields.iter().map(|(n, _, d)| FieldSpec { name: n.clone(), ty: d.clone() }).collect();
-        let traits = c.traits.iter().map(|(t, _)| (self.m.gindex[t], t.clone())).collect();
-        self.classes.push(ClassSpec { name: c.name.clone(), fields, methods, traits });
+        let scope: Vec<(String, u16)> = c.tparams.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect();
+        let mut traits = Vec::new();
+        for (t, targs, _) in &c.traits {
+            let ds = targs.iter().map(|a| self.m.resolve_scoped(a, &scope).map(|r| r.1)).collect::<R<Vec<_>>>()?;
+            traits.push((self.m.gindex[t], t.clone(), ds));
+        }
+        let tparams = c.tparams.iter().map(|t| t.name.clone()).collect();
+        self.classes.push(ClassSpec { name: c.name.clone(), tparams, fields, methods, traits });
         let dst = self.tmp_owned();
         self.emit(Instr::MakeClass { dst, spec: (self.classes.len() - 1) as u32 });
         let idx = self.m.gindex[&c.name];
@@ -3088,7 +3876,7 @@ impl<'m> FnCtx<'m> {
         for m in &t.methods {
             let default = match &m.body {
                 Some(_) => {
-                    let code = compile_function(self.m, m, None, &[])?;
+                    let code = compile_function(self.m, m, Owner::Trait(&t.name), &[], &[])?;
                     self.codes.push(Arc::new(code));
                     Some((self.codes.len() - 1) as u32)
                 }
@@ -3096,7 +3884,7 @@ impl<'m> FnCtx<'m> {
             };
             methods.push((m.name.clone(), default));
         }
-        self.traits.push(TraitSpec { name: t.name.clone(), methods });
+        self.traits.push(TraitSpec { name: t.name.clone(), nparams: t.tparams.len(), methods });
         let dst = self.tmp_owned();
         self.emit(Instr::MakeTrait { dst, spec: (self.traits.len() - 1) as u32 });
         let idx = self.m.gindex[&t.name];
@@ -3131,13 +3919,20 @@ fn ty_compatible(d: &Ty, v: &Ty) -> bool {
         (Ty::Option(a), b) => ty_compatible(a, b),
         (Ty::Float, Ty::Int) => true,
         (Ty::BigInt, Ty::Int) => true,
-        (Ty::Trait(_), Ty::Instance(_)) | (Ty::Trait(_), Ty::Trait(_)) => true,
-        (Ty::Trait(t), Ty::Iter(_)) => t == "Iterator",
+        // Trait types are checked by `FnCtx::compatible` (and at runtime).
+        (Ty::Trait(..), _) => true,
         // A user class implementing `Iterator` (checked at runtime).
-        (Ty::Iter(_), Ty::Instance(_) | Ty::Trait(_)) => true,
+        (Ty::Iter(_), Ty::Instance(..) | Ty::Trait(..)) => true,
+        (Ty::Instance(c1, a), Ty::Instance(c2, b)) => {
+            c1 == c2 && (a.is_empty() || b.is_empty() || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| inv(x, y))))
+        }
         (Ty::Func, Ty::StaticFn | Ty::Class(_) | Ty::TypeVal(_)) | (Ty::StaticFn, Ty::Func) => true,
         (a, b) => a == b,
     }
+}
+
+fn param_field_msg(n: &str, field: &str) -> String {
+    format!("`.{field}` on a value of type parameter `{n}`: its fields are not known (only methods of its bounds can be used)")
 }
 
 fn short(desc: &str) -> String {
@@ -3231,13 +4026,28 @@ fn check_init_assigns(c: &ClassDef, init: &FuncDef) -> R<()> {
     Ok(())
 }
 
-/// Compiles a function, method (`class_name`) or closure (`captures`).
-pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, captures: &[(String, Ty)]) -> R<Code> {
-    let name = match class_name {
-        Some(c) => format!("{c}.{}", f.name),
-        None => f.name.clone(),
+/// What a function is defined in.
+#[derive(Clone, Copy)]
+pub enum Owner<'a> {
+    None,
+    Class(&'a str),
+    /// A default method of a trait.
+    Trait(&'a str),
+}
+
+/// Compiles a function, method or closure (`captures`). `outer`: the
+/// enclosing type parameters of a closure (captured as `<T>`).
+pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(String, Ty)], outer: &[TParamSig]) -> R<Code> {
+    let class_name = match owner {
+        Owner::Class(c) => Some(c),
+        _ => None,
+    };
+    let name = match owner {
+        Owner::Class(c) | Owner::Trait(c) => format!("{c}.{}", f.name),
+        Owner::None => f.name.clone(),
     };
     let mut ctx = FnCtx::new(m, name, false);
+    ctx.line = f.span.line;
     ctx.class_name = class_name.map(String::from);
     ctx.captures = captures.to_vec();
     let body = f.body.as_ref().unwrap();
@@ -3246,12 +4056,66 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
     let mut state = State::new();
     let mut params = Vec::new();
     let mut checks = Vec::new();
+    let has_self = f.params.first().is_some_and(|p| p.name == "self") && (class_name.is_some() || ctx_is_trait_method(f));
+    // Registers: `self`, the hidden type parameters, then the parameters.
+    let mut preg = Vec::new();
+    if has_self {
+        preg.push(ctx.new_reg(f.params[0].keep, Some("self".into())));
+    }
+    let own_tregs: Vec<Reg> = f.tparams.iter().map(|t| ctx.new_reg(false, Some(format!("<{}>", t.name)))).collect();
+    for p in &f.params[has_self as usize..] {
+        preg.push(ctx.new_reg(p.keep, Some(p.name.clone())));
+    }
+    // Type parameters of the enclosing class/trait or closure scope.
+    let (owner_tps, owner_load): (Vec<TParamSig>, Option<(&str, bool)>) = match owner {
+        Owner::Class(c) => (m.classes[c].tparams.clone(), Some((c, true))),
+        Owner::Trait(t) => (m.trait_tparams(t), Some((t, false))),
+        Owner::None => (outer.to_vec(), None),
+    };
+    for (k, tp) in owner_tps.iter().enumerate() {
+        if f.tparams.iter().any(|t| t.name == tp.name) {
+            return Err(type_err(format!("type parameter `{}` shadows the enclosing one", tp.name), f.span));
+        }
+        let reg = ctx.new_reg(false, Some(format!("<{}>", tp.name)));
+        match owner_load {
+            Some((_, true)) => {
+                ctx.emit(Instr::LoadTypeArg { dst: reg, obj: 0, k: k as u32 });
+            }
+            Some((t, false)) => {
+                let tr = m.gindex[t];
+                ctx.emit(Instr::LoadTraitArg { dst: reg, obj: 0, tr, k: k as u32 });
+            }
+            None => {
+                let idx = captures.iter().position(|(n, _)| *n == format!("<{}>", tp.name)).expect("captured type parameter") as u32;
+                ctx.emit(Instr::LoadCapture { dst: reg, idx });
+            }
+        }
+        ctx.tscope.push(TPar { name: tp.name.clone(), reg, bounds: tp.bounds.clone() });
+    }
+    for (tp, reg) in f.tparams.iter().zip(&own_tregs) {
+        ctx.tscope.push(TPar { name: tp.name.clone(), reg: *reg, bounds: Vec::new() });
+    }
+    // Bounds of the function's own type parameters (they may mention each other).
+    let sigs = m.tparam_sigs(&f.tparams, &ctx.scope())?;
+    for (tp, sig) in f.tparams.iter().zip(&sigs) {
+        let mut descs = Vec::new();
+        for b in &tp.bounds {
+            descs.push(ctx.resolve_type(b)?.1);
+        }
+        ctx.tscope.iter_mut().find(|t| t.name == tp.name).unwrap().bounds = sig.bounds.clone();
+        ctx.code_tparams.push(TypeParamInfo { name: tp.name.clone(), bounds: descs });
+    }
+    let self_ty = |own: &[TParamSig]| own.iter().map(|t| Ty::Param(t.name.clone())).collect::<Vec<_>>();
     for (i, p) in f.params.iter().enumerate() {
-        let is_self = i == 0 && p.name == "self" && (class_name.is_some() || ctx_is_trait_method(f));
+        let is_self = i == 0 && has_self;
         let (ty, desc) = match (&p.ty, is_self) {
-            (_, true) => (class_name.map(|c| Ty::Instance(c.to_string())).unwrap_or(Ty::Unknown), None),
+            (_, true) => match owner {
+                Owner::Class(c) => (Ty::Instance(c.to_string(), self_ty(&owner_tps)), None),
+                Owner::Trait(t) => (Ty::Trait(t.to_string(), self_ty(&owner_tps)), None),
+                Owner::None => (Ty::Unknown, None),
+            },
             (Some(t), _) => {
-                let (ty, d) = m.resolve_type(t)?;
+                let (ty, d) = ctx.resolve_type(t)?;
                 (ty, Some(d))
             }
             (None, _) => (Ty::Unknown, None),
@@ -3262,17 +4126,18 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
                 p.span,
             ));
         }
-        if f.is_lambda && false {
-            unreachable!();
-        }
         let kind = if p.keep { LocalKind::Owned } else { LocalKind::Borrowed };
-        let reg = ctx.new_reg(p.keep, Some(p.name.clone()));
+        let reg = preg[i];
         ctx.locals.insert(p.name.clone(), Local { reg, kind, decl: desc.clone().map(|d| (ty.clone(), d)) });
         state.insert(p.name.clone(), Var { st: St::Live, ty: ty.clone() });
         if let Some(d) = &desc {
             checks.push((reg, d.clone(), p.name.clone()));
         }
         params.push(ParamInfo { name: p.name.clone(), keep: p.keep, ty: desc });
+    }
+    // The hidden type parameters follow `self`.
+    for (k, tp) in f.tparams.iter().enumerate() {
+        params.insert(has_self as usize + k, ParamInfo { name: format!("<{}>", tp.name), keep: false, ty: None });
     }
     let mut local_names = Vec::new();
     scan::assigned_names(body, &mut local_names);
@@ -3293,7 +4158,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
     let (ret, ret_ty) = match &f.ret {
         Some(TypeExpr::Unit(_)) => (RetKind::Unit, Ty::Unit),
         Some(t) => {
-            let (ty, d) = m.resolve_type(t)?;
+            let (ty, d) = ctx.resolve_type(t)?;
             (RetKind::Typed(d), ty)
         }
         None => (RetKind::Any, Ty::Unknown),
@@ -3302,7 +4167,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
         match &ret_ty {
             Ty::Iter(t) => ctx.yield_decl = (**t != Ty::Unknown).then(|| (**t).clone()),
             Ty::Unknown => {}
-            Ty::Trait(t) if t == "Iterator" => {}
+            Ty::Trait(t, a) if t == "Iterator" => ctx.yield_decl = a.first().cloned().filter(|t| *t != Ty::Unknown),
             other => {
                 return Err(type_err(
                     format!("generator `{}` returns an `Iterator<T>`, not `{}`", f.name, other.name()),

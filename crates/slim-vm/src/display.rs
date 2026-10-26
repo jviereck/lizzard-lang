@@ -94,6 +94,14 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             out.push('>');
         }
         Body::Class(c) => out.push_str(&format!("<class {}>", c.name)),
+        Body::Instantiated { func, targs } => {
+            out.push_str("<function ");
+            if let Some(Body::Function(f)) = func.body() {
+                out.push_str(&f.code.name);
+            }
+            let names: Vec<&str> = targs.iter().map(|t| crate::rtype::name(*t)).collect();
+            out.push_str(&format!("::<{}>>", names.join(", ")));
+        }
         Body::Dict(d) => {
             out.push('{');
             for (i, (k, v)) in d.entries().into_iter().enumerate() {

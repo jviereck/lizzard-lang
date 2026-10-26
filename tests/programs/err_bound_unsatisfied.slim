@@ -1,0 +1,12 @@
+# Type arguments must satisfy the class's bounds.
+class SortedBag<T: Ord>:
+    items: list<T>
+    def __init__(self) -> ():
+        self.items <- []
+    def add(self, x: T + keep) -> ():
+        self.items.append(x)
+        self.items <- sorted(self.items)
+
+ok = SortedBag::<int>()
+ok.add(3)
+bad = SortedBag::<list<int>>()

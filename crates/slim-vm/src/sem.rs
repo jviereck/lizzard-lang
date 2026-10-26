@@ -373,6 +373,18 @@ pub fn make_type<B: Backend>(b: &mut B, dst: Reg, ty: u32) -> Flow<()> {
     b.frame_op(h::f_make_type, dst as u32, ty, 0, 0)
 }
 
+pub fn load_type_arg<B: Backend>(b: &mut B, dst: Reg, obj: Reg, k: u32) -> Flow<()> {
+    b.frame_op(h::f_load_type_arg, dst as u32, obj as u32, k, 0)
+}
+
+pub fn load_trait_arg<B: Backend>(b: &mut B, dst: Reg, obj: Reg, tr: u32, k: u32) -> Flow<()> {
+    b.frame_op(h::f_load_trait_arg, dst as u32, obj as u32, tr, k)
+}
+
+pub fn instantiate<B: Backend>(b: &mut B, dst: Reg, func: Reg, targs: u32) -> Flow<()> {
+    b.frame_op(h::f_instantiate, dst as u32, func as u32, targs, 0)
+}
+
 // ---------------------------------------------------------------- fields, elements
 
 pub fn load_field<B: Backend>(b: &mut B, dst: Reg, obj: Reg, name: u32) -> Flow<()> {

@@ -96,6 +96,23 @@ fn binop_type_error(th: &mut Thread, op: &str, a: Value, b: Value) -> Raised {
     )
 }
 
+/// `a op b` on an instance through its operator method (`__add__`, ...),
+/// if it has one.
+fn dunder_binop(th: &mut Thread, op: &str, a: Value, b: Value) -> Option<VResult<Value>> {
+    let name = match op {
+        "+" => "__add__",
+        "-" => "__sub__",
+        "*" => "__mul__",
+        "/" => "__truediv__",
+        "//" => "__floordiv__",
+        "%" => "__mod__",
+        "**" => "__pow__",
+        _ => return None,
+    };
+    let m = *a.as_instance()?.class().methods.get(name)?;
+    Some(call_simple(th, m, Some(a), &[b]))
+}
+
 fn overflow(th: &mut Thread, op: &str) -> Raised {
     th.raise("OverflowError", format!("integer overflow in `{op}` (int is 64-bit; use bigint)"))
 }
@@ -111,6 +128,9 @@ fn arith(
     float: fn(f64, f64) -> f64,
 ) -> VResult<Value> {
     let (Some(x), Some(y)) = (num(a), num(b)) else {
+        if let Some(r) = dunder_binop(th, op, a, b) {
+            return r;
+        }
         return Err(binop_type_error(th, op, a, b));
     };
     match (&x, &y) {
@@ -182,6 +202,9 @@ pub extern "C" fn mul(th: &mut Thread, a: Value, b: Value) -> Value {
 
 pub extern "C" fn div(th: &mut Thread, a: Value, b: Value) -> Value {
     let (Some(x), Some(y)) = (num(a), num(b)) else {
+        if let Some(r) = dunder_binop(th, "/", a, b) {
+            return vres(r);
+        }
         return vres(Err(binop_type_error(th, "/", a, b)));
     };
     let d = to_f64(&y);
@@ -254,6 +277,9 @@ pub extern "C" fn modulo(th: &mut Thread, a: Value, b: Value) -> Value {
 
 pub extern "C" fn pow(th: &mut Thread, a: Value, b: Value) -> Value {
     let (Some(x), Some(y)) = (num(a), num(b)) else {
+        if let Some(r) = dunder_binop(th, "**", a, b) {
+            return vres(r);
+        }
         return vres(Err(binop_type_error(th, "**", a, b)));
     };
     match (&x, &y) {
@@ -317,7 +343,10 @@ pub extern "C" fn neg(th: &mut Thread, a: Value) -> Value {
         },
         Some(Num::Big(b)) => big_value(-b),
         Some(Num::Float(f)) => Value::float(-f),
-        None => vres(Err(unary_error(th, "-", a))),
+        None => match a.as_instance().and_then(|i| i.class().methods.get("__neg__").copied()) {
+            Some(m) => vres(call_simple(th, m, Some(a), &[])),
+            None => vres(Err(unary_error(th, "-", a))),
+        },
     }
 }
 
@@ -428,6 +457,26 @@ fn order(th: &mut Thread, op: &str, a: Value, b: Value) -> VResult<std::cmp::Ord
         (Some(Body::List(x)), Some(Body::List(y))) => {
             let (x, y) = (x.snapshot(), y.snapshot());
             seq_order(th, op, &x, &y)
+        }
+        // Instances of a class implementing `Ord` compare with `__lt__`.
+        (Some(Body::Instance(i)), _) if i.class().methods.contains_key("__lt__") => {
+            let m = i.class().methods["__lt__"];
+            let less = call_simple(th, m, Some(a), &[b])?;
+            let is_less = is_truthy(th, less);
+            less.decref();
+            if is_less? {
+                return Ok(O::Less);
+            }
+            let greater = match b.as_instance().and_then(|j| j.class().methods.get("__lt__").copied()) {
+                Some(m2) => {
+                    let r = call_simple(th, m2, Some(b), &[a])?;
+                    let g = is_truthy(th, r);
+                    r.decref();
+                    g?
+                }
+                None => false,
+            };
+            Ok(if greater { O::Greater } else { O::Equal })
         }
         _ => {
             if let Some(r) = dead_operand(th, a).or_else(|| dead_operand(th, b)) {
@@ -737,10 +786,14 @@ pub fn invoke(
         Some(Body::Function(func)) => {
             let code = &func.code;
             let nself = self_val.is_some() as usize;
+            let nt = code.tparams.len();
             let expected = code.params.len();
-            if args.len() + nself != expected {
-                let given = args.len();
-                let want = expected - nself;
+            // Type arguments are hidden leading parameters; a dynamic call
+            // passes none and they are inferred from the arguments.
+            let off = if nt > 0 && args.len() + nself + nt == expected { nt } else { 0 };
+            if args.len() + nself + off != expected {
+                let given = args.len().saturating_sub(nt - off);
+                let want = expected - nself - nt;
                 return Err(th.raise(
                     "TypeError",
                     format!("{} takes {want} argument{} but {given} {} given", callable_name(f), if want == 1 { "" } else { "s" }, if given == 1 { "was" } else { "were" }),
@@ -751,8 +804,8 @@ pub fn invoke(
                 regs[0] = s;
             }
             for (i, _) in args.iter().enumerate() {
-                let p = &code.params[i + nself];
-                regs[i + nself] = if p.keep {
+                let p = &code.params[i + nself + off];
+                regs[i + nself + off] = if p.keep {
                     take_for_keep(th, caller.as_deref_mut(), args, i, recv_reg, &p.name, &code.name)?
                 } else {
                     let v = args[i].v;
@@ -761,6 +814,17 @@ pub fn invoke(
                     }
                     v
                 };
+            }
+            if nt > 0 {
+                if let Err(e) = bind_type_args(th, code, &mut regs, nself) {
+                    // Values moved into `keep` parameters are released.
+                    for (i, p) in code.params.iter().enumerate() {
+                        if p.keep {
+                            regs[i].decref();
+                        }
+                    }
+                    return Err(e);
+                }
             }
             if code.is_generator {
                 return crate::generator::create(th, f, regs);
@@ -794,7 +858,28 @@ pub fn invoke(
             }
             (b.f)(th, &vals)
         }
-        Some(Body::Class(c)) => construct(th, caller, f, c, args),
+        Some(Body::Class(c)) => {
+            if !c.tparams.is_empty() {
+                return Err(th.raise(
+                    "TypeError",
+                    format!("cannot infer the type arguments of `{}`; write `{}::<{}>(...)`", c.name, c.name, c.tparams.join(", ")),
+                ));
+            }
+            construct(th, caller, f, c, rtype::class_type(f), args)
+        }
+        Some(Body::Type(t)) if matches!(t.ctor, Ctor::Class(_)) => {
+            let Ctor::Class(cls) = t.ctor else { unreachable!() };
+            let c = cls.as_class().unwrap();
+            if t.args.len() != c.tparams.len() {
+                return Err(th.raise("TypeError", format!("cannot infer the type arguments of `{}`", t.name)));
+            }
+            construct(th, caller, cls, c, t.value(), args)
+        }
+        Some(Body::Instantiated { func, targs }) => {
+            let mut full: Vec<CallArg> = targs.iter().map(|t| CallArg::borrowed(*t)).collect();
+            full.extend_from_slice(args);
+            invoke(th, caller, *func, self_val, recv_reg, &full)
+        }
         Some(Body::Type(t)) => {
             let vals: Vec<Value> = args.iter().map(|a| a.v).collect();
             if let Some(v) = vals.iter().find(|v| v.is_dead()) {
@@ -812,6 +897,96 @@ pub fn invoke(
     }
 }
 
+/// Infers the type arguments a call left out (`UNINIT`) from the runtime
+/// types of the arguments, then checks every type argument's bounds.
+fn bind_type_args(th: &mut Thread, code: &Code, regs: &mut [Value], nself: usize) -> VResult<()> {
+    let nt = code.tparams.len();
+    if regs[nself..nself + nt].contains(&Value::UNINIT) {
+        for (j, p) in code.params.iter().enumerate().skip(nself + nt) {
+            if let (Some(d), v) = (&p.ty, regs[j]) {
+                if v != Value::NONE {
+                    unify(th, d, rtype::as_type(rtype::type_of(v)).unwrap(), regs);
+                }
+            }
+        }
+    }
+    for (k, tp) in code.tparams.iter().enumerate() {
+        let t = regs[nself + k];
+        if t == Value::UNINIT {
+            let names: Vec<&str> = code.tparams.iter().map(|t| t.name.as_str()).collect();
+            return Err(th.raise(
+                "TypeError",
+                format!("cannot infer type argument `{}` of `{}()`; write `{}::<{}>(...)`", tp.name, code.name, code.name, names.join(", ")),
+            ));
+        }
+        for b in &tp.bounds {
+            let bt = match types::materialize(th, b, &|r| regs[r as usize]) {
+                Ok(bt) => rtype::as_type(bt).unwrap(),
+                Err(n) => return Err(th.raise("NameError", format!("type `{n}` is used before it is defined"))),
+            };
+            if !rtype::satisfies(rtype::as_type(t).unwrap(), bt) {
+                return Err(th.raise(
+                    "TypeError",
+                    format!("`{}` does not implement `{}` (required by `{}` of `{}()`)", rtype::name(t), bt.name, tp.name, code.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds unbound type parameters in `d` by matching it against type `t`.
+fn unify(th: &Thread, d: &TypeDesc, t: &'static rtype::RtType, regs: &mut [Value]) {
+    match d {
+        TypeDesc::Param(r, _) => {
+            if regs[*r as usize] == Value::UNINIT {
+                regs[*r as usize] = t.value();
+            }
+        }
+        TypeDesc::Builtin(Ctor::Option, args) if t.ctor != Ctor::Option => unify(th, &args[0], t, regs),
+        TypeDesc::Builtin(c, args) => {
+            if *c == t.ctor && args.len() == t.args.len() {
+                for (a, ta) in args.iter().zip(t.args.iter()) {
+                    unify(th, a, rtype::as_type(*ta).unwrap(), regs);
+                }
+            }
+        }
+        TypeDesc::Global(idx, _, args) if !args.is_empty() => {
+            let g = th.vm.global(*idx);
+            let target = match t.ctor {
+                Ctor::Class(c) if c == g => Some(t),
+                // A class implementing the generic trait: use its impl.
+                Ctor::Class(_) => rtype::impls_of(t)
+                    .iter()
+                    .map(|i| rtype::as_type(*i).unwrap())
+                    .find(|i| matches!(i.ctor, Ctor::Trait(x) if x == g)),
+                _ => None,
+            };
+            match target {
+                Some(tt) if tt.args.len() == args.len() => {
+                    for (a, ta) in args.iter().zip(tt.args.iter()) {
+                        unify(th, a, rtype::as_type(*ta).unwrap(), regs);
+                    }
+                }
+                _ => {
+                    // `Iterable<T>` / `Iterator<T>` over a builtin container.
+                    let builtin_iter = g.as_trait().is_some_and(|tr| tr.name == "Iterable" || tr.name == "Iterator");
+                    if builtin_iter && args.len() == 1 && !matches!(t.ctor, Ctor::Class(_)) {
+                        let item = match t.ctor {
+                            Ctor::Dict if t.args.len() == 2 => t.args[0],
+                            Ctor::Str => rtype::str_(),
+                            Ctor::Array(Some(e)) => rtype::elem_scalar(e),
+                            _ => rtype::elem_of(t),
+                        };
+                        unify(th, &args[0], rtype::as_type(item).unwrap(), regs);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Calls with borrowed arguments (from Rust code).
 pub fn call_simple(th: &mut Thread, f: Value, self_val: Option<Value>, args: &[Value]) -> VResult<Value> {
     let args: Vec<CallArg> = args.iter().map(|v| CallArg::borrowed(*v)).collect();
@@ -821,7 +996,7 @@ pub fn call_simple(th: &mut Thread, f: Value, self_val: Option<Value>, args: &[V
 pub fn new_exception(class: Value, msg: Value) -> Value {
     let c = class.as_class().unwrap();
     let slots: Vec<AtomicU64> = c.fields.iter().map(|_| AtomicU64::new(Value::UNINIT.0)).collect();
-    let e = Obj::alloc(Body::Instance(Instance { class, slots: slots.into_boxed_slice() }));
+    let e = Obj::alloc(Body::Instance(Instance { class, ty: rtype::class_type(class), slots: slots.into_boxed_slice() }));
     if let Some(i) = c.field_index("msg") {
         e.as_instance().unwrap().slots[i].store(msg.0, Ordering::Release);
     } else {
@@ -830,7 +1005,8 @@ pub fn new_exception(class: Value, msg: Value) -> Value {
     e
 }
 
-fn construct(th: &mut Thread, caller: Option<&mut Frame>, cls: Value, c: &'static Class, args: &[CallArg]) -> VResult<Value> {
+/// Creates an instance of type `ty` (a type of class `c`) and runs `__init__`.
+fn construct(th: &mut Thread, caller: Option<&mut Frame>, cls: Value, c: &'static Class, ty: Value, args: &[CallArg]) -> VResult<Value> {
     if c.is_exception && !c.methods.contains_key("__init__") && c.field_index("msg").is_some() && c.fields.len() == 1 {
         // Builtin-style exception: optional message.
         if args.len() > 1 {
@@ -853,7 +1029,7 @@ fn construct(th: &mut Thread, caller: Option<&mut Frame>, cls: Value, c: &'stati
         .iter()
         .map(|f| AtomicU64::new(if f.kind == SlotKind::Value { Value::UNINIT.0 } else { 0 }))
         .collect();
-    let inst = Obj::alloc(Body::Instance(Instance { class: cls, slots: slots.into_boxed_slice() }));
+    let inst = Obj::alloc(Body::Instance(Instance { class: cls, ty, slots: slots.into_boxed_slice() }));
     match c.methods.get("__init__") {
         Some(&init) => match invoke(th, caller, init, Some(inst), None, args) {
             Ok(r) => r.decref(),
@@ -1007,7 +1183,7 @@ pub extern "C" fn f_make_trait(th: &mut Thread, frame: &mut Frame, dst: u32, spe
         })
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, methods, implies: Vec::new() }));
+    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new() }));
     frame.set(dst as Reg, t);
     OK
 }
@@ -1024,11 +1200,24 @@ pub fn slot_kind(ty: &TypeDesc) -> SlotKind {
 
 pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResult<Value> {
     let mut traits = Vec::new();
-    for (idx, tname) in &s.traits {
+    let mut trait_args = Vec::new();
+    for (idx, tname, targs) in &s.traits {
         let t = resolve_global(th, *idx);
         let Some(tr) = t.as_trait() else {
             return Err(th.raise("TypeError", format!("class `{}`: `{tname}` is not a trait", s.name)));
         };
+        if !targs.is_empty() {
+            let mut args = Vec::new();
+            for a in targs {
+                match types::pre_resolve(th, a) {
+                    Ok(a) => args.push(a),
+                    Err(n) => {
+                        return Err(th.raise("NameError", format!("class `{}`: type `{n}` is used before it is defined", s.name)))
+                    }
+                }
+            }
+            trait_args.push((t, args));
+        }
         if !traits.contains(&t) {
             traits.push(t);
         }
@@ -1070,7 +1259,17 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         .map(|f| Field::new(f.name.clone(), f.ty.clone(), slot_kind(&f.ty)))
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    Ok(Obj::alloc_immortal(Body::Class(Class { name: s.name.clone(), id, fields, methods, traits, is_exception })))
+    Ok(Obj::alloc_immortal(Body::Class(Class {
+        name: s.name.clone(),
+        id,
+        tparams: s.tparams.clone(),
+        fields,
+        methods,
+        traits,
+        trait_args,
+        is_exception,
+        canonical: std::sync::OnceLock::new(),
+    })))
 }
 
 pub extern "C" fn f_make_class(th: &mut Thread, frame: &mut Frame, dst: u32, spec: u32, _: u32, _: u32) -> u32 {
@@ -1084,9 +1283,68 @@ pub extern "C" fn f_make_class(th: &mut Thread, frame: &mut Frame, dst: u32, spe
     }
 }
 
+/// Type argument `k` of the type of `o` (a generic class instance).
+pub fn type_arg(th: &mut Thread, o: Value, k: u32) -> VResult<Value> {
+    let t = rtype::as_type(rtype::type_of(o)).unwrap();
+    match t.args.get(k as usize) {
+        Some(a) => Ok(*a),
+        None => Err(th.raise("TypeError", format!("`{}` has no type argument {k}", t.name))),
+    }
+}
+
+/// Type argument `k` of trait `globals[tr]` as implemented by `o`.
+pub fn trait_arg(th: &mut Thread, o: Value, tr: u32, k: u32) -> VResult<Value> {
+    let trv = th.vm.global(tr);
+    let t = rtype::as_type(rtype::type_of(o)).unwrap();
+    let found = rtype::impls_of(t)
+        .iter()
+        .map(|i| rtype::as_type(*i).unwrap())
+        .find(|i| i.ctor == Ctor::Trait(trv))
+        .and_then(|i| i.args.get(k as usize).copied());
+    match found {
+        Some(a) => Ok(a),
+        None => Err(th.raise(
+            "TypeError",
+            format!("`{}` does not implement a generic `{}`", t.name, rtype::name(rtype::prim(Ctor::Trait(trv)))),
+        )),
+    }
+}
+
+/// dst = type argument `k` of the instance in `obj` (in a generic method).
+pub extern "C" fn f_load_type_arg(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, k: u32, _: u32) -> u32 {
+    match type_arg(th, frame.reg(obj as Reg), k) {
+        Ok(a) => {
+            frame.set(dst as Reg, a);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
+/// dst = type argument `k` of trait `globals[tr]` as implemented by the
+/// instance in `obj` (in a default method of a generic trait).
+pub extern "C" fn f_load_trait_arg(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, tr: u32, k: u32) -> u32 {
+    match trait_arg(th, frame.reg(obj as Reg), tr, k) {
+        Ok(a) => {
+            frame.set(dst as Reg, a);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
+/// dst = `func::<targs>`: a generic function with its type arguments.
+pub extern "C" fn f_instantiate(_th: &mut Thread, frame: &mut Frame, dst: u32, func: u32, targs: u32, _: u32) -> u32 {
+    let f = frame.reg(func as Reg);
+    let targs: Box<[Value]> = frame.code().arglists[targs as usize].args.iter().map(|a| frame.reg(a.reg)).collect();
+    f.incref();
+    frame.set(dst as Reg, Obj::alloc(Body::Instantiated { func: f, targs }));
+    OK
+}
+
 /// dst = the runtime type `code.types[ty]` (immortal).
 pub extern "C" fn f_make_type(th: &mut Thread, frame: &mut Frame, dst: u32, ty: u32, _: u32, _: u32) -> u32 {
-    match types::code_type(th, frame.code(), ty) {
+    match types::frame_type(th, frame, ty) {
         Ok(t) => {
             frame.set(dst as Reg, t.value());
             OK
@@ -1102,7 +1360,7 @@ pub extern "C" fn f_check_type(th: &mut Thread, frame: &mut Frame, reg: u32, ty:
         raise_dead(th, frame, reg as Reg);
         return RAISED;
     }
-    let t = match types::code_type(th, code, ty) {
+    let t = match types::frame_type(th, frame, ty) {
         Ok(t) => t,
         Err(Raised) => return RAISED,
     };
@@ -1178,7 +1436,7 @@ fn check_store(th: &mut Thread, inst: &Instance, i: usize, v: Value, mode: Store
     if v.is_dead() {
         return Err(dead_operand(th, v).unwrap());
     }
-    let t = types::field_type(th, f)?;
+    let t = types::field_type(th, inst, i)?;
     if !rtype::has_type(v, t) {
         return Err(th.raise(
             "TypeError",
@@ -1485,7 +1743,7 @@ pub extern "C" fn f_build_tuple(_th: &mut Thread, frame: &mut Frame, dst: u32, a
 }
 
 pub extern "C" fn f_build_list(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {
-    let t = match types::code_type(th, frame.code(), ty) {
+    let t = match types::frame_type(th, frame, ty) {
         Ok(t) => t.value(),
         Err(Raised) => return RAISED,
     };
@@ -1500,7 +1758,7 @@ pub extern "C" fn f_build_list(th: &mut Thread, frame: &mut Frame, dst: u32, arg
 }
 
 pub extern "C" fn f_build_dict(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {
-    let t = match types::code_type(th, frame.code(), ty) {
+    let t = match types::frame_type(th, frame, ty) {
         Ok(t) => t.value(),
         Err(Raised) => return RAISED,
     };
@@ -1611,7 +1869,7 @@ pub extern "C" fn f_take_exception(_th: &mut Thread, frame: &mut Frame, dst: u32
 
 pub extern "C" fn f_match_exception(th: &mut Thread, frame: &mut Frame, exc: u32, ty: u32, target: u32, _: u32) -> u32 {
     let v = frame.reg(exc as Reg);
-    let t = match types::code_type(th, frame.code(), ty) {
+    let t = match types::frame_type(th, frame, ty) {
         Ok(t) => t,
         Err(Raised) => return RAISED,
     };

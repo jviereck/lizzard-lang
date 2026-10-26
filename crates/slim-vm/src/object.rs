@@ -51,6 +51,8 @@ pub enum Body {
     Trait(Trait),
     Instance(Instance),
     BoundMethod { recv: Value, func: Value },
+    /// A generic function with its type arguments (`first::<int>`).
+    Instantiated { func: Value, targs: Box<[Value]> },
     Dict(crate::dict::Dict),
     /// `array<T>`: fixed-size packed scalars.
     Array(crate::array::ArrayObj),
@@ -108,11 +110,17 @@ impl Field {
 pub struct Class {
     pub name: String,
     pub id: u32,
+    /// Type parameter names; field and trait types refer to them by index.
+    pub tparams: Vec<String>,
     pub fields: Vec<Field>,
     pub methods: HashMap<String, Value>,
     /// Trait objects this class implements (including implied ones).
     pub traits: Vec<Value>,
+    /// Type arguments of generic implemented traits (`impl Iterable<T>`).
+    pub trait_args: Vec<(Value, Vec<TypeDesc>)>,
     pub is_exception: bool,
+    /// The type of instances of a non-generic class.
+    pub canonical: std::sync::OnceLock<Value>,
 }
 
 impl Class {
@@ -128,6 +136,8 @@ impl Class {
 pub struct Trait {
     pub name: String,
     pub id: u32,
+    /// Number of type parameters (`Iterable<T>` has one).
+    pub nparams: usize,
     /// (name, default implementation)
     pub methods: Vec<(String, Option<Value>)>,
     /// Traits implied by this one (e.g. `KeyError`'s `LookupError` implies `Exception`).
@@ -136,6 +146,8 @@ pub struct Trait {
 
 pub struct Instance {
     pub class: Value,
+    /// The instance's type (`Stack<int>`), an immortal type value.
+    pub ty: Value,
     pub slots: Box<[AtomicU64]>,
 }
 
@@ -323,6 +335,7 @@ impl Obj {
                 recv.decref();
                 func.decref();
             }
+            Body::Instantiated { func, .. } => func.decref(),
             Body::Dict(d) => {
                 for (k, v) in d.take_all() {
                     k.decref();
@@ -405,10 +418,12 @@ impl Value {
             Some(Body::Str(_)) => "str",
             Some(Body::Tuple(_)) => "tuple",
             Some(Body::List(l)) => return crate::rtype::name(l.ty).to_string(),
-            Some(Body::Function(_)) | Some(Body::Builtin(_)) | Some(Body::BoundMethod { .. }) => "function",
+            Some(Body::Function(_)) | Some(Body::Builtin(_)) | Some(Body::BoundMethod { .. }) | Some(Body::Instantiated { .. }) => {
+                "function"
+            }
             Some(Body::Class(_)) => "class",
             Some(Body::Trait(_)) => "trait",
-            Some(Body::Instance(i)) => return i.class().name.clone(),
+            Some(Body::Instance(i)) => return crate::rtype::name(i.ty).to_string(),
             Some(Body::Dict(d)) => return crate::rtype::name(d.ty).to_string(),
             Some(Body::Array(a)) => return format!("array<{}>", a.elem.name()),
             Some(Body::ElemType(_)) | Some(Body::Type(_)) => "type",

@@ -170,9 +170,18 @@ pub struct Param {
     pub span: Span,
 }
 
+/// A type parameter with its trait bounds: `T: Ord + Hash`.
+#[derive(Clone, Debug)]
+pub struct TypeParam {
+    pub name: String,
+    pub bounds: Vec<TypeExpr>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncDef {
     pub name: String,
+    pub tparams: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     /// `None` for a required trait method (`...` body).
@@ -191,7 +200,9 @@ pub struct FieldDecl {
 #[derive(Clone, Debug)]
 pub struct ClassDef {
     pub name: String,
-    pub traits: Vec<(String, Span)>,
+    pub tparams: Vec<TypeParam>,
+    /// Implemented traits with their type arguments: `impl Iterable<T>`.
+    pub traits: Vec<(String, Vec<TypeExpr>, Span)>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<FuncDef>,
     pub span: Span,
@@ -200,6 +211,7 @@ pub struct ClassDef {
 #[derive(Clone, Debug)]
 pub struct TraitDef {
     pub name: String,
+    pub tparams: Vec<TypeParam>,
     pub methods: Vec<FuncDef>,
     pub span: Span,
 }

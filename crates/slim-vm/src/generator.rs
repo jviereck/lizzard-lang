@@ -58,17 +58,40 @@ impl Generator {
     }
 }
 
+/// Runs the leading instructions that load a generic function's type
+/// parameters (from `self` or its captures), so the item type is known
+/// before the body starts. The body runs them again (they are idempotent).
+fn type_prologue(th: &mut Thread, code: &crate::code::Code, regs: &mut [Value], captures: &[Value]) -> VResult<()> {
+    use crate::ops::Instr;
+    for ins in &code.instrs {
+        match *ins {
+            Instr::LoadTypeArg { dst, obj, k } => regs[dst as usize] = crate::helpers::type_arg(th, regs[obj as usize], k)?,
+            Instr::LoadTraitArg { dst, obj, tr, k } => {
+                regs[dst as usize] = crate::helpers::trait_arg(th, regs[obj as usize], tr, k)?
+            }
+            Instr::LoadCapture { dst, idx } if code.reg_names[dst as usize].as_deref().is_some_and(|n| n.starts_with('<')) => {
+                regs[dst as usize] = captures[idx as usize]
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
 /// The yield type of a generator function's code.
-fn yield_type(th: &mut Thread, code: &crate::code::Code) -> VResult<&'static crate::rtype::RtType> {
+fn yield_type(th: &mut Thread, code: &crate::code::Code, regs: &[Value]) -> VResult<&'static crate::rtype::RtType> {
     match code.yield_ty {
-        Some(i) => crate::types::code_type(th, code, i),
+        Some(i) => crate::types::regs_type(th, code, i, regs),
         None => Ok(crate::rtype::as_type(crate::rtype::any()).unwrap()),
     }
 }
 
-pub fn create(th: &mut Thread, f: Value, regs: Vec<Value>) -> VResult<Value> {
+pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value> {
     let item = match f.body() {
-        Some(Body::Function(func)) => yield_type(th, &func.code)?,
+        Some(Body::Function(func)) => {
+            type_prologue(th, &func.code, &mut regs, &func.captures)?;
+            yield_type(th, &func.code, &regs)?
+        }
         _ => unreachable!("generator of a non-function"),
     };
     f.incref();
@@ -206,9 +229,12 @@ fn resume_inner(th: &mut Thread, g: &Generator, sent: Value, throw: Option<Value
 /// `yield` inside the generator frame: moves the value out and suspends.
 pub fn yield_op(th: &mut Thread, frame: &mut Frame, dst: Reg, src: Reg) -> u32 {
     let v = frame.reg(src);
-    let item = match yield_type(th, frame.code()) {
-        Ok(t) => t,
-        Err(_) => return 1,
+    let item = match frame.code().yield_ty {
+        Some(i) => match crate::types::frame_type(th, frame, i) {
+            Ok(t) => t,
+            Err(_) => return 1,
+        },
+        None => crate::rtype::as_type(crate::rtype::any()).unwrap(),
     };
     let Some(v) = crate::rtype::admit(v, item) else {
         th.raise(

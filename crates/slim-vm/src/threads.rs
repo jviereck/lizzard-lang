@@ -63,7 +63,12 @@ unsafe impl Send for SendValues {}
 /// Which parameters of a callable take ownership (`keep`).
 fn keep_flags(f: Value, nargs: usize) -> Vec<bool> {
     match f.body() {
-        Some(Body::Function(func)) => (0..nargs).map(|i| func.code.params.get(i).is_some_and(|p| p.keep)).collect(),
+        Some(Body::Function(func)) => {
+            // Hidden type parameters (`<T>`) are not passed by the caller.
+            let ps: Vec<bool> = func.code.params.iter().filter(|p| !p.name.starts_with('<')).map(|p| p.keep).collect();
+            (0..nargs).map(|i| ps.get(i).copied().unwrap_or(false)).collect()
+        }
+        Some(Body::Instantiated { func, .. }) => keep_flags(*func, nargs),
         Some(Body::Builtin(b)) => (0..nargs).map(|i| b.keep_mask & (1 << i) != 0).collect(),
         Some(Body::BoundMethod { func, .. }) => {
             let mut k = keep_flags(*func, nargs + 1);

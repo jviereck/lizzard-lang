@@ -138,6 +138,12 @@ opcodes! {
     CheckType { reg: Reg, ty: u32, what: u32 } => sem::check_type;
     /// dst = the runtime type `types[ty]` (immortal).
     MakeType { dst: Reg, ty: u32 } => sem::make_type;
+    /// dst = type argument `k` of the instance in `obj` (generic methods).
+    LoadTypeArg { dst: Reg, obj: Reg, k: u32 } => sem::load_type_arg;
+    /// dst = type argument `k` of trait `globals[tr]` as `obj` implements it.
+    LoadTraitArg { dst: Reg, obj: Reg, tr: u32, k: u32 } => sem::load_trait_arg;
+    /// dst = generic function `func` with the type arguments in `targs`.
+    Instantiate { dst: Reg, func: Reg, targs: u32 } => sem::instantiate;
 
     /// dst = borrow of obj.name
     LoadField { dst: Reg, obj: Reg, name: u32 } => sem::load_field;

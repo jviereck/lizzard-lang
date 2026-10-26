@@ -37,8 +37,13 @@ pub enum Ty {
     Iter(Box<Ty>),
     /// `Channel<T>`.
     Chan(Box<Ty>),
-    Instance(String),
-    Trait(String),
+    /// An instance of a class, with its type arguments (empty for a
+    /// non-generic class, or for "some instance" of a generic one).
+    Instance(String, Vec<Ty>),
+    /// A value implementing a trait (`Iterable<int>`).
+    Trait(String, Vec<Ty>),
+    /// A type parameter in a generic class, trait or function.
+    Param(String),
     /// A builtin object type (`Lock`, `Thread`): a move type.
     Opaque(String),
     /// A class object (immortal, copied freely).
@@ -68,6 +73,25 @@ fn read_ty(t: &Ty) -> Ty {
 }
 
 impl Ty {
+    /// Replaces type parameters bound in `map` (others stay).
+    pub fn subst(&self, map: &dyn Fn(&str) -> Option<Ty>) -> Ty {
+        let b = |t: &Ty| Box::new(t.subst(map));
+        let v = |ts: &[Ty]| ts.iter().map(|t| t.subst(map)).collect::<Vec<_>>();
+        match self {
+            Ty::Param(n) => map(n).unwrap_or_else(|| self.clone()),
+            Ty::List(t) => Ty::List(b(t)),
+            Ty::Dict(k, x) => Ty::Dict(b(k), b(x)),
+            Ty::Iter(t) => Ty::Iter(b(t)),
+            Ty::Chan(t) => Ty::Chan(b(t)),
+            Ty::Option(t) => Ty::Option(b(t)),
+            Ty::TypeVal(t) => Ty::TypeVal(b(t)),
+            Ty::Tuple(Some(ts)) => Ty::Tuple(Some(v(ts))),
+            Ty::Instance(c, a) => Ty::Instance(c.clone(), v(a)),
+            Ty::Trait(c, a) => Ty::Trait(c.clone(), v(a)),
+            t => t.clone(),
+        }
+    }
+
     pub fn list(t: Ty) -> Ty {
         Ty::List(Box::new(t))
     }
@@ -108,7 +132,7 @@ impl Ty {
     /// `Some(true)` for copy types, `Some(false)` for move types.
     pub fn is_copy(&self) -> Option<bool> {
         match self {
-            Ty::Unknown | Ty::Any => None,
+            Ty::Unknown | Ty::Any | Ty::Param(_) => None,
             Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Unit | Ty::NoneT | Ty::Class(_) | Ty::StaticFn | Ty::TypeVal(_) => {
                 Some(true)
             }
@@ -129,6 +153,7 @@ impl Ty {
             Ty::Tuple(Some(ts)) => ts.iter().all(Ty::is_precise),
             Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) => **t != Ty::Unknown && t.is_precise(),
             Ty::Dict(k, v) => k.is_precise() && v.is_precise(),
+            Ty::Instance(_, args) | Ty::Trait(_, args) => args.iter().all(Ty::is_precise),
             _ => true,
         }
     }
@@ -181,7 +206,8 @@ impl Ty {
             Ty::Func | Ty::StaticFn => "function".into(),
             Ty::Iter(t) => args("Iterator", &[t]),
             Ty::Chan(t) => args("Channel", &[t]),
-            Ty::Instance(c) | Ty::Trait(c) | Ty::Opaque(c) => c.clone(),
+            Ty::Instance(c, a) | Ty::Trait(c, a) if !a.is_empty() => args(c, &a.iter().collect::<Vec<_>>()),
+            Ty::Instance(c, _) | Ty::Trait(c, _) | Ty::Opaque(c) | Ty::Param(c) => c.clone(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Option(t) => format!("Option<{}>", t.name()),
             Ty::Array(None) => "array".into(),
@@ -193,8 +219,12 @@ impl Ty {
 
 /// What a name in a type annotation refers to.
 pub enum TypeName {
-    Class,
-    Trait,
+    /// A class with this many type parameters.
+    Class(usize),
+    /// A trait with this many type parameters.
+    Trait(usize),
+    /// A type parameter, found at this index of the environment.
+    Param(u16),
 }
 
 /// Converts an annotation into a static type and a runtime descriptor.
@@ -287,18 +317,30 @@ fn resolve_in(
                 "None" | "NoneType" => Err("`None` is not a type; use `Option<T>`".into()),
                 "Optional" => Err("use `Option<T>` instead of `Optional`".into()),
                 other => {
-                    if !args.is_empty() {
-                        return Err(format!("`{other}` does not take type arguments"));
-                    }
-                    match lookup(other) {
-                        Some((idx, TypeName::Class)) => {
-                            Ok((Ty::Instance(other.to_string()), TypeDesc::Global(idx, other.to_string())))
+                    let found = lookup(other).ok_or_else(|| format!("unknown type `{other}`"))?;
+                    let arity = match found.1 {
+                        TypeName::Param(k) => {
+                            if !args.is_empty() {
+                                return Err(format!("type parameter `{other}` does not take type arguments"));
+                            }
+                            return Ok((Ty::Param(other.to_string()), TypeDesc::Param(k, other.to_string())));
                         }
-                        Some((idx, TypeName::Trait)) => {
-                            Ok((Ty::Trait(other.to_string()), TypeDesc::Global(idx, other.to_string())))
-                        }
-                        None => Err(format!("unknown type `{other}`")),
+                        TypeName::Class(n) | TypeName::Trait(n) => n,
+                    };
+                    // No arguments on a generic type: any instantiation.
+                    if !args.is_empty() && args.len() != arity {
+                        return Err(match arity {
+                            0 => format!("`{other}` does not take type arguments"),
+                            n => format!("`{other}` takes {n} type argument{}", if n == 1 { "" } else { "s" }),
+                        });
                     }
+                    let (tys, ds): (Vec<Ty>, Vec<TypeDesc>) =
+                        (0..args.len()).map(arg).collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+                    let d = TypeDesc::Global(found.0, other.to_string(), ds);
+                    Ok(match found.1 {
+                        TypeName::Class(_) => (Ty::Instance(other.to_string(), tys), d),
+                        _ => (Ty::Trait(other.to_string(), tys), d),
+                    })
                 }
             }
         }

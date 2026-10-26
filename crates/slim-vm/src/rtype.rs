@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use crate::array::Elem;
+use crate::code::TypeDesc;
 use crate::object::{Body, Obj};
 use crate::value::Value;
 
@@ -57,6 +58,8 @@ pub struct RtType {
     this: OnceLock<Value>,
     list_of: OnceLock<Value>,
     option_of: OnceLock<Value>,
+    /// For a class type: the implemented trait types (`Iterable<int>`).
+    impls: OnceLock<Box<[Value]>>,
 }
 
 impl RtType {
@@ -99,6 +102,7 @@ pub fn intern(ctor: Ctor, args: &[Value]) -> Value {
         this: OnceLock::new(),
         list_of: OnceLock::new(),
         option_of: OnceLock::new(),
+        impls: OnceLock::new(),
     }));
     let _ = as_type(v).unwrap().this.set(v);
     t.insert(key, v);
@@ -125,14 +129,109 @@ fn type_name(ctor: Ctor, args: &[Value]) -> String {
         Ctor::Channel => "Channel",
         Ctor::Lock => "Lock",
         Ctor::Thread => "Thread",
-        Ctor::Class(c) => return c.as_class().map(|c| c.name.clone()).unwrap_or_default(),
-        Ctor::Trait(t) => return t.as_trait().map(|t| t.name.clone()).unwrap_or_default(),
+        Ctor::Class(c) => c.as_class().map(|c| c.name.as_str()).unwrap_or_default(),
+        Ctor::Trait(t) => t.as_trait().map(|t| t.name.as_str()).unwrap_or_default(),
     };
     if args.is_empty() {
         return base.into();
     }
     let parts: Vec<&str> = args.iter().map(|a| as_type(*a).map(|t| t.name.as_str()).unwrap_or("?")).collect();
     format!("{base}<{}>", parts.join(", "))
+}
+
+/// Resolves a type whose classes and traits are already resolved, with type
+/// parameters taken from `env`. `None` if it names an unresolved global.
+pub fn subst(d: &TypeDesc, env: &[Value]) -> Option<Value> {
+    Some(match d {
+        TypeDesc::Builtin(c, args) => {
+            let args = args.iter().map(|a| subst(a, env)).collect::<Option<Vec<_>>>()?;
+            intern(*c, &args)
+        }
+        TypeDesc::Param(k, _) => *env.get(*k as usize)?,
+        TypeDesc::Resolved(v) => *v,
+        TypeDesc::Global(..) => return None,
+    })
+}
+
+/// The type of instances of a non-generic class.
+pub fn class_type(c: Value) -> Value {
+    *c.as_class().expect("a class").canonical.get_or_init(|| intern(Ctor::Class(c), &[]))
+}
+
+/// The trait types a class type implements, with its type arguments
+/// substituted (`Stack<int>` implements `Iterable<int>`).
+pub fn impls_of(t: &RtType) -> &[Value] {
+    t.impls.get_or_init(|| {
+        let Ctor::Class(c) = t.ctor else { return Box::new([]) };
+        let class = c.as_class().unwrap();
+        class
+            .trait_args
+            .iter()
+            .filter_map(|(tr, args)| {
+                let args = args.iter().map(|a| subst(a, &t.args)).collect::<Option<Vec<_>>>()?;
+                Some(intern(Ctor::Trait(*tr), &args))
+            })
+            .collect()
+    })
+}
+
+/// Whether type `t` satisfies trait type `tr` (a bound such as `Ord` or
+/// `Iterable<int>`). The builtin traits are structural; user traits are
+/// satisfied by classes that implement them with the same type arguments.
+pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
+    let Ctor::Trait(trv) = tr.ctor else { return false };
+    let Some(trait_) = trv.as_trait() else { return false };
+    let class = match t.ctor {
+        Ctor::Class(c) => c.as_class(),
+        _ => None,
+    };
+    let implements = |name: &str| class.is_some_and(|c| c.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name)));
+    // Tuples (and `Option`s, for hashing) qualify when all their parts do.
+    let parts = || !t.is_bare() && t.args.iter().all(|a| satisfies(as_type(*a).unwrap(), tr));
+    match trait_.name.as_str() {
+        "Ord" => match t.ctor {
+            Ctor::Int | Ctor::Float | Ctor::BigInt | Ctor::Bool | Ctor::Str => true,
+            Ctor::Tuple => parts(),
+            _ => implements("Ord") || implements("Num"),
+        },
+        "Num" => matches!(t.ctor, Ctor::Int | Ctor::Float | Ctor::BigInt) || implements("Num"),
+        "Hash" => match t.ctor {
+            Ctor::List | Ctor::Dict | Ctor::Array(_) | Ctor::Any => false,
+            Ctor::Tuple | Ctor::Option => parts(),
+            _ => true,
+        },
+        "Len" => {
+            matches!(t.ctor, Ctor::Str | Ctor::List | Ctor::Dict | Ctor::Array(_) | Ctor::Tuple | Ctor::Channel) || implements("Len")
+        }
+        "Iterable" | "Iterator" if class.is_none() => {
+            let item = match t.ctor {
+                Ctor::Iterator => Some(elem_of(t)),
+                _ if trait_.name == "Iterator" => None,
+                Ctor::List | Ctor::Channel => Some(elem_of(t)),
+                Ctor::Dict if t.args.len() == 2 => Some(t.args[0]),
+                Ctor::Str => Some(str_()),
+                Ctor::Array(Some(e)) => Some(elem_scalar(e)),
+                Ctor::Tuple => t.args.first().copied().filter(|f| t.args.iter().all(|a| a == f)),
+                _ => None,
+            };
+            item.is_some_and(|item| tr.is_bare() || tr.args[0] == item)
+        }
+        _ => match class {
+            Some(c) => {
+                // A class implementing `Iterator<T>` also provides `Iterable<T>`.
+                let provides = |i: &Value| {
+                    *i == tr.value()
+                        || (trait_.name == "Iterable"
+                            && as_type(*i).is_some_and(|i| {
+                                i.args == tr.args && matches!(i.ctor, Ctor::Trait(x) if x.as_trait().is_some_and(|x| x.name == "Iterator"))
+                            }))
+                };
+                let declared = c.implements(trv) || (trait_.name == "Iterable" && implements("Iterator"));
+                declared && (tr.is_bare() || impls_of(t).iter().any(provides))
+            }
+            None => matches!(t.ctor, Ctor::Trait(x) if x == trv && (tr.is_bare() || t.args == tr.args)),
+        },
+    }
 }
 
 pub fn as_type(v: Value) -> Option<&'static RtType> {
@@ -277,8 +376,8 @@ pub fn type_of(v: Value) -> Value {
             tuple_of(&tys)
         }
         Some(Body::Array(a)) => prim(Ctor::Array(Some(a.elem))),
-        Some(Body::Instance(i)) => prim(Ctor::Class(i.class)),
-        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. }) => prim(Ctor::Function),
+        Some(Body::Instance(i)) => i.ty,
+        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Instantiated { .. }) => prim(Ctor::Function),
         Some(Body::Lock(_)) => prim(Ctor::Lock),
         Some(Body::Thread(_)) => prim(Ctor::Thread),
         _ => any(),
@@ -317,24 +416,31 @@ pub fn has_type(v: Value, t: &RtType) -> bool {
         Ctor::Iterator => match v.body() {
             Some(Body::Iter(it)) => t.is_bare() || same(it.ty, t),
             Some(Body::Generator(g)) => t.is_bare() || same(g.ty, t),
-            // A user iterator's item type is not known (generic traits come later).
+            // A user iterator: its `impl Iterator<T>` gives the item type.
             Some(Body::Instance(i)) => {
-                (t.is_bare() || t.arg(0).ctor == Ctor::Any)
-                    && i.class().traits.iter().any(|tr| tr.as_trait().is_some_and(|tr| tr.name == "Iterator"))
+                let is_iter = |tr: &Value| tr.as_trait().is_some_and(|tr| tr.name == "Iterator");
+                i.class().traits.iter().any(is_iter)
+                    && (t.is_bare()
+                        || t.arg(0).ctor == Ctor::Any
+                        || impls_of(as_type(i.ty).unwrap())
+                            .iter()
+                            .filter_map(|x| as_type(*x))
+                            .any(|x| matches!(x.ctor, Ctor::Trait(tr) if is_iter(&tr)) && x.args.first() == t.args.first()))
             }
             _ => false,
         },
         Ctor::Array(e) => v.as_array().is_some_and(|a| e.is_none_or(|e| a.elem == e)),
-        Ctor::Function => {
-            matches!(v.body(), Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_) | Body::Type(_)))
-        }
+        Ctor::Function => matches!(
+            v.body(),
+            Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Instantiated { .. } | Body::Class(_) | Body::Type(_))
+        ),
         Ctor::Lock => matches!(v.body(), Some(Body::Lock(_))),
         Ctor::Thread => matches!(v.body(), Some(Body::Thread(_))),
-        Ctor::Class(c) => v.as_instance().is_some_and(|i| i.class == c),
+        Ctor::Class(c) => v.as_instance().is_some_and(|i| i.class == c && (t.is_bare() || same(i.ty, t))),
         Ctor::Trait(tr) => match v.body() {
-            Some(Body::Instance(i)) => i.class().implements(tr),
-            Some(Body::Generator(_) | Body::Iter(_)) => tr.as_trait().is_some_and(|t| t.name == "Iterator"),
-            _ => false,
+            Some(Body::Instance(i)) if t.is_bare() => i.class().implements(tr),
+            Some(Body::Generator(_) | Body::Iter(_)) if t.is_bare() => tr.as_trait().is_some_and(|t| t.name == "Iterator" || t.name == "Iterable"),
+            _ => v != Value::NONE && satisfies(as_type(type_of(v)).unwrap(), t),
         },
     }
 }

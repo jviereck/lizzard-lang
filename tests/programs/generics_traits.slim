@@ -1,0 +1,124 @@
+# User traits as bounds, generic traits, and generic methods.
+
+trait Shape:
+    def area(self) -> float: ...
+    def describe(self) -> str:
+        "shape with area " + str(self.area())
+
+class Square(impl Shape, impl Ord):
+    side: float
+    def __init__(self, side: float) -> ():
+        self.side = side
+    def area(self) -> float:
+        self.side * self.side
+    def __lt__(self, other: Square) -> bool:
+        self.side < other.side
+
+class Circle(impl Shape):
+    r: float
+    def __init__(self, r: float) -> ():
+        self.r = r
+    def area(self) -> float:
+        3.0 * self.r * self.r
+
+# A bound gives static method resolution on `T`.
+def total_area<T: Shape>(xs: list<T>) -> float:
+    t = 0.0
+    for x in xs:
+        t += x.area()
+    t
+
+def biggest<T: Shape + Ord>(xs: list<T>) -> str:
+    sorted(xs)[len(xs) - 1].describe()
+
+# A generic trait: its default methods see the implementing type's argument.
+trait Source<T>:
+    def next_item(self) -> Option<T>: ...
+    def collect(self) -> list<T>:
+        out: list<T> = []
+        item = self.next_item()
+        while item is not None:
+            out.append(item)
+            item = self.next_item()
+        out
+
+class Countdown(impl Source<int>):
+    n: int
+    def __init__(self, n: int) -> ():
+        self.n = n
+    def next_item(self) -> Option<int>:
+        if self.n == 0:
+            None
+        else:
+            self.n -= 1
+            self.n + 1
+
+class Repeat<T>(impl Source<T>):
+    value: T
+    times: int
+    def __init__(self, value: T + keep, times: int) -> ():
+        self.value <- value
+        self.times = times
+    def next_item(self) -> Option<T>:
+        if self.times == 0:
+            None
+        else:
+            self.times -= 1
+            self.value++
+
+def drain<T>(s: Source<T>) -> list<T>:
+    s.collect()
+
+# A user iterator: `impl Iterator<T>` makes it usable in `for` and as an
+# `Iterator<T>`.
+class Upto(impl Iterator<int>):
+    i: int
+    n: int
+    def __init__(self, n: int) -> ():
+        self.i = 0
+        self.n = n
+    def __next__(self) -> int:
+        if self.i >= self.n:
+            raise StopIteration()
+        self.i += 1
+        self.i
+
+def sum_all(xs: Iterable<int>) -> int:
+    t = 0
+    for x in xs:
+        t += x
+    t
+
+# Generic methods take their own type parameters.
+class Registry:
+    names: list<str>
+    def __init__(self) -> ():
+        self.names <- []
+    def tag<T>(self, x: T) -> tuple<str, T>:
+        ("#" + str(len(self.names)), x++)
+
+def untyped(x: any) -> any:
+    x++
+
+def main() -> ():
+    shapes = [Square(2.0), Square(1.0)]
+    print(total_area(shapes), total_area([Circle(1.0)]), biggest(shapes))
+    print(Countdown(3).collect(), drain(Countdown(2)), drain(Repeat("ab", 2)))
+    r = Repeat::<float>(1, 2)
+    floats = r.collect()
+    floats.append(0.5)
+    print(floats, sum_all([1, 2]), sum_all(Upto(4)))
+    for i in Upto(2):
+        print("upto", i)
+    reg = Registry()
+    print(reg.tag(5), reg.tag("x"))
+    try:
+        total_area(untyped([1, 2]))
+    except TypeError as e:
+        print("error:", e)
+    try:
+        sum_all(untyped(["a"]))
+    except TypeError as e:
+        print("error:", e)
+
+main()

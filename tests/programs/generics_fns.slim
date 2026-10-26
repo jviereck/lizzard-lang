@@ -1,0 +1,77 @@
+# Generic functions: type arguments are hidden leading parameters, inferred
+# statically, given with a turbofish, or inferred at runtime from `any`.
+
+def max_of<T: Ord>(xs: list<T>) -> Option<T>:
+    best: Option<T> = None
+    for x in xs:
+        if best is None:
+            best = x++
+        elif x > best:
+            best = x++
+    best
+
+def first<T>(xs: list<T>) -> Option<T>:
+    xs.first()
+
+def repeat<T>(x: T, n: int) -> list<T>:
+    out: list<T> = []
+    for i in range(n):
+        out.append(x++)
+    out
+
+def total<T: Num>(xs: list<T>, zero: T) -> T:
+    acc = zero++
+    for x in xs:
+        acc = acc + x
+    acc
+
+def keys_of<K: Hash, V>(d: dict<K, V>) -> list<K>:
+    out: list<K> = []
+    for k in d:
+        out.append(k++)
+    out
+
+def pairs<A, B>(a: A, b: B) -> tuple<A, B>:
+    (a++, b++)
+
+def count<T: Len>(x: T) -> int:
+    len(x)
+
+def untyped(x: any) -> any:
+    x++
+
+def main() -> ():
+    print(max_of([3, 9, 2]), max_of(["pear", "apple"]), max_of::<float>([]))
+    print(first([1.5, 2.5]), repeat("ab", 3), repeat::<float>(1, 2))
+    print(total([1, 2, 3], 0), total([0.5, 0.25], 0.0))
+    print(keys_of({"a": 1, "b": 2}), pairs(1, "x"), count("hello"), count([1, 2]))
+
+    # The result type is the instantiated one.
+    words = repeat("w", 2)
+    words.append("z")
+    print(words)
+
+    # A generic function as a value must be instantiated.
+    f = first::<str>
+    print(f(["only"]))
+    try:
+        untyped(f)([1])
+    except TypeError as e:
+        print("error:", e)
+
+    # Arguments typed `any` are inferred at runtime (bounds checked then).
+    print(max_of(untyped([4, 1])), repeat(untyped(2.5), 2))
+    try:
+        max_of(untyped([[1], [2]]))
+    except TypeError as e:
+        print("error:", e)
+    try:
+        total(untyped(["a"]), untyped("b"))
+    except TypeError as e:
+        print("error:", e)
+    try:
+        total(untyped([1]), untyped(2.5))
+    except TypeError as e:
+        print("error:", e)
+
+main()

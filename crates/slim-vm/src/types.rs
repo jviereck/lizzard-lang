@@ -6,50 +6,118 @@ use crate::object::{Body, Field};
 use crate::rtype::{self, Ctor, RtType};
 use crate::value::Value;
 
-/// The runtime type for `d`, or the name of a class or trait that is not
-/// defined yet.
-pub fn materialize(th: &Thread, d: &TypeDesc) -> Result<Value, String> {
+/// The runtime type for `d`, with type parameters taken from `env`. Fails
+/// with the name of a class or trait that is not defined yet, or of a type
+/// parameter that has no value.
+pub fn materialize(th: &Thread, d: &TypeDesc, env: &dyn Fn(u16) -> Value) -> Result<Value, String> {
     match d {
         TypeDesc::Builtin(c, args) => {
-            let args = args.iter().map(|a| materialize(th, a)).collect::<Result<Vec<_>, _>>()?;
+            let args = args.iter().map(|a| materialize(th, a, env)).collect::<Result<Vec<_>, _>>()?;
             Ok(rtype::intern(*c, &args))
         }
-        TypeDesc::Global(idx, n) => {
+        TypeDesc::Global(idx, n, args) => {
             let v = th.vm.global(*idx);
+            let args = args.iter().map(|a| materialize(th, a, env)).collect::<Result<Vec<_>, _>>()?;
             match v.body() {
-                Some(Body::Class(_)) => Ok(rtype::prim(Ctor::Class(v))),
-                Some(Body::Trait(_)) => Ok(rtype::prim(Ctor::Trait(v))),
+                Some(Body::Class(_)) => Ok(rtype::intern(Ctor::Class(v), &args)),
+                Some(Body::Trait(_)) => Ok(rtype::intern(Ctor::Trait(v), &args)),
                 _ => Err(n.clone()),
             }
         }
+        TypeDesc::Param(k, n) => match env(*k) {
+            Value::UNINIT => Err(n.clone()),
+            v => Ok(v),
+        },
+        TypeDesc::Resolved(v) => Ok(*v),
     }
+}
+
+fn no_env(_: u16) -> Value {
+    Value::UNINIT
 }
 
 fn undefined(th: &mut Thread, n: &str) -> crate::interp::Raised {
     th.raise("NameError", format!("type `{n}` is used before it is defined"))
 }
 
-/// The runtime type of `code.types[idx]` (cached in the code object).
+/// The runtime type of `code.types[idx]`, which mentions no type parameters
+/// (cached in the code object).
 pub fn code_type(th: &mut Thread, code: &Code, idx: u32) -> VResult<&'static RtType> {
     let slot = &code.type_cache[idx as usize];
     if let Some(v) = slot.get() {
         return Ok(rtype::as_type(*v).unwrap());
     }
-    match materialize(th, &code.types[idx as usize]) {
+    match materialize(th, &code.types[idx as usize], &no_env) {
         Ok(v) => Ok(rtype::as_type(*slot.get_or_init(|| v)).unwrap()),
         Err(n) => Err(undefined(th, &n)),
     }
 }
 
-/// The runtime type of a field (cached in the field).
-pub fn field_type(th: &mut Thread, f: &Field) -> VResult<&'static RtType> {
+/// The runtime type of `code.types[idx]` in a frame: type parameters are
+/// read from the frame's type-argument registers.
+pub fn frame_type(th: &mut Thread, frame: &crate::interp::Frame, idx: u32) -> VResult<&'static RtType> {
+    let code = frame.code();
+    let d = &code.types[idx as usize];
+    if !d.has_params() {
+        return code_type(th, code, idx);
+    }
+    match materialize(th, d, &|r| frame.reg(r)) {
+        Ok(v) => Ok(rtype::as_type(v).unwrap()),
+        Err(n) => Err(undefined(th, &n)),
+    }
+}
+
+/// The runtime type of `code.types[idx]` with type parameters read from
+/// `regs` (a frame that is not running yet).
+pub fn regs_type(th: &mut Thread, code: &Code, idx: u32, regs: &[Value]) -> VResult<&'static RtType> {
+    let d = &code.types[idx as usize];
+    if !d.has_params() {
+        return code_type(th, code, idx);
+    }
+    match materialize(th, d, &|r| regs[r as usize]) {
+        Ok(v) => Ok(rtype::as_type(v).unwrap()),
+        Err(n) => Err(undefined(th, &n)),
+    }
+}
+
+/// The runtime type of field `idx` of an instance (cached in the field
+/// unless it depends on the instance's type arguments).
+pub fn field_type(th: &mut Thread, inst: &crate::object::Instance, idx: usize) -> VResult<&'static RtType> {
+    let f: &Field = &inst.class().fields[idx];
     if let Some(v) = f.rt.get() {
         return Ok(rtype::as_type(*v).unwrap());
     }
-    match materialize(th, &f.ty) {
+    if f.ty.has_params() {
+        let args = &rtype::as_type(inst.ty).unwrap().args;
+        return match materialize(th, &f.ty, &|k| args.get(k as usize).copied().unwrap_or(Value::UNINIT)) {
+            Ok(v) => Ok(rtype::as_type(v).unwrap()),
+            Err(n) => Err(undefined(th, &n)),
+        };
+    }
+    match materialize(th, &f.ty, &no_env) {
         Ok(v) => Ok(rtype::as_type(*f.rt.get_or_init(|| v)).unwrap()),
         Err(n) => Err(undefined(th, &n)),
     }
+}
+
+/// Resolves the classes and traits named in `d` now; type parameters stay.
+pub fn pre_resolve(th: &Thread, d: &TypeDesc) -> Result<TypeDesc, String> {
+    Ok(match d {
+        TypeDesc::Builtin(c, args) => {
+            TypeDesc::Builtin(*c, args.iter().map(|a| pre_resolve(th, a)).collect::<Result<_, _>>()?)
+        }
+        TypeDesc::Global(idx, n, args) => {
+            let args = args.iter().map(|a| pre_resolve(th, a)).collect::<Result<_, _>>()?;
+            let v = th.vm.global(*idx);
+            let c = match v.body() {
+                Some(Body::Class(_)) => Ctor::Class(v),
+                Some(Body::Trait(_)) => Ctor::Trait(v),
+                _ => return Err(n.clone()),
+            };
+            TypeDesc::Builtin(c, args)
+        }
+        other => other.clone(),
+    })
 }
 
 /// The name of a value's type for error messages: the full reified type for

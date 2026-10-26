@@ -16,8 +16,13 @@ pub enum TypeDesc {
     /// A builtin type constructor and its arguments (none for scalars and
     /// for a bare container type, which accepts any container of its kind).
     Builtin(Ctor, Vec<TypeDesc>),
-    /// A class or trait bound to a module-level name.
-    Global(u32, String),
+    /// A class or trait bound to a module-level name, with type arguments.
+    Global(u32, String, Vec<TypeDesc>),
+    /// A type parameter: an index into the environment the type is resolved
+    /// in (a register in code; the instance's type arguments in a class).
+    Param(u16, String),
+    /// An already resolved type value.
+    Resolved(Value),
 }
 
 impl TypeDesc {
@@ -36,12 +41,30 @@ impl TypeDesc {
     pub fn is(&self, c: Ctor) -> bool {
         matches!(self, TypeDesc::Builtin(x, a) if *x == c && a.is_empty())
     }
+
+    /// Mentions a type parameter (so it depends on the environment).
+    pub fn has_params(&self) -> bool {
+        match self {
+            TypeDesc::Param(..) => true,
+            TypeDesc::Resolved(_) => false,
+            TypeDesc::Builtin(_, a) | TypeDesc::Global(_, _, a) => a.iter().any(TypeDesc::has_params),
+        }
+    }
 }
 
 impl fmt::Display for TypeDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TypeDesc::Global(_, n) => f.write_str(n),
+            TypeDesc::Param(_, n) => f.write_str(n),
+            TypeDesc::Resolved(v) => f.write_str(crate::rtype::name(*v)),
+            TypeDesc::Global(_, n, args) => {
+                f.write_str(n)?;
+                if !args.is_empty() {
+                    let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                    write!(f, "<{}>", parts.join(", "))?;
+                }
+                Ok(())
+            }
             TypeDesc::Builtin(c, args) => {
                 let base = match c {
                     Ctor::Any => "any",
@@ -62,7 +85,8 @@ impl fmt::Display for TypeDesc {
                     Ctor::Channel => "Channel",
                     Ctor::Lock => "Lock",
                     Ctor::Thread => "Thread",
-                    Ctor::Class(_) | Ctor::Trait(_) => "?",
+                    Ctor::Class(v) => v.as_class().map(|c| c.name.as_str()).unwrap_or("?"),
+                    Ctor::Trait(v) => v.as_trait().map(|t| t.name.as_str()).unwrap_or("?"),
                 };
                 f.write_str(base)?;
                 if !args.is_empty() {
@@ -80,6 +104,14 @@ pub struct ParamInfo {
     pub name: String,
     pub keep: bool,
     pub ty: Option<TypeDesc>,
+}
+
+/// A type parameter of a generic function: a hidden leading parameter that
+/// holds a type value, with the traits it must implement.
+#[derive(Clone, Debug)]
+pub struct TypeParamInfo {
+    pub name: String,
+    pub bounds: Vec<TypeDesc>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,16 +158,19 @@ pub struct FieldSpec {
 #[derive(Clone, Debug)]
 pub struct ClassSpec {
     pub name: String,
+    /// Type parameter names (`Param(k)` in field and trait types).
+    pub tparams: Vec<String>,
     pub fields: Vec<FieldSpec>,
     /// (method name, index into `Code::codes`)
     pub methods: Vec<(String, u32)>,
-    /// Global slots of the implemented traits.
-    pub traits: Vec<(u32, String)>,
+    /// Implemented traits: global slot, name and type arguments.
+    pub traits: Vec<(u32, String, Vec<TypeDesc>)>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TraitSpec {
     pub name: String,
+    pub nparams: usize,
     /// (method name, default implementation as index into `Code::codes`)
     pub methods: Vec<(String, Option<u32>)>,
 }
@@ -164,8 +199,11 @@ pub struct Code {
     pub names: Vec<String>,
     pub arglists: Vec<ArgList>,
     pub types: Vec<TypeDesc>,
-    /// Runtime type values of `types`, filled in on first use.
+    /// Runtime type values of `types`, filled in on first use (for types
+    /// that do not mention type parameters).
     pub type_cache: Box<[OnceLock<Value>]>,
+    /// Hidden leading parameters (after `self`) that hold type arguments.
+    pub tparams: Vec<TypeParamInfo>,
     /// Item type of a generator function (`-> Iterator<T>`).
     pub yield_ty: Option<u32>,
     pub codes: Vec<Arc<Code>>,

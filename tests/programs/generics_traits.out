@@ -1,0 +1,10 @@
+5.0 3.0 shape with area 4.0
+[3, 2, 1] [2, 1] ['ab', 'ab']
+[1.0, 1.0, 0.5] 3 10
+upto 1
+upto 2
+('#0', 5) ('#0', 'x')
+error: `int` does not implement `Shape` (required by `T` of `total_area()`)
+error: argument `xs` of `sum_all()` expected `Iterable<int>`, got `list<str>`
+rc-audit: ok
+[exit 0]

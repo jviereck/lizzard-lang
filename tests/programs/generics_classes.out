@@ -1,0 +1,16 @@
+Stack(items=[1, 2, 3]) 3 6
+popped 13
+ADA
+GRACE
+Box(value=5) 10
+5 7
+Pair(first='x', second=1.5) Pair(first=1.5, second='x') 2.5 X
+[1, 2] 2
+[3] 1
+[Box(value='a'), Box(value='b')]
+error: argument `x` of `Stack.push()` expected `int`, got `str`
+error: argument `s` of `total()` expected `Stack<int>`, got `Stack<str>`
+error: variable `bad` expected `list<Box<int>>`, got `list<Box<str>>`
+True Stack(items=[1, 2])
+rc-audit: ok
+[exit 0]
