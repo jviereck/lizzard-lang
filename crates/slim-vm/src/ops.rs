@@ -143,6 +143,8 @@ opcodes! {
     MakeType { dst: Reg, ty: u32 } => sem::make_type;
     /// dst = type argument `k` of the instance in `obj` (generic methods).
     LoadTypeArg { dst: Reg, obj: Reg, k: u32 } => sem::load_type_arg;
+    /// dst = the runtime type of `obj` (`Self` in a trait default method).
+    LoadTypeOf { dst: Reg, obj: Reg } => sem::load_type_of;
     /// dst = type argument `k` of trait `globals[tr]` as `obj` implements it.
     LoadTraitArg { dst: Reg, obj: Reg, tr: u32, k: u32 } => sem::load_trait_arg;
     /// dst = generic function `func` with the type arguments in `targs`.
@@ -163,6 +165,9 @@ opcodes! {
     BuildTuple { dst: Reg, args: u32 } => sem::build_tuple;
     /// dst = a new list of type `types[ty]` from the (owned) arguments.
     BuildList { dst: Reg, args: u32, ty: u32 } => sem::build_list;
+    /// dst = a struct of type `types[ty]` with the owned field values in
+    /// `args` (declared order).
+    BuildStruct { dst: Reg, args: u32, ty: u32 } => sem::build_struct;
     /// dst = a new dict of type `types[ty]` from alternating keys and values.
     BuildDict { dst: Reg, args: u32, ty: u32 } => sem::build_dict;
     /// Unpacks the owned sequence in `src` into the registers of arglist `dsts`.
@@ -213,7 +218,7 @@ impl Instr {
             Instr::LoadImm { bits, .. } => {
                 s.push_str(&format!("    ; {:?}", crate::value::Value(*bits as i64 as u64)))
             }
-            Instr::CheckType { ty, .. } | Instr::MakeType { ty, .. } | Instr::BuildDict { ty, .. } => {
+            Instr::CheckType { ty, .. } | Instr::MakeType { ty, .. } | Instr::BuildDict { ty, .. } | Instr::BuildStruct { ty, .. } => {
                 s.push_str(&format!("    ; {}", code.types[*ty as usize]))
             }
             Instr::LoadField { name, .. }

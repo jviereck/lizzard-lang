@@ -25,11 +25,11 @@ square.add(2.0, 2.0)
 square.add(0.0, 2.0)
 print(square, "area:", square.area(), "points:", len(square))
 
-# `Shape` is defined in Rust; slim classes implement it too.
-class Circle(impl Shape):
+# `Shape` is defined in Rust; slim structs implement it too.
+struct Circle:
     r: float
-    def __init__(self, r: float) -> ():
-        self.r = r
+
+impl Shape for Circle:
     def area(self) -> float:
         3.14159 * self.r * self.r
 
@@ -42,7 +42,7 @@ trait Describe:
 impl Describe for Polygon
 
 # Module variables are shared between threads, so their values must be `Send`.
-shapes: list<Shape + Send> = [square++, Circle(1.0)]
+shapes: list<Shape + Send> = [square++, Circle { r: 1.0 }]
 for s in shapes:
     print("shape area:", s.area())
 print(square.describe())

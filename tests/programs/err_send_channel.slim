@@ -1,8 +1,10 @@
 # Channels connect threads, so their items must be `Send`.
-class Bag:
+struct Bag:
     item: any
-    def __init__(self, item: any + keep) -> ():
-        self.item <- item
+
+impl Bag:
+    def new(item: any + keep) -> Self:
+        Bag { item }
 
 def main() -> ():
     ch: Channel<Bag> = Channel()

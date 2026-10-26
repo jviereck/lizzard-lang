@@ -251,7 +251,7 @@ impl Ty {
             Ty::Chan(t) => args("Channel", &[t]),
             Ty::Instance(c, a) | Ty::Trait(c, a) if !a.is_empty() => args(c, &a.iter().collect::<Vec<_>>()),
             Ty::Instance(c, _) | Ty::Trait(c, _) | Ty::Opaque(c) | Ty::Param(c) => c.clone(),
-            Ty::Class(c) => format!("class {c}"),
+            Ty::Class(c) => format!("type {c}"),
             Ty::Option(t) => format!("Option<{}>", t.name()),
             Ty::Array(None) => "array".into(),
             Ty::Array(Some(e)) => format!("array<{}>", e.name()),

@@ -1,5 +1,5 @@
-  File "err_send_global.slim", line 8
-    bag = Bag(1)
+  File "err_send_global.slim", line 10
+    bag = Bag::new(1)
     ^
 TypeError: cannot store `Bag`, which is not `Send`, in module variable `bag` (module variables are shared between threads)
 [exit 1]

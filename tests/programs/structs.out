@@ -1,0 +1,11 @@
+25.0 4.0 0.0
+one 1
+[1.5] two
+t True
+2.0
+in scope a
+caught Done
+caught bad thing 7
+dropping a
+rc-audit: ok
+[exit 0]

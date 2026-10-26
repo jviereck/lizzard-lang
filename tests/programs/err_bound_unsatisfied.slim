@@ -1,12 +1,14 @@
-# Type arguments must satisfy the class's bounds.
-class SortedBag<T: Ord>:
+# Type arguments must satisfy the struct's bounds.
+struct SortedBag<T: Ord>:
     items: list<T>
-    def __init__(self) -> ():
-        self.items <- []
+
+impl<T: Ord> SortedBag<T>:
+    def new() -> Self:
+        SortedBag { items: [] }
     def add(self, x: T + keep) -> ():
         self.items.append(x)
         self.items <- sorted(self.items)
 
-ok = SortedBag::<int>()
+ok = SortedBag::<int>::new()
 ok.add(3)
-bad = SortedBag::<list<int>>()
+bad = SortedBag::<list<int>>::new()

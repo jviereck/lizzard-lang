@@ -1,4 +1,4 @@
-  File "err_send_class_plus.slim", line 7
+  File "err_send_class_plus.slim", line 5
     def f(c: Counter + Send) -> ():
              ^
 TypeError: `+ Send` only applies to `any`, `function`, `Iterator<T>` and traits; `Counter` is `Send` exactly when its fields are

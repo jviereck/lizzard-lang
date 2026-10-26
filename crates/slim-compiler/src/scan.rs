@@ -47,8 +47,16 @@ fn stmt_assigned(s: &Stmt, out: &mut Vec<String>) {
             expr_assigned(value, out);
         }
         StmtKind::Def(f) => push(out, &f.name),
-        StmtKind::Class(c) => push(out, &c.name),
+        StmtKind::Struct(c) => push(out, &c.name),
         StmtKind::Trait(t) => push(out, &t.name),
+        // Associated functions are globals `Type::name`.
+        StmtKind::Impl(i) => {
+            if let (None, TypeExpr::Named(tn, _, _)) = (&i.tr, &i.target) {
+                for m in i.methods.iter().filter(|m| m.params.first().is_none_or(|p| p.name != "self")) {
+                    push(out, &format!("{tn}::{}", m.name));
+                }
+            }
+        }
         StmtKind::While { cond, body } => {
             expr_assigned(cond, out);
             assigned_names(body, out);
@@ -245,7 +253,11 @@ fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr), deep: bool) {
             v(c, f);
             args.iter().for_each(|a| v(a, f))
         }
-        ExprKind::Dup(x) | ExprKind::Unary(_, x) | ExprKind::YieldFrom(x) | ExprKind::TypeApp(x, _) => v(x, f),
+        ExprKind::Dup(x) | ExprKind::Unary(_, x) | ExprKind::YieldFrom(x) | ExprKind::TypeApp(x, _) | ExprKind::Path(x, _) => v(x, f),
+        ExprKind::StructLit { ty, fields } => {
+            v(ty, f);
+            fields.iter().for_each(|(_, x, _)| v(x, f))
+        }
         ExprKind::Yield(Some(x)) => v(x, f),
         ExprKind::Binary(_, a, b) | ExprKind::And(a, b) | ExprKind::Or(a, b) => {
             v(a, f);

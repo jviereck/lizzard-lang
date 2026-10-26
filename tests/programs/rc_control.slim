@@ -1,29 +1,33 @@
-class Res:
+struct Res:
     name: str
-    def __init__(self, n: str + keep) -> ():
-        self.name <- n
+
+impl Res:
+    def new(n: str + keep) -> Self:
+        Res { name: n }
+
+impl Drop for Res:
     def __drop__(self) -> ():
         print("drop", self.name)
 
 rc_auto(False)
 
 def scope() -> ():
-    a = Res("a")
-    b = Res("b")
-    c = Res("c")
+    a = Res::new("a")
+    b = Res::new("b")
+    c = Res::new("c")
 
 scope()
 print("after scope, pending =", rc_pending())
 print("freed (limit 1):", rc_run(1))
 print("freed rest:", rc_run())
 
-holder = [Res("in-list")]
+holder = [Res::new("in-list")]
 holder.pop()
 print("popped, nothing freed yet")
 rc_run()
 
-r = Res("shared")
+r = Res::new("shared")
 r2 = r++
-r = Res("replacement")
+r = Res::new("replacement")
 rc_run()
 print("shared still alive via r2:", r2.name)

@@ -434,15 +434,15 @@ main()
     assert_eq!(l, ["400"]);
     let e = err("from geom import Stack, Point\ndef show(s: Stack<Point>) -> int:\n    s.len()\ndef main() -> ():\n    spawn(show, Stack::<Point>())\nmain()\n");
     assert!(e.contains("is not `Send` (`geom.Stack<geom.Point>`)"), "{e}");
-    // Native traits: a Rust trait implemented by a Rust and a slim class;
+    // Native traits: a Rust trait implemented by a Rust class and a struct;
     // a program's trait implemented for a Rust class; builtin traits.
     let l = ok(r#"
 from util import log
 from geom import Polygon, Shape, Stack
-class Square(impl Shape):
+struct Square:
     side: float
-    def __init__(self, side: float) -> ():
-        self.side = side
+
+impl Shape for Square:
     def area(self) -> float:
         self.side * self.side
     def scale(self, k: float) -> ():
@@ -473,7 +473,7 @@ def size<T: Len>(x: T) -> int:
     len(x)
 
 def main() -> ():
-    shapes: list<Shape> = [tri(1.0), Square(2.0)]
+    shapes: list<Shape> = [tri(1.0), Square { side: 2.0 }]
     for s in shapes:
         s.scale(2.0)
         log(str(s.area()))
@@ -512,20 +512,21 @@ main()
 "#);
     assert_eq!(l, ["0.0", "TypeError"]);
 
-    let e = err("from geom import Shape\nclass Sq(impl Shape):\n    def __init__(self) -> ():\n        pass\n    def area(self) -> float:\n        1.0\n");
-    assert!(e.contains("class `Sq` implements `geom.Shape` but does not define required method `scale`"), "{e}");
+    let e = err("from geom import Shape\nstruct Sq\nimpl Shape for Sq:\n    def area(self) -> float:\n        1.0\n");
+    assert!(e.contains("`impl geom.Shape for Sq`: `Sq` does not define required method `scale`"), "{e}");
     let e = err("from geom import Point\ntrait D:\n    def area(self) -> float: ...\nimpl D for Point\n");
     assert!(e.contains("`impl D for geom.Point`: `geom.Point` does not define required method `area`"), "{e}");
     let e = err("from geom import Point\ntrait D:\n    def x(self) -> int: ...\nimpl D for Point\n");
     assert!(e.contains("`geom.Point.x` is `() -> float`, but `D` needs `() -> int`"), "{e}");
-    let e = err("trait D:\n    def f(self) -> int: ...\nclass C(impl D):\n    def __init__(self) -> ():\n        pass\n    def f(self) -> int:\n        1\nclass E:\n    def __init__(self) -> ():\n        pass\nimpl D for E\n");
-    assert!(e.contains("`E` is a slim class; declare it in the class header: `class E(impl D)`"), "{e}");
+    let e = err("from geom import Polygon\nimpl Polygon:\n    def f(self) -> int:\n        1\n");
+    assert!(e.contains("`geom.Polygon` is a native class: its methods are defined in Rust"), "{e}");
     let e = err("from geom import Shape, Point\nimpl Shape for Point\n");
     assert!(e.contains("`geom.Shape` is a native trait"), "{e}");
     let e = err("from geom import Polygon\ntrait D:\n    def area(self) -> float: ...\ndef f() -> ():\n    impl D for Polygon\n");
     assert!(e.contains("must be at module level"), "{e}");
-    let e = err("from geom import Polygon\nimpl D for Polygon\ntrait D:\n    def area(self) -> float: ...\n");
-    assert!(e.contains("comes before trait `D` is defined"), "{e}");
+    // Items are order-independent: an impl may come before its trait.
+    let l = ok("from util import log\nfrom geom import Polygon\nimpl D for Polygon\nlog(Polygon().d())\ntrait D:\n    def area(self) -> float: ...\n    def d(self) -> str:\n        str(self.area())\n");
+    assert_eq!(l, ["0.0"]);
     let e = err("from geom import Polygon\nimpl Len for Polygon\n");
     assert!(e.contains("`geom.Polygon` already implements `Len`"), "{e}");
 

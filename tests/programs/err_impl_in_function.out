@@ -1,0 +1,5 @@
+  File "err_impl_in_function.slim", line 4
+        impl A:
+        ^
+SyntaxError: `impl` blocks must be at module level
+[exit 1]

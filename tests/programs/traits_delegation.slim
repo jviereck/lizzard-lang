@@ -3,22 +3,28 @@ trait Log:
     def hello(self) -> ():
         self.log("hello from default")
 
-class Console(impl Log):
+struct Console:
     lines: int
-    def __init__(self) -> ():
-        self.lines = 0
+
+impl Console:
+    def new() -> Self:
+        Console { lines: 0 }
+
+impl Log for Console:
     def log(self, msg: str) -> ():
         self.lines += 1
         print("console:", msg)
 
-class Service(impl Log):
+struct Service:
     out: Console
     last: Option<str>
     count: int
-    def __init__(self, out: Console + keep) -> ():
-        self.out <- out
-        self.last <- None
-        self.count = 0
+
+impl Service:
+    def new(out: Console + keep) -> Self:
+        Service { out, last: None, count: 0 }
+
+impl Log for Service:
     def log(self, msg: str) -> ():
         self.out.log(msg)
         old <- self.last <- Some(msg++)
@@ -29,7 +35,7 @@ class Service(impl Log):
 def use_log(l: Log) -> ():
     l.log("via trait")
 
-s = Service(Console())
+s = Service::new(Console::new())
 s.log("one")
 s.log("two")
 s.hello()

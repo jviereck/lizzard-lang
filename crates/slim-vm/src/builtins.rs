@@ -908,6 +908,7 @@ const TRAITS: &[(&str, &[&str], &[&str], usize)] = &[
     ("Num", &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"], 0),
     ("Hash", &[], &[], 0),
     ("Len", &[], &["__len__"], 0),
+    ("Drop", &[], &["__drop__"], 0),
     // Automatic: every type that is not local (thread-confined) is `Send`.
     ("Send", &[], &[], 0),
 ];

@@ -1,13 +1,13 @@
 # A field typed with a type parameter is checked against the instance's
 # type arguments, also through untyped paths.
-class Cell<T>:
+struct Cell<T>:
     value: T
-    def __init__(self, value: T + keep) -> ():
-        self.value <- value
+
+impl<T> Cell<T>:
     def set(self, v: any) -> ():
         self.value <- v++
 
-c = Cell("text")
+c = Cell { value: "text" }
 c.set("more")
 print(c.value)
 c.set(42)

@@ -1,13 +1,15 @@
 # `any` may hold anything; `any + Send` only values that are `Send`.
-class Bag:
+struct Bag:
     item: any
-    def __init__(self, item: any + keep) -> ():
-        self.item <- item
+
+impl Bag:
+    def new(item: any + keep) -> Self:
+        Bag { item }
 
 def keep_for_later(x: any + Send) -> str:
     str(x)
 
 def main() -> ():
-    print(keep_for_later(Bag(1)))
+    print(keep_for_later(Bag::new(1)))
 
 main()

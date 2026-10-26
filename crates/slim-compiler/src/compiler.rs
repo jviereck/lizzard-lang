@@ -88,13 +88,27 @@ pub struct ClassInfo {
     /// arguments, the instantiation's class). The family itself has no
     /// methods; see `ModInfo::class_info`.
     pub instances: Vec<(Vec<Ty>, ClassInfo)>,
+    /// Defined in Rust (no struct literal, no inherent `impl`).
+    pub native: bool,
+    /// Implemented traits as the runtime class records them: (trait, type
+    /// arguments in terms of the struct's type parameters).
+    pub trait_descs: Vec<(String, Vec<TypeDesc>)>,
+}
+
+/// A method of a struct from one of its `impl` blocks, for code generation.
+#[derive(Clone)]
+pub struct ImplMethod {
+    pub def: FuncDef,
+    /// The impl's names for the struct's type parameters, in order
+    /// (`impl<U> Stack<U>` names the first one `U`).
+    pub tparams: Vec<String>,
 }
 
 pub struct TraitInfo {
     pub tparams: Vec<TParamSig>,
     pub methods: HashMap<String, Sig>,
     /// Defined by a native module: every method is required, and only Rust
-    /// classes (`c.implements`) or slim class headers implement it.
+    /// classes (`c.implements`) or slim structs (`impl T for S`) implement it.
     pub native: bool,
 }
 
@@ -113,6 +127,8 @@ const BUILTIN_TRAITS: &[(&str, usize, &[&str], &[&str])] = &[
     ("Num", 0, &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"]),
     ("Hash", 0, &[], &[]),
     ("Len", 0, &[], &["__len__"]),
+    // `__drop__` runs when a value is freed.
+    ("Drop", 0, &[], &["__drop__"]),
     // Automatic, as in Rust: every type that is not local (thread-confined)
     // is `Send`. Only used as a bound.
     ("Send", 0, &[], &[]),
@@ -138,6 +154,11 @@ fn builtin_trait(n: &str) -> Option<&'static (&'static str, usize, &'static [&'s
 }
 
 pub struct ModInfo {
+    /// Methods of each struct from its `impl` blocks.
+    pub impl_methods: HashMap<String, Vec<ImplMethod>>,
+    /// Associated functions as module functions named `Type::name`, with
+    /// the impl's type parameters first.
+    pub assoc_fns: Vec<FuncDef>,
     pub gindex: HashMap<String, u32>,
     pub module_vars: HashSet<String>,
     pub funcs: HashMap<String, Sig>,
@@ -409,8 +430,15 @@ impl ModInfo {
     /// The methods a value of type `t` is statically known to have, from a
     /// trait type. `None` when nothing is known.
     fn trait_methods(&self, t: &str, args: &[Ty]) -> Option<HashMap<String, Sig>> {
+        self.trait_methods_for(t, args, Ty::Unknown)
+    }
+
+    /// Like `trait_methods`, with `Self` standing for `self_ty` (`Unknown`
+    /// when the implementing type is not known).
+    fn trait_methods_for(&self, t: &str, args: &[Ty], self_ty: Ty) -> Option<HashMap<String, Sig>> {
         let ti = self.traits.get(t)?;
         let map = tparam_map(&ti.tparams, args);
+        let map = |n: &str| if n == "Self" { Some(self_ty.clone()) } else { map(n) };
         Some(ti.methods.iter().map(|(n, s)| (n.clone(), s.subst(&map))).collect())
     }
 }
@@ -476,7 +504,7 @@ fn native_class_info(c: &slim_vm::native::ClassSpec, m: &ModuleSpec, names: &Nat
         // A generic family implements what every instantiation does.
         impls = first.impls.iter().filter(|t| instances.iter().all(|(_, i)| i.impls.contains(t))).cloned().collect();
     }
-    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls, instances }
+    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls, instances, native: true, trait_descs: Vec::new() }
 }
 
 fn native_sig(f: &FnSpec, classes: &NativeNames) -> Sig {
@@ -511,8 +539,8 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                     scan::global_decls(b, &mut decls);
                 }
             }
-            StmtKind::Class(c) => {
-                for m in &c.methods {
+            StmtKind::Impl(i) => {
+                for m in &i.methods {
                     if let Some(b) = &m.body {
                         scan::global_decls(b, &mut decls);
                     }
@@ -535,6 +563,8 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
         .collect();
     let builtin_traits: HashSet<String> = BUILTIN_TRAITS.iter().map(|t| t.0.to_string()).collect();
     let mut info = ModInfo {
+        impl_methods: HashMap::new(),
+        assoc_fns: Vec::new(),
         gindex,
         module_vars: module_vars.iter().cloned().collect(),
         funcs: HashMap::new(),
@@ -569,15 +599,27 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
     }
     let names = |tps: &[TypeParam]| tps.iter().map(|t| TParamSig { name: t.name.clone(), bounds: Vec::new() }).collect::<Vec<_>>();
     let scope_of = |tps: &[TypeParam]| tps.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect::<Vec<_>>();
-    // Register class and trait names (and arities) first so annotations can
+    // Register struct and trait names (and arities) first so annotations can
     // refer to them.
     for s in &module.body.stmts {
         match &s.kind {
-            StmtKind::Class(c) => {
+            StmtKind::Struct(c) => {
                 if builtin_names.contains(&c.name) {
                     return Err(syn_err(format!("cannot redefine builtin `{}`", c.name), c.span));
                 }
-                let ci = ClassInfo { local: false, tparams: names(&c.tparams), fields: Vec::new(), methods: HashMap::new(), impls: Vec::new(), instances: Vec::new() };
+                if info.classes.contains_key(&c.name) {
+                    return Err(syn_err(format!("struct `{}` is defined twice", c.name), c.span));
+                }
+                let ci = ClassInfo {
+                    local: false,
+                    tparams: names(&c.tparams),
+                    fields: Vec::new(),
+                    methods: HashMap::new(),
+                    impls: Vec::new(),
+                    instances: Vec::new(),
+                    native: false,
+                    trait_descs: Vec::new(),
+                };
                 info.classes.insert(c.name.clone(), ci);
             }
             StmtKind::Trait(t) => {
@@ -589,10 +631,10 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             _ => {}
         }
     }
-    // Bounds of class and trait type parameters.
+    // Bounds of struct and trait type parameters.
     for s in &module.body.stmts {
         match &s.kind {
-            StmtKind::Class(c) => {
+            StmtKind::Struct(c) => {
                 let tps = info.tparam_sigs(&c.tparams, &scope_of(&c.tparams))?;
                 info.classes.get_mut(&c.name).unwrap().tparams = tps;
             }
@@ -610,7 +652,9 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 info.funcs.insert(f.name.clone(), sig);
             }
             StmtKind::Trait(t) => {
-                let tps = info.trait_tparams(&t.name);
+                // `Self` in a trait's signatures is the implementing type.
+                let mut tps = info.trait_tparams(&t.name);
+                tps.push(TParamSig { name: "Self".into(), bounds: Vec::new() });
                 let mut ms = HashMap::new();
                 for m in &t.methods {
                     check_method_typing(m)?;
@@ -618,8 +662,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 }
                 info.traits.get_mut(&t.name).unwrap().methods = ms;
             }
-            StmtKind::Class(c) => {
-                let tps = info.classes[&c.name].tparams.clone();
+            StmtKind::Struct(c) => {
                 let scope = scope_of(&c.tparams);
                 let mut fields = Vec::new();
                 for f in &c.fields {
@@ -629,75 +672,20 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                     let (ty, d) = info.resolve_scoped(&f.ty, &scope)?;
                     fields.push((f.name.clone(), ty, d));
                 }
-                let mut methods = HashMap::new();
-                for m in &c.methods {
-                    check_method_typing(m)?;
-                    if fields.iter().any(|(n, _, _)| *n == m.name) {
-                        return Err(syn_err(format!("`{}` is both a field and a method", m.name), m.span));
-                    }
-                    methods.insert(m.name.clone(), info.sig_of(m, true, &tps)?);
-                }
-                let mut impls: Vec<(String, Vec<Ty>)> = Vec::new();
-                for (tname, targs, tspan) in &c.traits {
-                    if tname == "Send" {
-                        return Err(type_err("`Send` is automatic: a class is `Send` when all of its fields are", *tspan));
-                    }
-                    if tname == "Local" {
-                        return Err(type_err(
-                            "there is no `Local` trait: as in Rust, a class is `Send` unless a field is not (e.g. an `any` field)",
-                            *tspan,
-                        ));
-                    }
-                    let arity = match (info.traits.get(tname), builtin_trait(tname)) {
-                        (Some(t), _) => t.tparams.len(),
-                        (None, Some(b)) => b.1,
-                        (None, None) => {
-                            if info.classes.contains_key(tname) || info.builtin_classes.contains(tname) {
-                                return Err(type_err(
-                                    format!("`{tname}` is a class, not a trait; classes cannot inherit (use a field and delegate by hand)"),
-                                    *tspan,
-                                ));
-                            }
-                            return Err(name_err(format!("unknown trait `{tname}`"), *tspan));
-                        }
-                    };
-                    if targs.len() != arity {
-                        return Err(type_err(
-                            match arity {
-                                0 => format!("trait `{tname}` does not take type arguments"),
-                                n => format!("trait `{tname}` takes {n} type argument{}: `impl {tname}<...>`", if n == 1 { "" } else { "s" }),
-                            },
-                            *tspan,
-                        ));
-                    }
-                    if impls.iter().any(|(t, _)| t == tname) {
-                        return Err(type_err(format!("class `{}` implements `{tname}` twice", c.name), *tspan));
-                    }
-                    let mut args = Vec::new();
-                    for a in targs {
-                        args.push(info.resolve_scoped(a, &scope)?.0);
-                    }
-                    impls.push((tname.clone(), args.clone()));
-                    if let Some((_, _, implies, _)) = builtin_trait(tname) {
-                        for i in implies.iter() {
-                            if !impls.iter().any(|(t, _)| t == i) {
-                                let a = if builtin_trait(i).is_some_and(|b| b.1 == args.len()) { args.clone() } else { Vec::new() };
-                                impls.push((i.to_string(), a));
-                            }
-                        }
-                    }
-                }
-                let ci = info.classes.get_mut(&c.name).unwrap();
-                ci.fields = fields;
-                ci.methods = methods;
-                ci.impls = impls;
+                info.classes.get_mut(&c.name).unwrap().fields = fields;
             }
             _ => {}
         }
     }
-    // `Send`, as in Rust: a class is not `Send` (it is local) when a field
-    // type is not (to a fixpoint: fields may name later classes). Native
-    // classes over non-`Send` Rust types are the roots. Within the class, its
+    // `impl` blocks: methods, associated functions and implemented traits.
+    for s in &module.body.stmts {
+        if let StmtKind::Impl(i) = &s.kind {
+            collect_impl(&mut info, module, i)?;
+        }
+    }
+    // `Send`, as in Rust: a struct is not `Send` (it is local) when a field
+    // type is not (to a fixpoint: fields may name later structs). Native
+    // classes over non-`Send` Rust types are the roots. Within the struct, its
     // own type parameters count as `Send`: the type arguments decide
     // (`Box<Counter>` is not `Send` when `Counter` is not).
     loop {
@@ -714,13 +702,14 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             info.classes.get_mut(&n).unwrap().local = true;
         }
     }
-    // Trait default methods become available on implementing classes, with
+    // Trait default methods become available on implementing structs, with
     // the trait's type parameters replaced by the impl's arguments.
     for s in &module.body.stmts {
-        if let StmtKind::Class(c) = &s.kind {
-            let impls = info.classes[&c.name].impls.clone();
-            for (tname, targs) in impls {
-                if let Some(tm) = info.trait_methods(&tname, &targs) {
+        if let StmtKind::Struct(c) = &s.kind {
+            let ci = &info.classes[&c.name];
+            let self_ty = Ty::Instance(c.name.clone(), ci.tparams.iter().map(|t| Ty::Param(t.name.clone())).collect());
+            for (tname, targs) in ci.impls.clone() {
+                if let Some(tm) = info.trait_methods_for(&tname, &targs, self_ty.clone()) {
                     let ci = info.classes.get_mut(&c.name).unwrap();
                     for (n, sig) in tm {
                         ci.methods.entry(n).or_insert(sig);
@@ -729,52 +718,9 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             }
         }
     }
-    for s in &module.body.stmts {
-        if let StmtKind::Class(c) = &s.kind {
-            for (tname, _, _) in &c.traits {
-                let Some(tdef) = module.body.stmts.iter().find_map(|s| match &s.kind {
-                    StmtKind::Trait(t) if t.name == *tname => Some(t),
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                for m in &tdef.methods {
-                    if m.body.is_none() && !c.methods.iter().any(|cm| cm.name == m.name) {
-                        return Err(type_err(
-                            format!("class `{}` implements `{tname}` but does not define required method `{}`", c.name, m.name),
-                            c.span,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    // Native traits: every method is required.
-    for s in &module.body.stmts {
-        if let StmtKind::Class(c) = &s.kind {
-            for (tname, _, _) in &c.traits {
-                let Some(ti) = info.traits.get(tname).filter(|t| t.native) else { continue };
-                let mut req: Vec<&String> = ti.methods.keys().collect();
-                req.sort();
-                for m in req {
-                    if !c.methods.iter().any(|cm| cm.name == *m) {
-                        return Err(type_err(
-                            format!("class `{}` implements `{tname}` but does not define required method `{}`", c.name, m),
-                            c.span,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    // `impl Trait for NativeClass`.
-    for s in &module.body.stmts {
-        if let StmtKind::ImplFor { tr, targs, target, tspan } = &s.kind {
-            impl_for(&mut info, module, tr, targs, target, *tspan, s.span)?;
-        }
-    }
     let mut ctx = FnCtx::new(&info, "<module>".into(), true);
     ctx.state = Some(HashMap::new());
+    ctx.hoist_items(module)?;
     ctx.block(&module.body)?;
     let r = ctx.tmp_owned();
     ctx.emit(Instr::LoadImm { dst: r, bits: Value::UNIT.0 as i32 });
@@ -783,19 +729,268 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
     Ok((Arc::new(code), globals))
 }
 
+/// Renames type names in a type expression (`T` -> `U`).
+fn rename_texpr(t: &TypeExpr, map: &dyn Fn(&str) -> Option<String>) -> TypeExpr {
+    match t {
+        TypeExpr::Unit(s) => TypeExpr::Unit(*s),
+        TypeExpr::Send(x) => TypeExpr::Send(Box::new(rename_texpr(x, map))),
+        TypeExpr::Named(n, args, sp) => {
+            let n = if args.is_empty() { map(n).unwrap_or_else(|| n.clone()) } else { n.clone() };
+            TypeExpr::Named(n, args.iter().map(|a| rename_texpr(a, map)).collect(), *sp)
+        }
+    }
+}
+
+/// Records an `impl` block: inherent methods and associated functions of a
+/// struct, or a trait implementation (checked against the trait). Native
+/// targets take only bodiless trait impls (see `impl_for`).
+fn collect_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
+    let TypeExpr::Named(tn, targs, tspan) = &i.target else {
+        return Err(type_err("`impl` needs a struct (or, for traits, a native class) as its target", i.target.span()));
+    };
+    let Some(ci) = info.classes.get(tn) else {
+        if info.builtin_classes.contains(tn) {
+            return Err(type_err(format!("cannot implement methods or traits for builtin class `{tn}`"), *tspan));
+        }
+        if info.traits.contains_key(tn) || builtin_trait(tn).is_some() {
+            return Err(type_err(format!("`{tn}` is a trait; write `impl {tn} for Type:`"), *tspan));
+        }
+        return Err(type_err(format!("impls for `{tn}` are not supported: the target must be a struct of this program or a native class"), *tspan));
+    };
+    if ci.native {
+        let Some((tr, trargs, trspan)) = &i.tr else {
+            return Err(type_err(format!("`{tn}` is a native class: its methods are defined in Rust; add yours through a trait (`impl MyTrait for {tn}`)"), *tspan));
+        };
+        if !i.methods.is_empty() || !i.tparams.is_empty() || !targs.is_empty() {
+            return Err(type_err(format!("`impl {tr} for {tn}` cannot have a body or type parameters yet; the trait's default methods are used"), i.span));
+        }
+        return impl_for(info, module, tr, trargs, tn, *trspan, i.span);
+    }
+    // A struct's impl applies to all its instantiations: `impl<A, B> S<A, B>`
+    // with the struct's own bounds.
+    let ctps = ci.tparams.clone();
+    let arity_ok = targs.len() == ctps.len() && i.tparams.len() == ctps.len();
+    let pnames: Vec<String> = targs
+        .iter()
+        .filter_map(|a| match a {
+            TypeExpr::Named(n, xs, _) if xs.is_empty() && i.tparams.iter().any(|t| t.name == *n) => Some(n.clone()),
+            _ => None,
+        })
+        .collect();
+    let distinct = pnames.iter().collect::<HashSet<_>>().len() == pnames.len();
+    if !arity_ok || pnames.len() != ctps.len() || !distinct {
+        let want = if ctps.is_empty() {
+            tn.clone()
+        } else {
+            let ps: Vec<&str> = ctps.iter().map(|t| t.name.as_str()).collect();
+            format!("impl<{}> {tn}<{}>", ps.join(", "), ps.join(", "))
+        };
+        return Err(type_err(
+            format!("an impl of struct `{tn}` must cover all its instantiations: `{want}` (specialized and conditional impls are not supported yet)"),
+            *tspan,
+        ));
+    }
+    // Impl names -> struct names, and the impl's scope (struct positions).
+    let to_class = |n: &str| pnames.iter().position(|p| p == n).map(|k| Ty::Param(ctps[k].name.clone()));
+    let scope: Vec<(String, u16)> = pnames.iter().enumerate().map(|(k, n)| (n.clone(), k as u16)).collect();
+    let itps = info.tparam_sigs(&i.tparams, &scope)?;
+    for tp in &itps {
+        let k = pnames.iter().position(|p| *p == tp.name).unwrap();
+        for b in &tp.bounds {
+            if !ctps[k].bounds.contains(&b.subst(&to_class)) {
+                return Err(type_err(
+                    format!("bound `{}: {}` is not one of struct `{tn}`'s bounds (conditional impls are not supported yet)", tp.name, b.name()),
+                    *tspan,
+                ));
+            }
+        }
+    }
+    // The impl's parameters with the struct's bounds, in impl names.
+    let to_impl = |n: &str| ctps.iter().position(|t| t.name == n).map(|k| pnames[k].clone());
+    let sdef = module.body.stmts.iter().find_map(|s| match &s.kind {
+        StmtKind::Struct(d) if d.name == *tn => Some(d),
+        _ => None,
+    });
+    let impl_tparams: Vec<TypeParam> = sdef
+        .map(|d| {
+            d.tparams
+                .iter()
+                .enumerate()
+                .map(|(k, tp)| TypeParam { name: pnames[k].clone(), bounds: tp.bounds.iter().map(|b| rename_texpr(b, &to_impl)).collect(), span: tp.span })
+                .collect()
+        })
+        .unwrap_or_default();
+    let outer: Vec<TParamSig> = pnames.iter().enumerate().map(|(k, n)| TParamSig { name: n.clone(), bounds: ctps[k].bounds.iter().map(|b| b.subst(&|x| to_impl(x).map(Ty::Param))).collect() }).collect();
+    let self_ty = Ty::Instance(tn.clone(), ctps.iter().map(|t| Ty::Param(t.name.clone())).collect());
+    let fields: Vec<String> = ci.fields.iter().map(|f| f.0.clone()).collect();
+    let mut sigs: Vec<(String, Sig, Span)> = Vec::new();
+    for m in &i.methods {
+        let is_method = m.params.first().is_some_and(|p| p.name == "self");
+        if m.name == "__init__" {
+            return Err(type_err(
+                format!("structs have no `__init__`: define `def new(...) -> Self:` returning `{tn} {{ .. }}` and call `{tn}::new(...)`"),
+                m.span,
+            ));
+        }
+        if !is_method {
+            if let Some((tr, _, _)) = &i.tr {
+                return Err(type_err(format!("`{}` in `impl {tr} for {tn}` must take `self`: traits have no associated functions", m.name), m.span));
+            }
+            // An associated function: a module function `Type::name` whose
+            // type parameters are the impl's, then its own.
+            let mut def = m.clone();
+            def.name = format!("{tn}::{}", m.name);
+            def.tparams = impl_tparams.iter().cloned().chain(m.tparams.iter().cloned()).collect();
+            if info.funcs.contains_key(&def.name) {
+                return Err(type_err(format!("`{}` is defined twice", def.name), m.span));
+            }
+            let sig = info.sig_of(&def, false, &[])?;
+            info.funcs.insert(def.name.clone(), sig);
+            info.assoc_fns.push(def);
+            continue;
+        }
+        check_method_typing(m)?;
+        if fields.contains(&m.name) {
+            return Err(syn_err(format!("`{}` is both a field and a method of `{tn}`", m.name), m.span));
+        }
+        if m.name == "__drop__" && !matches!(&i.tr, Some((t, _, _)) if t == "Drop") {
+            return Err(type_err(format!("a destructor is defined by implementing `Drop`: `impl Drop for {tn}:`"), m.span));
+        }
+        let sig = info.sig_of(m, true, &outer)?.subst(&to_class);
+        if sigs.iter().any(|(n, _, _)| *n == m.name) || info.classes[tn].methods.contains_key(&m.name) {
+            return Err(type_err(format!("method `{}` of `{tn}` is defined twice", m.name), m.span));
+        }
+        sigs.push((m.name.clone(), sig, m.span));
+    }
+    if let Some((tr, trargs, trspan)) = &i.tr {
+        check_trait_impl(info, module, tn, &self_ty, tr, trargs, *trspan, &scope, &to_class, &sigs, i.span)?;
+    }
+    let ci = info.classes.get_mut(tn).unwrap();
+    for (n, sig, _) in sigs {
+        ci.methods.insert(n, sig);
+    }
+    let methods = i.methods.iter().filter(|m| m.params.first().is_some_and(|p| p.name == "self")).cloned();
+    info.impl_methods.entry(tn.clone()).or_default().extend(methods.map(|def| ImplMethod { def, tparams: pnames.clone() }));
+    Ok(())
+}
+
+/// Checks `impl tr<trargs> for tn` (methods `sigs`, in the struct's names)
+/// and records the trait (and the traits it implies) on the struct.
+#[allow(clippy::too_many_arguments)]
+fn check_trait_impl(
+    info: &mut ModInfo,
+    module: &Module,
+    tn: &str,
+    self_ty: &Ty,
+    tr: &str,
+    trargs: &[TypeExpr],
+    trspan: Span,
+    scope: &[(String, u16)],
+    to_class: &dyn Fn(&str) -> Option<Ty>,
+    sigs: &[(String, Sig, Span)],
+    span: Span,
+) -> R<()> {
+    if tr == "Send" {
+        return Err(type_err(format!("`Send` is automatic: `{tn}` is `Send` when all of its fields are"), trspan));
+    }
+    if tr == "Local" {
+        return Err(type_err("there is no `Local` trait: as in Rust, a struct is `Send` unless a field is not (e.g. an `any` field)", trspan));
+    }
+    let arity = match (info.traits.get(tr), builtin_trait(tr)) {
+        (Some(t), _) => t.tparams.len(),
+        (None, Some(b)) => b.1,
+        (None, None) => {
+            if info.classes.contains_key(tr) || info.builtin_classes.contains(tr) {
+                return Err(type_err(format!("`{tr}` is a struct, not a trait; structs cannot inherit (use a field and delegate by hand)"), trspan));
+            }
+            return Err(name_err(format!("unknown trait `{tr}`"), trspan));
+        }
+    };
+    if trargs.len() != arity {
+        return Err(type_err(
+            match arity {
+                0 => format!("trait `{tr}` does not take type arguments"),
+                n => format!("trait `{tr}` takes {n} type argument{}: `impl {tr}<...> for {tn}`", if n == 1 { "" } else { "s" }),
+            },
+            trspan,
+        ));
+    }
+    if info.classes[tn].impls.iter().any(|(t, _)| t == tr) {
+        return Err(type_err(format!("`{tn}` implements `{tr}` twice"), trspan));
+    }
+    let mut args = Vec::new();
+    let mut descs = Vec::new();
+    for a in trargs {
+        let (t, d) = info.resolve_scoped(a, scope)?;
+        args.push(t.subst(to_class));
+        descs.push(d);
+    }
+    // Required, allowed and expected methods.
+    let shown = if args.is_empty() { tr.to_string() } else { format!("{tr}<{}>", args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")) };
+    let what = format!("`impl {shown} for {tn}`");
+    match (info.traits.get(tr), builtin_trait(tr)) {
+        (Some(ti), _) => {
+            let want = info.trait_methods_for(tr, &args, self_ty.clone()).unwrap_or_default();
+            let tdef = module.body.stmts.iter().find_map(|s| match &s.kind {
+                StmtKind::Trait(t) if t.name == tr => Some(t),
+                _ => None,
+            });
+            let mut required: Vec<&String> = match tdef {
+                Some(d) => ti.methods.keys().filter(|n| d.methods.iter().any(|m| m.name == **n && m.body.is_none())).collect(),
+                None => ti.methods.keys().collect(),
+            };
+            required.sort();
+            for n in required {
+                if !sigs.iter().any(|(m, _, _)| m == n) {
+                    return Err(type_err(format!("{what}: `{tn}` does not define required method `{n}`"), span));
+                }
+            }
+            for (n, have, mspan) in sigs {
+                let Some(w) = want.get(n) else {
+                    return Err(type_err(format!("{what}: `{n}` is not a method of trait `{tr}`"), *mspan));
+                };
+                let params_ok = have.params.len() == w.params.len() && have.params.iter().zip(&w.params).all(|(h, x)| h.ty == x.ty);
+                if !params_ok || !ty_compatible(&w.ret, &have.ret) {
+                    let show = |s: &Sig| format!("({}) -> {}", s.params.iter().map(|p| p.ty.name()).collect::<Vec<_>>().join(", "), s.ret.name());
+                    return Err(type_err(format!("{what}: `{n}` is `{}`, but `{tr}` needs `{}`", show(have), show(w)), *mspan));
+                }
+            }
+        }
+        (None, Some((_, _, implies, methods))) => {
+            // The trait's own methods are required; those of the traits it
+            // implies (`Num` implies `Ord`) may be defined here too.
+            let allowed: Vec<&str> = methods.iter().chain(implies.iter().filter_map(|i| builtin_trait(i)).flat_map(|t| t.3.iter())).copied().collect();
+            for m in methods.iter() {
+                if !sigs.iter().any(|(n, _, _)| n == m) {
+                    return Err(type_err(format!("{what}: `{tn}` does not define required method `{m}`"), span));
+                }
+            }
+            if let Some((n, _, mspan)) = sigs.iter().find(|(n, _, _)| !allowed.contains(&n.as_str())) {
+                return Err(type_err(format!("{what}: `{n}` is not a method of trait `{tr}`; define it in `impl {tn}:`"), *mspan));
+            }
+        }
+        (None, None) => unreachable!(),
+    }
+    let ci = info.classes.get_mut(tn).unwrap();
+    ci.impls.push((tr.to_string(), args.clone()));
+    ci.trait_descs.push((tr.to_string(), descs));
+    if let Some((_, _, implies, _)) = builtin_trait(tr) {
+        for i in implies.iter() {
+            if !ci.impls.iter().any(|(t, _)| t == i) {
+                let a = if builtin_trait(i).is_some_and(|b| b.1 == args.len()) { args.clone() } else { Vec::new() };
+                ci.impls.push((i.to_string(), a));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks `impl tr for target` (a program's trait for a native class) and
 /// records it: the class (each instantiation of a generic one) implements
 /// the trait and gets its default methods.
 fn impl_for(info: &mut ModInfo, module: &Module, tr: &str, targs: &[TypeExpr], target: &str, tspan: Span, span: Span) -> R<()> {
-    let header = |tr: &str| format!("declare it in the class header: `class {target}(impl {tr})`");
     if !targs.is_empty() {
         return Err(type_err(format!("generic traits cannot be implemented for native classes (`impl {tr}<...> for {target}`)"), tspan));
-    }
-    match info.classes.get(target) {
-        None if info.builtin_classes.contains(target) => return Err(type_err(format!("cannot implement traits for builtin class `{target}`"), span)),
-        None => return Err(name_err(format!("unknown class `{target}`"), span)),
-        Some(_) if !target.contains('.') => return Err(type_err(format!("`{target}` is a slim class; {}", header(tr)), span)),
-        Some(_) => {}
     }
     let user = info.traits.get(tr);
     if user.is_some_and(|t| t.native) {
@@ -803,15 +998,6 @@ fn impl_for(info: &mut ModInfo, module: &Module, tr: &str, targs: &[TypeExpr], t
     }
     if user.is_some_and(|t| !t.tparams.is_empty()) {
         return Err(type_err(format!("generic traits cannot be implemented for native classes (`{tr}`)"), tspan));
-    }
-    // The trait must be defined before the `impl`, which runs where it is.
-    let pos = |pred: &dyn Fn(&StmtKind) -> bool| module.body.stmts.iter().position(|s| pred(&s.kind));
-    if user.is_some() {
-        let def = pos(&|k| matches!(k, StmtKind::Trait(t) if t.name == tr));
-        let imp = pos(&|k| matches!(k, StmtKind::ImplFor { tr: t, target: c, .. } if t == tr && c == target));
-        if def > imp {
-            return Err(type_err(format!("`impl {tr} for {target}` comes before trait `{tr}` is defined"), span));
-        }
     }
     let required: Vec<(String, Option<Sig>)> = match (user, builtin_trait(tr)) {
         (Some(t), _) => {
@@ -1460,7 +1646,7 @@ impl<'m> FnCtx<'m> {
     ) -> R<(ArgList, Vec<Option<Ty>>, Ty)> {
         let tps = &sig.tparams;
         let mut known: Vec<Option<Ty>> = match explicit {
-            Some(v) => v.into_iter().map(Some).collect(),
+            Some(v) => v.into_iter().map(Some).chain(std::iter::repeat(None)).take(tps.len()).collect(),
             None => vec![None; tps.len()],
         };
         if let Some(e) = expect {
@@ -1694,15 +1880,10 @@ impl<'m> FnCtx<'m> {
             StmtKind::Break => self.break_continue(true, s.span),
             StmtKind::Continue => self.break_continue(false, s.span),
             StmtKind::Def(f) => self.def_stmt(f),
-            StmtKind::Class(c) => self.class_stmt(c),
-            StmtKind::Trait(t) => self.trait_stmt(t),
-            StmtKind::ImplFor { tr, target, .. } => {
-                if !self.is_module {
-                    return Err(syn_err(format!("`impl {tr} for {target}` must be at module level"), s.span));
-                }
-                self.emit(Instr::ImplNative { tr: self.m.gindex[tr], class: self.m.gindex[target] });
-                Ok(())
-            }
+            // Items are defined at module start (see `hoist_items`).
+            StmtKind::Struct(c) => self.item_here(&format!("struct `{}`", c.name), c.span),
+            StmtKind::Trait(t) => self.item_here(&format!("trait `{}`", t.name), t.span),
+            StmtKind::Impl(i) => self.item_here("`impl` blocks", i.span),
             StmtKind::Raise { exc, cause } => self.raise_stmt(exc.as_ref(), cause.as_ref(), s.span),
             // Resolved before compiling (see `imports`).
             StmtKind::Import { .. } | StmtKind::FromImport { .. } => Ok(()),
@@ -2165,6 +2346,14 @@ impl<'m> FnCtx<'m> {
                 Ok(Res { reg: dst, own: Own::Borrowed, ty, root: o.root, desc: "an element".into() })
             }
             ExprKind::Call(f, args) => self.call_expr(f, args, expect, e.span),
+            ExprKind::StructLit { ty, fields } => self.struct_lit(ty, fields, expect, e.span),
+            ExprKind::Path(base, n) => {
+                if matches!(base.kind, ExprKind::TypeApp(..)) {
+                    return Err(type_err(format!("type arguments on `{n}` need a call: `...::{n}(...)`"), e.span));
+                }
+                let g = self.path_global(base, n, e.span)?;
+                self.expr(&Expr { kind: ExprKind::Name(g), span: e.span })
+            }
             ExprKind::Dup(inner) => {
                 let r = self.expr(inner)?;
                 if r.own == Own::Owned {
@@ -2404,7 +2593,7 @@ impl<'m> FnCtx<'m> {
                 } else if ci.methods.contains_key(name) {
                     ty = self.func_ty(self.may_be_local(&o.ty));
                 } else {
-                    return Err(Error::new("AttributeError", format!("class `{c}` has no field or method `{name}`"), span));
+                    return Err(Error::new("AttributeError", format!("`{c}` has no field or method `{name}`"), span));
                 }
             }
         }
@@ -3128,7 +3317,7 @@ impl<'m> FnCtx<'m> {
                 if let Some(ci) = self.m.class_info(c, args) {
                     return match ci.fields.iter().find(|(n, _, _)| n == field) {
                         Some((_, t, _)) => Ok(t.subst(&class_map(ci, args))),
-                        None => Err(Error::new("AttributeError", format!("class `{c}` has no field `{field}`"), span)),
+                        None => Err(Error::new("AttributeError", format!("`{c}` has no field `{field}`"), span)),
                     };
                 }
                 Ok(Ty::Unknown)
@@ -3494,9 +3683,150 @@ impl<'m> FnCtx<'m> {
         targs.iter().map(|t| self.resolve_type(t).map(|r| r.0)).collect()
     }
 
+    /// The global of `base::n`: an associated function `Type::n`.
+    fn path_global(&self, base: &Expr, n: &str, span: Span) -> R<String> {
+        let ExprKind::Name(tn) = &base.kind else {
+            return Err(syn_err("expected a type name before `::`", span));
+        };
+        if tn == "Self" {
+            return Err(type_err("`Self` is only available inside `impl` blocks", span));
+        }
+        let g = format!("{tn}::{n}");
+        if self.m.funcs.contains_key(&g) {
+            return Ok(g);
+        }
+        match self.m.classes.get(tn) {
+            Some(ci) if ci.methods.contains_key(n) => {
+                Err(type_err(format!("`{n}` is a method of `{tn}`, not an associated function: call it on a value (`x.{n}(...)`)"), span))
+            }
+            Some(_) => Err(Error::new("AttributeError", format!("`{tn}` has no associated function `{n}`"), span)),
+            None if self.m.traits.contains_key(tn) || builtin_trait(tn).is_some() => {
+                Err(type_err(format!("qualified trait calls (`{tn}::{n}(x)`) are not supported yet; call `x.{n}()`"), span))
+            }
+            None => Err(name_err(format!("`{tn}` is not a struct"), span)),
+        }
+    }
+
+    /// `Name { field: value, .. }`: every field once, in any order. The type
+    /// arguments come from `Name::<T>`, the expected type, or the values.
+    fn struct_lit(&mut self, base: &Expr, fields: &[(String, Expr, Span)], expect: Option<Ty>, span: Span) -> R<Res> {
+        let (name, turbofish) = match &base.kind {
+            ExprKind::Name(n) => (n.clone(), None),
+            ExprKind::TypeApp(b, ts) => match &b.kind {
+                ExprKind::Name(n) => (n.clone(), Some(ts)),
+                _ => return Err(syn_err("expected a struct name before `{`", span)),
+            },
+            _ => return Err(syn_err("expected a struct name before `{`", span)),
+        };
+        if name == "Self" {
+            return Err(type_err("`Self { .. }` is only available inside `impl` blocks", span));
+        }
+        let Some(ci) = self.m.classes.get(&name) else {
+            if self.m.builtin_classes.contains(&name) {
+                return Err(type_err(format!("`{name}` is a builtin class: create it with `{name}(\"message\")`"), span));
+            }
+            return Err(name_err(format!("unknown struct `{name}`"), span));
+        };
+        if ci.native {
+            return Err(type_err(format!("`{name}` is a native class: create it by calling it (`{name}(...)`)"), span));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (f, _, fspan) in fields {
+            if !ci.fields.iter().any(|(n, _, _)| n == f) {
+                return Err(Error::new("AttributeError", format!("struct `{name}` has no field `{f}`"), *fspan));
+            }
+            if seen.contains(&f.as_str()) {
+                return Err(syn_err(format!("field `{f}` is given twice"), *fspan));
+            }
+            seen.push(f);
+        }
+        let missing: Vec<String> = ci.fields.iter().filter(|(n, _, _)| !seen.contains(&n.as_str())).map(|(n, _, _)| format!("`{n}`")).collect();
+        if !missing.is_empty() {
+            return Err(type_err(format!("missing field{} {} in `{name} {{ .. }}`", if missing.len() == 1 { "" } else { "s" }, missing.join(", ")), span));
+        }
+        let tps = ci.tparams.clone();
+        let decl: Vec<(String, Ty)> = ci.fields.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect();
+        let mut known: Vec<Option<Ty>> = match turbofish {
+            Some(ts) => self.explicit_targs(ts, tps.len(), &name, span)?.into_iter().map(Some).collect(),
+            None => vec![None; tps.len()],
+        };
+        if turbofish.is_none() {
+            if let Some(Ty::Instance(c, a)) = expect.as_ref().map(|t| t.peel()) {
+                if *c == name && a.len() == tps.len() {
+                    known = a.iter().map(|t| (*t != Ty::Unknown).then(|| t.clone())).collect();
+                }
+            }
+        }
+        let sub = |known: &[Option<Ty>], t: &Ty| {
+            t.subst(&|p| tps.iter().position(|x| x.name == p).map(|i| known[i].clone().unwrap_or(Ty::Unknown)))
+        };
+        // Values in source order, owned (moved in).
+        let mut vals: Vec<(usize, Res, Span)> = Vec::new();
+        for (f, v, fspan) in fields {
+            let k = decl.iter().position(|(n, _)| n == f).unwrap();
+            let pre = sub(&known, &decl[k].1);
+            self.expect = (pre != Ty::Unknown).then_some(pre);
+            let r = self.expr_owned(v, &format!("field `{f}`"))?;
+            self.unify(&decl[k].1, &r.ty, &tps, &mut known);
+            vals.push((k, r, *fspan));
+        }
+        if known.iter().any(|k| k.is_none()) {
+            let names: Vec<&str> = tps.iter().map(|t| t.name.as_str()).collect();
+            return Err(type_err(
+                format!("cannot infer the type arguments of `{name}`; write `{name}::<{}> {{ .. }}` or annotate the variable", names.join(", ")),
+                span,
+            ));
+        }
+        for (k, r, fspan) in &vals {
+            let fty = sub(&known, &decl[*k].1);
+            if !self.compatible(&fty, &r.ty) {
+                let f = &decl[*k].0;
+                return Err(type_err(self.explain(&fty, &r.ty, format!("field `{f}` of `{name}` expects `{}`, got `{}`", fty.name(), r.ty.name())), *fspan));
+            }
+        }
+        let t = Ty::Instance(name.clone(), known.into_iter().map(|k| k.unwrap()).collect());
+        self.m.check_wf(&t, &|n| self.pbounds(n), span)?;
+        let Some(d) = self.ty_desc(&t) else {
+            return Err(type_err(format!("cannot build `{}` here", t.name()), span));
+        };
+        vals.sort_by_key(|(k, _, _)| *k);
+        let args = vals.iter().map(|(_, r, _)| Arg::new(r.reg, true, false, None)).collect();
+        let ti = self.type_idx(d);
+        let al = self.arglist(ArgList { args, pins: false });
+        let dst = self.tmp_owned();
+        self.emit(Instr::BuildStruct { dst, args: al, ty: ti });
+        Ok(Res { reg: dst, own: Own::Owned, ty: t, root: None, desc: "value".into() })
+    }
+
     fn call_expr(&mut self, f: &Expr, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
         if let ExprKind::Attr(recv, mname) = &f.kind {
             return self.method_call(recv, mname, args, expect, span);
+        }
+        // `Type::f(...)` / `Type::<T>::f(...)`: the module function `Type::f`
+        // (its leading type parameters are the impl's).
+        if let ExprKind::Path(base, n) = &f.kind {
+            let (b, targs) = match &base.kind {
+                ExprKind::TypeApp(b, ts) => (&**b, Some(ts)),
+                _ => (&**base, None),
+            };
+            let g = Expr { kind: ExprKind::Name(self.path_global(b, n, f.span)?), span: f.span };
+            let callee = match targs {
+                Some(ts) => Expr { kind: ExprKind::TypeApp(Box::new(g), ts.clone()), span: f.span },
+                None => g,
+            };
+            return self.call_expr(&callee, args, expect, span);
+        }
+        let named = match &f.kind {
+            ExprKind::TypeApp(b, _) => &b.kind,
+            k => k,
+        };
+        if let ExprKind::Name(n) = named {
+            if self.is_global_name(n) && self.m.classes.get(n).is_some_and(|c| !c.native) {
+                return Err(type_err(
+                    format!("`{n}` is a struct: create it with a literal `{n} {{ .. }}` or an associated function (`{n}::new(...)`)"),
+                    span,
+                ));
+            }
         }
         // `name::<types>(...)` of a user class or function: the signature is
         // the name's; the type arguments are explicit.
@@ -3692,6 +4022,11 @@ impl<'m> FnCtx<'m> {
             ));
         }
         let explicit = match turbofish {
+            // `Stack::<int>::new()` gives the impl's type parameters; the
+            // function's own are inferred.
+            Some(ts) if name.contains("::") && ts.len() < sig.tparams.len() => {
+                Some(ts.iter().map(|t| self.resolve_type(t).map(|r| r.0)).collect::<R<Vec<_>>>()?)
+            }
             Some(ts) => Some(self.explicit_targs(ts, sig.tparams.len(), name, span)?),
             None => None,
         };
@@ -3904,7 +4239,7 @@ impl<'m> FnCtx<'m> {
     fn param_method(&self, n: &str, mname: &str) -> Option<Option<Sig>> {
         for b in self.pbounds(n) {
             let Ty::Trait(bn, bargs) = &b else { continue };
-            if let Some(ms) = self.m.trait_methods(bn, bargs) {
+            if let Some(ms) = self.m.trait_methods_for(bn, bargs, Ty::Param(n.into())) {
                 if let Some(s) = ms.get(mname) {
                     return Some(Some(s.clone()));
                 }
@@ -3931,7 +4266,7 @@ impl<'m> FnCtx<'m> {
                         Some(s) => sig = Some(s.subst(&class_map(ci, cargs))),
                         None => {
                             if !ci.fields.iter().any(|(n, _, _)| n == mname) {
-                                return Err(Error::new("AttributeError", format!("class `{c}` has no method `{mname}`"), span));
+                                return Err(Error::new("AttributeError", format!("`{c}` has no method `{mname}`"), span));
                             }
                         }
                     }
@@ -4405,40 +4740,61 @@ impl<'m> FnCtx<'m> {
         Ok(self.func_ty(local))
     }
 
-    fn class_stmt(&mut self, c: &ClassDef) -> R<()> {
-        if !self.is_module {
-            return Err(syn_err("classes must be defined at module level", c.span));
+    /// Items are order-independent, as in Rust: traits, then structs (with
+    /// the methods of their `impl` blocks), then associated functions and
+    /// native trait impls are defined before the module's statements run.
+    fn hoist_items(&mut self, module: &Module) -> R<()> {
+        for s in &module.body.stmts {
+            if let StmtKind::Trait(t) = &s.kind {
+                self.trait_stmt(t)?;
+            }
         }
+        for s in &module.body.stmts {
+            if let StmtKind::Struct(c) = &s.kind {
+                self.struct_stmt(c)?;
+            }
+        }
+        for f in &self.m.assoc_fns {
+            self.def_stmt(f)?;
+        }
+        for s in &module.body.stmts {
+            if let StmtKind::Impl(i) = &s.kind {
+                if let (Some((tr, _, _)), TypeExpr::Named(tn, _, _)) = (&i.tr, &i.target) {
+                    if self.m.classes.get(tn).is_some_and(|c| c.native) {
+                        self.emit(Instr::ImplNative { tr: self.m.gindex[tr], class: self.m.gindex[tn] });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A struct, trait or impl statement: already defined at module start;
+    /// an error elsewhere.
+    fn item_here(&self, what: &str, span: Span) -> R<()> {
+        if self.is_module {
+            return Ok(());
+        }
+        Err(syn_err(format!("{what} must be defined at module level"), span))
+    }
+
+    fn struct_stmt(&mut self, c: &StructDef) -> R<()> {
         let info = &self.m.classes[&c.name];
         let pb = |n: &str| info.tparams.iter().find(|t| t.name == n).map(|t| t.bounds.clone()).unwrap_or_default();
         for ((_, ty, _), f) in info.fields.iter().zip(&c.fields) {
             self.m.check_wf(ty, &pb, f.span)?;
         }
-        for ((_, args), (_, _, sp)) in info.impls.iter().zip(&c.traits) {
-            args.iter().try_for_each(|a| self.m.check_wf(a, &pb, *sp))?;
+        for (_, args) in &info.impls {
+            args.iter().try_for_each(|a| self.m.check_wf(a, &pb, c.span))?;
         }
         let mut methods = Vec::new();
-        for m in &c.methods {
-            if m.name == "__init__" {
-                check_init_assigns(c, m)?;
-                if !m.tparams.is_empty() {
-                    return Err(type_err(format!("`__init__` cannot have type parameters; declare them on the class (`class {}<...>`)", c.name), m.span));
-                }
-            }
-            let code = compile_function(self.m, m, Owner::Class(&c.name), &[], &[])?;
+        for im in self.m.impl_methods.get(&c.name).into_iter().flatten() {
+            let code = compile_function(self.m, &im.def, Owner::Class(&c.name, &im.tparams), &[], &[])?;
             self.codes.push(Arc::new(code));
-            methods.push((m.name.clone(), (self.codes.len() - 1) as u32));
-        }
-        if !c.methods.iter().any(|m| m.name == "__init__") && !c.fields.is_empty() {
-            return Err(syn_err(format!("class `{}` has fields and needs an `__init__` that assigns them", c.name), c.span));
+            methods.push((im.def.name.clone(), (self.codes.len() - 1) as u32));
         }
         let fields = info.fields.iter().map(|(n, _, d)| FieldSpec { name: n.clone(), ty: d.clone() }).collect();
-        let scope: Vec<(String, u16)> = c.tparams.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect();
-        let mut traits = Vec::new();
-        for (t, targs, _) in &c.traits {
-            let ds = targs.iter().map(|a| self.m.resolve_scoped(a, &scope).map(|r| r.1)).collect::<R<Vec<_>>>()?;
-            traits.push((self.m.gindex[t], t.clone(), ds));
-        }
+        let traits = info.trait_descs.iter().map(|(t, ds)| (self.m.gindex[t], t.clone(), ds.clone())).collect();
         let tparams = c.tparams.iter().map(|t| t.name.clone()).collect();
         let local = info.local;
         self.classes.push(ClassSpec { name: c.name.clone(), tparams, fields, methods, traits, local });
@@ -4557,67 +4913,12 @@ fn binop_ty(op: BinOp, a: &Ty, b: &Ty) -> Ty {
     }
 }
 
-/// Fields a block definitely assigns through `self.f = ...` / `self.f <- ...`.
-fn definitely_assigned(b: &Block, out: &mut HashSet<String>) {
-    for s in &b.stmts {
-        match &s.kind {
-            StmtKind::Assign { target, value } | StmtKind::AnnAssign { target, value: Some(value), .. } => {
-                field_target(target, out);
-                if let ExprKind::If { branches, else_ } = &value.kind {
-                    if_assigns(branches, else_.as_ref(), out);
-                }
-            }
-            StmtKind::Move { targets, .. } => targets.iter().for_each(|t| field_target(t, out)),
-            StmtKind::Expr(Expr { kind: ExprKind::If { branches, else_ }, .. }) => {
-                if_assigns(branches, else_.as_ref(), out)
-            }
-            _ => {}
-        }
-    }
-}
-
-fn if_assigns(branches: &[(Expr, Block)], else_: Option<&Block>, out: &mut HashSet<String>) {
-    let Some(e) = else_ else { return };
-    let mut common: Option<HashSet<String>> = None;
-    for b in branches.iter().map(|(_, b)| b).chain(std::iter::once(e)) {
-        let mut s = HashSet::new();
-        definitely_assigned(b, &mut s);
-        common = Some(match common {
-            None => s,
-            Some(c) => c.intersection(&s).cloned().collect(),
-        });
-    }
-    out.extend(common.unwrap_or_default());
-}
-
-fn field_target(t: &Expr, out: &mut HashSet<String>) {
-    if let ExprKind::Attr(o, f) = &t.kind {
-        if matches!(&o.kind, ExprKind::Name(n) if n == "self") {
-            out.insert(f.clone());
-        }
-    }
-}
-
-fn check_init_assigns(c: &ClassDef, init: &FuncDef) -> R<()> {
-    let mut assigned = HashSet::new();
-    definitely_assigned(init.body.as_ref().unwrap(), &mut assigned);
-    for f in &c.fields {
-        if !assigned.contains(&f.name) {
-            return Err(Error::new(
-                "TypeError",
-                format!("`{}.__init__` must assign field `{}` on every path", c.name, f.name),
-                init.span,
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// What a function is defined in.
 #[derive(Clone, Copy)]
 pub enum Owner<'a> {
     None,
-    Class(&'a str),
+    /// A method of a struct, with the impl's names for its type parameters.
+    Class(&'a str, &'a [String]),
     /// A default method of a trait.
     Trait(&'a str),
 }
@@ -4626,11 +4927,11 @@ pub enum Owner<'a> {
 /// enclosing type parameters of a closure (captured as `<T>`).
 pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(String, Ty)], outer: &[TParamSig]) -> R<Code> {
     let class_name = match owner {
-        Owner::Class(c) => Some(c),
+        Owner::Class(c, _) => Some(c),
         _ => None,
     };
     let name = match owner {
-        Owner::Class(c) | Owner::Trait(c) => format!("{c}.{}", f.name),
+        Owner::Class(c, _) | Owner::Trait(c) => format!("{c}.{}", f.name),
         Owner::None => f.name.clone(),
     };
     let mut ctx = FnCtx::new(m, name, false);
@@ -4655,7 +4956,10 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     }
     // Type parameters of the enclosing class/trait or closure scope.
     let (owner_tps, owner_load): (Vec<TParamSig>, Option<(&str, bool)>) = match owner {
-        Owner::Class(c) => (m.classes[c].tparams.clone(), Some((c, true))),
+        Owner::Class(c, names) => {
+            let tps = m.classes[c].tparams.iter().zip(names).map(|(t, n)| TParamSig { name: n.clone(), bounds: t.bounds.clone() }).collect();
+            (tps, Some((c, true)))
+        }
         Owner::Trait(t) => (m.trait_tparams(t), Some((t, false))),
         Owner::None => (outer.to_vec(), None),
     };
@@ -4679,6 +4983,13 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         }
         ctx.tscope.push(TPar { name: tp.name.clone(), reg, bounds: tp.bounds.clone() });
     }
+    // `Self` in a trait's default method: the type of `self`.
+    if let (Owner::Trait(t), true) = (owner, has_self) {
+        let reg = ctx.new_reg(false, Some("<Self>".into()));
+        ctx.emit(Instr::LoadTypeOf { dst: reg, obj: 0 });
+        let bound = Ty::Trait(t.to_string(), owner_tps.iter().map(|p| Ty::Param(p.name.clone())).collect());
+        ctx.tscope.push(TPar { name: "Self".into(), reg, bounds: vec![bound] });
+    }
     for (tp, reg) in f.tparams.iter().zip(&own_tregs) {
         ctx.tscope.push(TPar { name: tp.name.clone(), reg: *reg, bounds: Vec::new() });
     }
@@ -4700,7 +5011,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         let is_self = i == 0 && has_self;
         let (ty, desc) = match (&p.ty, is_self) {
             (_, true) => match owner {
-                Owner::Class(c) => (Ty::Instance(c.to_string(), self_ty(&owner_tps)), None),
+                Owner::Class(c, _) => (Ty::Instance(c.to_string(), self_ty(&owner_tps)), None),
                 // Any implementing class, `Send` or not.
                 Owner::Trait(t) => (Ty::Local(Box::new(Ty::Trait(t.to_string(), self_ty(&owner_tps)))), None),
                 Owner::None => (Ty::Unknown, None),

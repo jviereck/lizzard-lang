@@ -1,18 +1,20 @@
-class Node:
+struct Node:
     value: int
     next: Option<Node>
-    def __init__(self, v: int) -> ():
-        self.value = v
-        self.next <- None
 
-class Stack:
+impl Node:
+    def new(v: int) -> Self:
+        Node { value: v, next: None }
+
+struct Stack:
     head: Option<Node>
     size: int
-    def __init__(self) -> ():
-        self.head <- None
-        self.size = 0
+
+impl Stack:
+    def new() -> Self:
+        Stack { head: None, size: 0 }
     def push(self, v: int) -> ():
-        n = Node(v)
+        n = Node::new(v)
         old <- self.head <- None
         n.next <- old
         self.head <- n
@@ -22,7 +24,7 @@ class Stack:
             return self.head.value
         -1
 
-st = Stack()
+st = Stack::new()
 for i in range(5):
     st.push(i * 10)
 print(st.size, st.peek())
@@ -73,17 +75,21 @@ report = |n: int| {
 }
 print(report(20))
 
-class Res:
+struct Res:
     name: str
-    def __init__(self, n: str + keep) -> ():
-        self.name <- n
+
+impl Res:
+    def new(n: str + keep) -> Self:
+        Res { name: n }
+
+impl Drop for Res:
     def __drop__(self) -> ():
         print("dropping", self.name)
 
 rc_auto(False)
 def make() -> ():
-    a = Res("a")
-    b = Res("b")
+    a = Res::new("a")
+    b = Res::new("b")
 make()
 print("pending:", rc_pending())
 print("freed:", rc_run())

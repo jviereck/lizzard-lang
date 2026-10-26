@@ -1,5 +1,5 @@
-  File "err_send_impl_local.slim", line 2
-    class Counter(impl Local):
-                       ^
-TypeError: there is no `Local` trait: as in Rust, a class is `Send` unless a field is not (e.g. an `any` field)
+  File "err_send_impl_local.slim", line 5
+    impl Local for Counter
+         ^
+TypeError: there is no `Local` trait: as in Rust, a struct is `Send` unless a field is not (e.g. an `any` field)
 [exit 1]

@@ -1,0 +1,9 @@
+trait Shape:
+    def scale(self, k: float) -> Self: ...
+
+struct Square:
+    side: float
+
+impl Shape for Square:
+    def scale(self, k: int) -> Self:
+        Square { side: self.side * k }

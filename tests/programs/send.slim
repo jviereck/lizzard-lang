@@ -3,47 +3,47 @@
 # not `Send`; `X + Send` restricts them to values that are.
 
 # `Send`: only an `int` field.
-class Counter:
+struct Counter:
     n: int
-    def __init__(self) -> ():
-        self.n = 0
+
+impl Counter:
+    def new() -> Self:
+        Counter { n: 0 }
     def inc(self) -> int:
         self.n += 1
         self.n
 
 # Not `Send`: an `any` field may hold anything.
-class Bag:
+struct Bag:
     item: any
-    def __init__(self, item: any + keep) -> ():
-        self.item <- item
+
+impl Bag:
+    def new(item: any + keep) -> Self:
+        Bag { item }
 
 # Not `Send`: a field of a type that is not.
-class Holder:
+struct Holder:
     b: Bag
-    def __init__(self, b: Bag + keep) -> ():
-        self.b <- b
 
 # `Send` exactly when `T` is.
-class Box<T>:
+struct Box<T>:
     value: T
-    def __init__(self, value: T + keep) -> ():
-        self.value <- value
 
 trait Ticker:
     def tick(self) -> int: ...
 
-class Clock(impl Ticker):
+struct Clock:
     t: int
-    def __init__(self) -> ():
-        self.t = 0
+
+impl Ticker for Clock:
     def tick(self) -> int:
         self.t += 10
         self.t
 
-class BagClock(impl Ticker):
+struct BagClock:
     b: Bag
-    def __init__(self) -> ():
-        self.b <- Bag(1)
+
+impl Ticker for BagClock:
     def tick(self) -> int:
         1
 
@@ -57,12 +57,12 @@ def tick_all(ts: list<Ticker>) -> int:
     total
 
 def ticks() -> Iterator<int>:
-    b = Bag(0)
+    b = Bag::new(0)
     yield 1
     yield 2
 
 def counts() -> Iterator<int> + Send:
-    c = Counter()
+    c = Counter::new()
     yield c.inc()
     yield c.inc()
 
@@ -82,19 +82,19 @@ def run<T: Send>(f: function + Send, x: T + keep) -> Thread:
     spawn(f, x)
 
 def make_bag() -> Bag:
-    Bag("made")
+    Bag::new("made")
 
 def main() -> ():
-    b = Bag(5)
+    b = Bag::new(5)
     print(b.item, show(b))
-    h = Holder(Bag("x"))
+    h = Holder { b: Bag::new("x") }
     print(h.b.item)
-    bb = Box(Bag(1))
+    bb = Box { value: Bag::new(1) }
     print(bb.value.item)
 
     # `Send` values cross threads.
-    print(spawn(bump, Counter()).join())
-    print(spawn(unbox, Box(Counter())).join())
+    print(spawn(bump, Counter::new()).join())
+    print(spawn(unbox, Box { value: Counter::new() }).join())
     xs: list<any + Send> = [1, "a", 2.5]
     print(spawn(total_len, xs++).join())
     double = |k: int| k * 2
@@ -102,7 +102,7 @@ def main() -> ():
     print(run(square, 7).join())
 
     # Erased types may hold values that are not `Send`.
-    print(tick_all([Clock(), BagClock()]))
+    print(tick_all([Clock { t: 0 }, BagClock { b: Bag::new(1) }]))
     peek = |k: int| k + len(str(b.item))
     print(peek(100))
     held: list<function> = [peek, double]

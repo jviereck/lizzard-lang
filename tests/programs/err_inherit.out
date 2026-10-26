@@ -1,5 +1,5 @@
-  File "err_inherit.slim", line 4
-    class Child(impl Base):
-                     ^
-TypeError: `Base` is a class, not a trait; classes cannot inherit (use a field and delegate by hand)
+  File "err_inherit.slim", line 5
+    impl Base for Child
+         ^
+TypeError: `Base` is a struct, not a trait; structs cannot inherit (use a field and delegate by hand)
 [exit 1]

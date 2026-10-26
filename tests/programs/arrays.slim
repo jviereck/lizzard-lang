@@ -23,12 +23,13 @@ def dot(a: array<f64>, b: array<f64>) -> float:
         s += a[i] * b[i]
     s
 
-class Grid:
+struct Grid:
     cells: array<u8>
     w: int
-    def __init__(self, w: int) -> ():
-        self.cells <- array(u8, w * w)
-        self.w = w
+
+impl Grid:
+    def new(w: int) -> Self:
+        Grid { cells: array(u8, w * w), w }
     def set(self, x: int, y: int, v: int) -> ():
         self.cells[y * self.w + x] = v
     def get(self, x: int, y: int) -> int:
@@ -40,7 +41,7 @@ def main() -> ():
     print(dot(xs, ys))
     v = xs[1]
     print(v + 1.0)
-    g = Grid(4)
+    g = Grid::new(4)
     g.set(1, 2, 200)
     print(g.get(1, 2), g.cells.sum())
 main()

@@ -1,12 +1,14 @@
 # A generator declared `+ Send` may be resumed on another thread, so it
 # cannot hold a value that is not `Send` across a `yield`.
-class Bag:
+struct Bag:
     item: any
-    def __init__(self, item: any + keep) -> ():
-        self.item <- item
+
+impl Bag:
+    def new(item: any + keep) -> Self:
+        Bag { item }
 
 def ticks() -> Iterator<int> + Send:
-    b = Bag(1)
+    b = Bag::new(1)
     yield 1
     yield 2
 

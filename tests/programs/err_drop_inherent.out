@@ -1,0 +1,5 @@
+  File "err_drop_inherent.slim", line 5
+        def __drop__(self) -> ():
+        ^
+TypeError: a destructor is defined by implementing `Drop`: `impl Drop for Node:`
+[exit 1]

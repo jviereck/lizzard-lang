@@ -5,6 +5,9 @@
 //! become `geom.dot`), which the compiler then treats like any other
 //! module-level function or class. A function's own parameters and locals
 //! shadow imported names.
+//!
+//! The same pass replaces `Self` inside an `impl` block by the block's
+//! target type (`Stack<T>`), in types and in struct literals and paths.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +30,8 @@ struct Rewriter<'a> {
     names: HashMap<String, String>,
     /// Names bound by the enclosing functions.
     shadow: Vec<HashSet<String>>,
+    /// The target of the enclosing `impl` block, which `Self` stands for.
+    self_ty: Option<TypeExpr>,
 }
 
 fn has_item(m: &ModuleSpec, item: &str) -> bool {
@@ -35,7 +40,7 @@ fn has_item(m: &ModuleSpec, item: &str) -> bool {
 
 /// Rewrites the imports of `module`. Returns the native modules it uses.
 pub fn resolve<'a>(module: &mut Module, natives: &'a [ModuleSpec]) -> R<Vec<&'a ModuleSpec>> {
-    let mut rw = Rewriter { modules: HashMap::new(), names: HashMap::new(), shadow: Vec::new() };
+    let mut rw = Rewriter { modules: HashMap::new(), names: HashMap::new(), shadow: Vec::new(), self_ty: None };
     let mut used: Vec<&ModuleSpec> = Vec::new();
     for s in &module.body.stmts {
         let find = |m: &str| natives.iter().find(|n| n.name == m).ok_or_else(|| name_err(format!("no module named `{m}`"), s.span));
@@ -145,44 +150,37 @@ impl Rewriter<'_> {
                 self.expr(value)
             }
             StmtKind::Def(f) => self.func(f),
-            StmtKind::Class(c) => {
+            StmtKind::Struct(c) => {
                 for tp in &mut c.tparams {
                     tp.bounds.iter_mut().for_each(|b| self.ty(b));
                 }
-                for (n, args, _) in &mut c.traits {
+                for f in &mut c.fields {
+                    self.ty(&mut f.ty);
+                }
+                Ok(())
+            }
+            StmtKind::Impl(i) => {
+                if !top {
+                    return Err(Error::syntax("`impl` blocks must be at module level", s.span));
+                }
+                for tp in &mut i.tparams {
+                    tp.bounds.iter_mut().for_each(|b| self.ty(b));
+                }
+                if let Some((n, args, _)) = &mut i.tr {
                     if let Some(q) = self.names.get(n.as_str()) {
                         *n = q.clone();
                     }
                     args.iter_mut().for_each(|a| self.ty(a));
                 }
-                for f in &mut c.fields {
-                    self.ty(&mut f.ty);
-                }
-                for m in &mut c.methods {
-                    self.func(m)?;
-                }
-                Ok(())
+                self.ty(&mut i.target);
+                self.self_ty = Some(i.target.clone());
+                let r = i.methods.iter_mut().try_for_each(|m| self.func(m));
+                self.self_ty = None;
+                r
             }
             StmtKind::Trait(t) => {
                 for m in &mut t.methods {
                     self.func(m)?;
-                }
-                Ok(())
-            }
-            StmtKind::ImplFor { tr, targs, target, .. } => {
-                if let Some(q) = self.names.get(tr.as_str()) {
-                    *tr = q.clone();
-                }
-                targs.iter_mut().for_each(|a| self.ty(a));
-                if let Some(q) = self.names.get(target.as_str()) {
-                    *target = q.clone();
-                } else if let Some((m, item)) = target.split_once('.') {
-                    if let Some(spec) = self.modules.get(m) {
-                        if !has_item(spec, item) {
-                            return Err(Error::new("AttributeError", format!("module `{}` has no `{item}`", spec.name), s.span));
-                        }
-                        *target = format!("{}.{item}", spec.name);
-                    }
                 }
                 Ok(())
             }
@@ -230,6 +228,12 @@ impl Rewriter<'_> {
     }
 
     fn ty(&mut self, t: &mut TypeExpr) {
+        if let (TypeExpr::Named(n, args, _), Some(st)) = (&*t, &self.self_ty) {
+            if n == "Self" && args.is_empty() {
+                *t = st.clone();
+                return;
+            }
+        }
         match t {
             TypeExpr::Unit(_) => {}
             TypeExpr::Send(inner) => self.ty(inner),
@@ -255,6 +259,13 @@ impl Rewriter<'_> {
                         return Ok(());
                     }
                 }
+            }
+        }
+        if let (ExprKind::Name(n), Some(TypeExpr::Named(tn, targs, _))) = (&e.kind, &self.self_ty) {
+            if n == "Self" && !self.shadowed(n) {
+                let base = Expr { kind: ExprKind::Name(tn.clone()), span: e.span };
+                e.kind = if targs.is_empty() { base.kind } else { ExprKind::TypeApp(Box::new(base), targs.clone()) };
+                return Ok(());
             }
         }
         match &mut e.kind {
@@ -289,6 +300,11 @@ impl Rewriter<'_> {
             ExprKind::TypeApp(f, ts) => {
                 ts.iter_mut().for_each(|t| self.ty(t));
                 self.expr(f)
+            }
+            ExprKind::Path(base, _) => self.expr(base),
+            ExprKind::StructLit { ty, fields } => {
+                self.expr(ty)?;
+                fields.iter_mut().try_for_each(|(_, v, _)| self.expr(v))
             }
             ExprKind::Dup(x) | ExprKind::Unary(_, x) | ExprKind::YieldFrom(x) => self.expr(x),
             ExprKind::Binary(_, a, b) | ExprKind::And(a, b) | ExprKind::Or(a, b) => {

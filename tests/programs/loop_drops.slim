@@ -1,8 +1,12 @@
 # A local assigned in a loop body drops the previous iteration's value.
-class Noisy:
+struct Noisy:
     name: str
-    def __init__(self, name: str + keep) -> ():
-        self.name <- name
+
+impl Noisy:
+    def new(name: str + keep) -> Self:
+        Noisy { name: name }
+
+impl Drop for Noisy:
     def __drop__(self) -> ():
         print("drop", self.name)
 
@@ -10,16 +14,16 @@ def main() -> ():
     rc_auto(False)
     i = 0
     while i < 3:
-        x = Noisy("w" + str(i))
+        x = Noisy::new("w" + str(i))
         i += 1
     print("after while, freed", rc_run())
     for s in ["a" + "1", "b" + "2", "c" + "3"]:
-        n = Noisy(s)
+        n = Noisy::new(s)
     print("after for, freed", rc_run())
-    y = Noisy("moved")
+    y = Noisy::new("moved")
     for k in range(2):
         keep_it = y
-        y = Noisy("again " + str(k))
+        y = Noisy::new("again " + str(k))
     print("after range, freed", rc_run())
 
 main()

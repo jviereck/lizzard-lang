@@ -11,8 +11,8 @@ Greenfield project in `/Users/jmeivier/dev/slim_lang` (empty; rustc 1.96). The g
 **Refcounting is deterministic and user-scheduled, for realtime use.** Dropping the last reference never frees anything inline. Dead objects are queued, and `rc_run()` does the freeing and bookkeeping at a moment the program chooses.
 
 Language: Python syntax with these differences:
-- classes **without inheritance**, plus nominal **traits** (`class C(impl T1, T2)`); delegation is written by hand
-- mandatory typing for class fields and methods, with annotations checked at runtime
+- **Rust-style types**: data in `struct`, behaviour in `impl Type:` and `impl Trait for Type:` blocks, nominal **traits**, no inheritance (delegation is written by hand)
+- mandatory typing for struct fields and methods, with annotations checked at runtime
 - **explicit ownership**: moves, `++` for a new reference, and `+ keep` parameters, which keeps refcount traffic minimal
 - Rust-style `Option<T>` with `Some(v)` / `None`. There's no `unwrap`: you either narrow the type or call `some_or(...)`.
 - Rust-style lambdas `|x| expr` / `|x| { statements }`, where the multiline body sets its own indentation level
@@ -23,27 +23,33 @@ Language: Python syntax with these differences:
 ```python
 trait Log:
     def log(self, msg: str) -> (): ...           # `...` body = required method
+    def hello(self) -> ():                       # default method
+        self.log("hello")
 
-class Console(impl Log):
+struct Console                                   # no fields
+
+impl Log for Console:
     def log(self, msg: str) -> ():               # msg is borrowed (no `keep`)
         print(msg)
 
-class Service(impl Log):
+struct Service:
     out: Console                                 # all fields declared + typed
     last: Option<str>
     count: int                                   # stored as raw i64
-    def __init__(self, out: Console + keep) -> ():
-        self.out <- out                          # move into field; `out` now dead
-        self.last <- None
-        self.count = 0                           # copy types use plain `=`
+
+impl Service:
+    def new(out: Console + keep) -> Self:        # associated function (no `self`)
+        Service { out, last: None, count: 0 }    # literal: every field; `out` moves in
+
+impl Log for Service:
     def log(self, msg: str) -> ():               # hand-written delegation
         self.out.log(msg)                        # temp borrow of a field: fine
         old <- self.last <- Some(msg++)          # swap out old value, store new ref
         if old is not None:                      # narrows `old` to str
             print(old)
-        self.count += 1
+        self.count += 1                          # copy types use plain `=`
 
-s = Service(Console())                           # fresh object moved into keep param
+s = Service::new(Console {})                     # fresh object moved into keep param
 name = "svc"
 t = name++                                       # new reference; `name` still usable
 u = name                                         # move; `name` dead from here on
@@ -90,18 +96,22 @@ report = |n: int| {
   - Inside the block the lexer pushes a nested indentation context. The first non-blank line after `{` sets the base indent, the usual INDENT/DEDENT rules apply relative to it, and `}` ends the context.
   - Parameters follow the same rules as functions: borrowed by default, with `+ keep` allowed. Captures move move-type values in (`++` a value first to keep it) and copy copy-type values.
   - A lambda is itself a move-type object.
-- **Mandatory class typing.**
-  - Every field is declared in the class body with a type.
+- **Mandatory struct typing.**
+  - Every field is declared in the `struct` with a type.
   - Every method annotates all its parameters except `self`, plus its return type.
-  - `__init__` must assign every field on every path. This is checked statically, and a runtime `UNINIT` sentinel is the backstop.
+  - A struct value is created by a literal that gives every field exactly once: `Point { x: 1.0, y }` (`y` is shorthand for `y: y`). There is no `__init__`; constructors are associated functions (`Point::new(..)`). Field values move into the struct, like `keep` arguments.
   - Annotations stay optional on free functions and locals.
 - **Runtime checks.** Annotations are checked on parameters at call entry, on return values, on annotated locals, and on field stores; a mismatch raises `TypeError`.
   - `x: T` matches if `type(x) is T`, if T is a trait in `type(x)`'s `impl` list, or if T is `Option<U>` and x is `None` or matches U.
   - Generics are reified (see "Runtime types" below): `list<int>` checks the list's own type, `list` accepts any list.
-- **Classes and traits.** Classes are sealed once defined (no monkeypatching, fixed slots). The parentheses after a class name may contain only `impl` trait lists.
-  - A trait method whose body is `...` is required; one with a real body is a default that gets copied into the class.
-  - A class missing a required method raises `TypeError` when it is defined.
-- **Exceptions:** `try/except/else/finally`, `raise` (which moves the exception), `raise X from Y`, `except (A, B) as e` (`e` is an owned local). Exception groups such as `LookupError` and `ArithmeticError` are built-in traits.
+- **Structs, impls and traits (10d).** As in Rust: `struct Name<T>:` declares the fields (or `struct Marker` none), `impl<T> Name<T>:` adds methods (first parameter `self`) and associated functions (no `self`, called `Name::f(..)` or `Name::<int>::f(..)`), and `impl<T> Trait<args> for Name<T>:` implements a trait. A marker impl has no body (`impl Exception for AppError`).
+  - **Traits** are defined as before: `trait Shape:` with required methods (`...` body) and defaults (real bodies). `Self` in a trait's signatures is the implementing type; in a default method it is `self`'s runtime type. Traits are used in annotations (`s: Shape`, `list<Shape + Send>`), as bounds (`T: Shape`) and with `isinstance`.
+  - **Checks.** An impl of a trait must define every required method with the trait's parameter types (after substituting `Self` and the trait's arguments) and a compatible return type, and nothing the trait doesn't declare; defaults are inherited. `Send` is never implemented (it follows the fields), and a struct cannot implement another struct.
+  - **Methods** of several `impl` blocks are merged; a name defined twice (or both a field and a method) is an error. Operator dunders (`__add__`, `__lt__`, ...) may be inherent methods; `__drop__` only in `impl Drop for T`. Structs are sealed (fixed slots, no monkeypatching).
+  - **Impls cover the whole struct**: `impl<A, B> Pair<A, B>` with the struct's own bounds (any names). Specialized or conditional impls are not supported yet.
+  - **Items are order-independent.** Traits, structs (with their impls) and associated functions are defined at module start, before the module's statements run, so an impl may come before its trait.
+  - Calling a struct (`Point(1.0, 2.0)`) is an error; `class` is a syntax error that explains the replacement.
+- **Exceptions:** `try/except/else/finally`, `raise` (which moves the exception), `raise X from Y`, `except (A, B) as e` (`e` is an owned local). Exception groups such as `LookupError` and `ArithmeticError` are built-in traits. A user exception is a struct implementing `Exception` (a `msg: str` field is shown by `str(e)`): `raise AppError { msg: "bad", code: 7 }`; `raise Done` works for a struct without fields. Builtin exception classes are called: `ValueError("x")`.
 - **Generators:** `yield` (which moves the value out), `yield from`, `.send()`, `.throw()`, `.close()`, `StopIteration`. `for` loops use `__iter__` / `__next__`; `__next__` returns an owned value, and a list iterator returns `++` of each element.
 - **Threads:** `spawn(f, args...)` is a `keep` call, so objects move or `++` into the thread. Built-ins `Lock` and `Channel` (`send` is `keep`).
 
@@ -157,7 +167,7 @@ A decrement never frees anything inline; it only does bookkeeping.
 
 **What `rc_run()` does.** It does all the expensive work, at a time the program chooses:
 1. It applies deferred decrements whose grace period has passed, meaning their epoch stamp is older than every thread's oldest borrow pin and last safepoint. Objects that reach 0 join the pending-free queue.
-2. It pops the pending objects whose grace period has passed. For each one it runs the class's optional `__drop__(self) -> ()` destructor, decrements the object's children (which may queue more objects, handled in the same run), and returns the memory to the allocator.
+2. It pops the pending objects whose grace period has passed. For each one it runs the struct's optional `__drop__(self) -> ()` destructor (from `impl Drop for T`), decrements the object's children (which may queue more objects, handled in the same run), and returns the memory to the allocator.
 
 **Built-ins**
 | function | effect |
@@ -315,7 +325,7 @@ pub trait Backend {
 8. **Lock-free-read `list` and `dict`;** no negative indexes.
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
-10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`.
+10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`.
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**
@@ -384,24 +394,25 @@ Refinements made while building milestones 1–6. Where they conflict with the s
   - **Tuples** are typed structurally (`tuple<int, str>`); indexing with a literal and unpacking keep the item types.
   - **Generators** declare their item type with `-> Iterator<T>`; otherwise it is inferred from the `yield`s (`any` if unknown).
   - **Static argument checks.** Arguments are checked against the parameter types of statically known callees.
-- **User generics (9d).** Classes, traits and functions take type parameters with trait bounds: `class Stack<T>(impl Iterable<T>)`, `trait Source<T>`, `def max_of<T: Ord + Hash>(xs: list<T>)`. Explicit type arguments in expressions use a turbofish: `Stack::<int>()`, `first::<str>`.
+- **User generics (9d).** Structs, traits and functions take type parameters with trait bounds: `struct Stack<T>` with `impl<T> Iterable<T> for Stack<T>`, `trait Source<T>`, `def max_of<T: Ord + Hash>(xs: list<T>)`. Explicit type arguments in expressions use a turbofish: `Stack::<int>::new()`, `Stack::<int> { items: [] }`, `first::<str>`.
   - **Reified.** An instance carries its instantiated type (`Stack<int>`). Fields typed with a parameter are checked against the instance's type arguments, and annotations compare whole types (`Stack<int>` is not `Stack<str>`; a bare `Stack` accepts any).
   - **Generic functions and methods** receive their type arguments as hidden leading parameters (after `self`). The compiler passes them when it can infer them (from a turbofish, the arguments, or the expected result type). Otherwise the callee infers them at runtime from the arguments' types. Bounds are checked in both cases. A generic function used as a value infers its type arguments when it is called, or can be instantiated first (`f::<int>` binds them).
-  - **Generic classes** need statically known type arguments: a turbofish, the context (`s: Stack<str> = Stack()`) or inference from `__init__`'s arguments (`Box(5)` is a `Box<int>`). A dynamic call of a generic class raises `TypeError`. `__init__` cannot have its own type parameters.
-  - **Methods** of generic classes load the class's type arguments from `self` at entry (`LoadTypeArg`); default methods of generic traits load the trait's arguments as implemented by `self`'s class (`LoadTraitArg`); closures capture the type parameters in scope. Bodies are compiled once (no monomorphization).
+  - **Generic struct literals** need statically known type arguments: a turbofish, the context (`s: Stack<str> = Stack { items: [] }`) or inference from the field values (`Box { value: 5 }` is a `Box<int>`).
+  - **Associated functions** are module functions named `Type::f` whose leading type parameters are the impl's, then their own; the explicit arguments of `Stack::<int>::new()` fill the impl's, and the rest are inferred like any generic call (`t: Stack<str> = Stack::new()`).
+  - **Methods** of generic structs load the struct's type arguments from `self` at entry (`LoadTypeArg`); default methods of generic traits load the trait's arguments as implemented by `self`'s struct (`LoadTraitArg`) and `Self` with `LoadTypeOf`; closures capture the type parameters in scope. Bodies are compiled once (no monomorphization).
   - **Strict bounds.** In a generic body a value of type `T` can be moved, copied, stored in `T` slots, returned, compared with `==`/`is`, printed and passed where `T` or `any` is expected. Everything else needs a bound: `< <= > >=`, `sorted`, `min`, `max` need `Ord`; `+ - * / // % **` and unary `-` need `Num` (both operands `T`; `/` is untyped); `len` needs `Len`; `for` needs `Iterable<U>` (items are `U`); dict keys need `Hash`; method calls need a user trait bound that declares the method. Field access, indexing and calling a `T` are compile errors.
-  - **Builtin traits:** `Ord` (numbers, `bool`, `str`, tuples of `Ord`; classes implementing `__lt__`), `Num` (implies `Ord`; numbers; classes implementing the arithmetic dunders), `Hash` (everything except `list`, `dict`, `array` and tuples containing them), `Len`, `Iterable<U>` and `Iterator<U>` (implies `Iterable<U>`). Instances of classes implementing `Ord`/`Num` work with the operators through their dunders. User traits cannot reuse these names.
-  - **Trait arguments** in a class's `impl` list may refer to the class's own parameters (`impl Iterable<T>`) and to classes defined earlier. A class implements a trait at most once.
+  - **Builtin traits:** `Ord` (numbers, `bool`, `str`, tuples of `Ord`; structs implementing `__lt__`), `Num` (implies `Ord`; numbers; structs implementing the arithmetic dunders), `Hash` (everything except `list`, `dict`, `array` and tuples containing them), `Len`, `Iterable<U>` and `Iterator<U>` (implies `Iterable<U>`), and `Drop` (`__drop__`). Structs implementing `Ord`/`Num` work with the operators through their dunders. User traits cannot reuse these names.
+  - **Trait arguments** of an impl may refer to the impl's parameters (`impl<T> Iterable<T> for Stack<T>`). A struct implements a trait at most once.
   - **Known limitation:** `Option<T>` with `T = Option<U>` is not supported (the inner `None` cannot be told apart).
 - **`Send` (9e, redesigned in 9f and 9g).** As in Rust, a type is `Send` (its values may cross threads) unless it holds something that isn't. A value of a non-`Send` type is *local*: it stays on the thread that created it. Internally, the compiler's `Ty::Local`, `RtType.local` and the rc `LOCAL` bit all mean "not `Send`".
   - **`Send` is inherited structurally.** It is an auto trait that cannot be implemented explicitly, and there is no `Local` trait.
-    - A class is not `Send` when a field type is not (computed to a fixpoint, since fields may name classes declared later).
+    - A struct is not `Send` when a field type is not (computed to a fixpoint, since fields may name structs declared later).
     - A generic instantiation is not `Send` when a type argument is not: `Box<T>` is `Send` exactly when `T` is. The same goes for `list`, `dict`, `Option`, tuples and `Iterator<T>`.
     - The roots are native bindings over Rust types without `Send` (`class_not_send`) and the erased types below.
   - **Erased types follow Rust's `dyn Trait`.** `any`, `function`, `Iterator<T>` and trait types (`Shape`) may hold values that aren't `Send`. `X + Send` (`any + Send`, `function + Send`, `Iterator<int> + Send`, `Shape + Send`) restricts them to values that are. An `X + Send` can be used as an `X`, but not the other way round. Inside containers the two are different types (`list<any>` ≠ `list<any + Send>`).
     - Consequences:
       - `list<any>` is not `Send`, just as `Vec<Box<dyn Any>>` isn't, so sending one to a thread needs `list<any + Send>`;
-      - a class with an `any` field is not `Send`;
+      - a struct with an `any` field is not `Send`;
       - an unannotated generator yields `any`, so it is not `Send`.
     - A lambda or nested `def` is `function + Send` when every capture is `Send`, and `function` otherwise. The same holds for a bound method and its receiver. Module-level `def`s are `Send`.
     - A generator declared `-> Iterator<T> + Send` cannot hold a value that isn't `Send` (a live variable or a capture) across a `yield`. A plain `-> Iterator<T>` may hold anything.
@@ -453,13 +464,13 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - **Registration errors panic:** a wrong number of type arguments, or the same instantiation registered twice.
   - **Traits (10c).**
     - **Rust traits.** A module defines a trait whose methods are all required: `m.trait_def("Shape", |t| { t.method::<(), f64>("area"); t.method::<(f64,), ()>("scale"); })`. The argument types are a tuple (`()`, `(f64,)`, ...). Its classes, defined after it, implement it with `c.implements("Shape")`.
-      - Slim imports it like a class (`from geom import Shape`) and uses it as any trait: `s: Shape`, `list<Shape + Send>`, `T: Shape`, `class Square(impl Shape)`.
-      - A slim class must define every method.
+      - Slim imports it like a class (`from geom import Shape`) and uses it as any trait: `s: Shape`, `list<Shape + Send>`, `T: Shape`, `impl Shape for Square:`.
+      - A struct must define every method.
     - **Builtin traits through dunders.** `c.implements("Ord" | "Num" | "Len")` with `__lt__`, the arithmetic dunders (`Num` implies `Ord`) or `__len__`. Operators, `sorted` and `len()` call a native object's dunder methods like an instance's. `Send` is never implemented this way: it follows the Rust type.
     - **Registration checks.** At registration, the class's methods are checked against the trait's signatures; a missing or mismatched method panics with the class, trait and method names.
-    - **Program traits for native classes:** `impl Describe for Polygon`, a module-level statement after the trait's definition. It is checked at compile time:
+    - **Program traits for native classes:** `impl Describe for Polygon`, without a body (the trait's default methods are used). It is checked at compile time:
       - every required method exists on the class, with the trait's parameter types and a compatible return type;
-      - the target is a native class (a slim class lists its traits in its header);
+      - native classes get no inherent `impl` (their methods are defined in Rust);
       - the trait is not a native one (those are implemented in Rust) and is not generic.
 
       For a generic native class (`impl Len for Stack`), the impl covers every instantiation, and each instantiation is checked. At runtime, the statement (`ImplNative`) adds the class to the trait's `native_impls` and those of the traits it implies, which `rtype::satisfies` consults for bounds, `has_type` and `isinstance`. It also records the trait's default methods in `vm.native_methods`, which method calls on native objects fall back to, so `p.describe()` runs the slim default with `self` the native object.

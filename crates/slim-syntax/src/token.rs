@@ -15,7 +15,9 @@ pub enum Tok {
 
     // keywords
     Def,
+    /// Only lexed to explain that `class` was replaced by `struct` + `impl`.
     Class,
+    Struct,
     Trait,
     Impl,
     If,
@@ -103,6 +105,7 @@ impl Tok {
         Some(match s {
             "def" => Tok::Def,
             "class" => Tok::Class,
+            "struct" => Tok::Struct,
             "trait" => Tok::Trait,
             "impl" => Tok::Impl,
             "if" => Tok::If,
@@ -148,6 +151,7 @@ impl fmt::Display for Tok {
             Tok::Str(_) => "string literal",
             Tok::Def => "`def`",
             Tok::Class => "`class`",
+            Tok::Struct => "`struct`",
             Tok::Trait => "`trait`",
             Tok::Impl => "`impl`",
             Tok::If => "`if`",

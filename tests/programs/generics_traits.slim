@@ -5,19 +5,29 @@ trait Shape:
     def describe(self) -> str:
         "shape with area " + str(self.area())
 
-class Square(impl Shape, impl Ord):
+struct Square:
     side: float
-    def __init__(self, side: float) -> ():
-        self.side = side
+
+impl Square:
+    def new(side: float) -> Self:
+        Square { side }
+
+impl Shape for Square:
     def area(self) -> float:
         self.side * self.side
+
+impl Ord for Square:
     def __lt__(self, other: Square) -> bool:
         self.side < other.side
 
-class Circle(impl Shape):
+struct Circle:
     r: float
-    def __init__(self, r: float) -> ():
-        self.r = r
+
+impl Circle:
+    def new(r: float) -> Self:
+        Circle { r }
+
+impl Shape for Circle:
     def area(self) -> float:
         3.0 * self.r * self.r
 
@@ -42,10 +52,14 @@ trait Source<T>:
             item = self.next_item()
         out
 
-class Countdown(impl Source<int>):
+struct Countdown:
     n: int
-    def __init__(self, n: int) -> ():
-        self.n = n
+
+impl Countdown:
+    def new(n: int) -> Self:
+        Countdown { n }
+
+impl Source<int> for Countdown:
     def next_item(self) -> Option<int>:
         if self.n == 0:
             None
@@ -53,12 +67,15 @@ class Countdown(impl Source<int>):
             self.n -= 1
             self.n + 1
 
-class Repeat<T>(impl Source<T>):
+struct Repeat<T>:
     value: T
     times: int
-    def __init__(self, value: T + keep, times: int) -> ():
-        self.value <- value
-        self.times = times
+
+impl<T> Repeat<T>:
+    def new(value: T + keep, times: int) -> Self:
+        Repeat { value, times }
+
+impl<T> Source<T> for Repeat<T>:
     def next_item(self) -> Option<T>:
         if self.times == 0:
             None
@@ -71,12 +88,15 @@ def drain<T>(s: Source<T>) -> list<T>:
 
 # A user iterator: `impl Iterator<T>` makes it usable in `for` and as an
 # `Iterator<T>`.
-class Upto(impl Iterator<int>):
+struct Upto:
     i: int
     n: int
-    def __init__(self, n: int) -> ():
-        self.i = 0
-        self.n = n
+
+impl Upto:
+    def new(n: int) -> Self:
+        Upto { i: 0, n }
+
+impl Iterator<int> for Upto:
     def __next__(self) -> int:
         if self.i >= self.n:
             raise StopIteration()
@@ -90,10 +110,12 @@ def sum_all(xs: Iterable<int>) -> int:
     t
 
 # Generic methods take their own type parameters.
-class Registry:
+struct Registry:
     names: list<str>
-    def __init__(self) -> ():
-        self.names <- []
+
+impl Registry:
+    def new() -> Self:
+        Registry { names: [] }
     def tag<T>(self, x: T) -> tuple<str, T>:
         ("#" + str(len(self.names)), x++)
 
@@ -101,16 +123,16 @@ def untyped(x: any) -> any:
     x++
 
 def main() -> ():
-    shapes = [Square(2.0), Square(1.0)]
-    print(total_area(shapes), total_area([Circle(1.0)]), biggest(shapes))
-    print(Countdown(3).collect(), drain(Countdown(2)), drain(Repeat("ab", 2)))
-    r = Repeat::<float>(1, 2)
+    shapes = [Square::new(2.0), Square { side: 1.0 }]
+    print(total_area(shapes), total_area([Circle::new(1.0)]), biggest(shapes))
+    print(Countdown::new(3).collect(), drain(Countdown::new(2)), drain(Repeat::new("ab", 2)))
+    r = Repeat::<float>::new(1, 2)
     floats = r.collect()
     floats.append(0.5)
-    print(floats, sum_all([1, 2]), sum_all(Upto(4)))
-    for i in Upto(2):
+    print(floats, sum_all([1, 2]), sum_all(Upto::new(4)))
+    for i in Upto::new(2):
         print("upto", i)
-    reg = Registry()
+    reg = Registry::new()
     print(reg.tag(5), reg.tag("x"))
     try:
         total_area(untyped([1, 2]))

@@ -1,37 +1,46 @@
-# Generic classes: type arguments are part of the instance's runtime type.
+# Generic structs: type arguments are part of the instance's runtime type.
 
-class Stack<T>(impl Iterable<T>, impl Len):
+struct Stack<T>:
     items: list<T>
-    def __init__(self) -> ():
-        self.items <- []
+
+impl<T> Stack<T>:
+    def new() -> Self:
+        Stack { items: [] }
     def push(self, x: T + keep) -> ():
         self.items.append(x)
     def pop(self) -> Option<T>:
         self.items.pop()
+
+impl<T> Len for Stack<T>:
     def __len__(self) -> int:
         len(self.items)
+
+impl<T> Iterable<T> for Stack<T>:
     def __iter__(self) -> Iterator<T>:
         for x in self.items:
             yield x++
 
-class Box<T>:
+struct Box<T>:
     value: T
-    def __init__(self, value: T + keep) -> ():
-        self.value <- value
+
+impl<T> Box<T>:
+    def new(value: T + keep) -> Self:
+        Box { value }
     def get(self) -> T:
         self.value++
     def swap(self, v: T + keep) -> T:
         old <- self.value <- v
         old
 
-class Pair<A, B>:
+struct Pair<A, B>:
     first: A
     second: B
-    def __init__(self, a: A + keep, b: B + keep) -> ():
-        self.first <- a
-        self.second <- b
+
+impl<A, B> Pair<A, B>:
+    def new(a: A + keep, b: B + keep) -> Self:
+        Pair { first: a, second: b }
     def flip(self) -> Pair<B, A>:
-        Pair(self.second++, self.first++)
+        Pair { first: self.second++, second: self.first++ }
 
 def untyped(x: any) -> any:
     x++
@@ -44,7 +53,7 @@ def total(s: Stack<int>) -> int:
 
 def main() -> ():
     # Explicit type arguments.
-    s = Stack::<int>()
+    s = Stack::<int>::new()
     s.push(1)
     s.push(2)
     s.push(3)
@@ -54,28 +63,28 @@ def main() -> ():
         print("popped", top + 10)
 
     # From the context.
-    names: Stack<str> = Stack()
+    names: Stack<str> = Stack::new()
     names.push("ada")
     names.push("grace")
     for n in names:
         print(n.upper())
 
     # Inferred from the constructor arguments.
-    b = Box(5)
+    b = Box::new(5)
     print(b, b.get() * 2)
     old = b.swap(7)
     print(old, b.value)
-    p = Pair("x", 1.5)
+    p = Pair::new("x", 1.5)
     q = p.flip()
     print(p, q, q.first + 1.0, q.second.upper())
 
     # Nested generic types.
-    nested = Stack::<list<int>>()
+    nested = Stack::<list<int>>::new()
     nested.push([1, 2])
     nested.push([3])
     for xs in nested:
         print(xs, len(xs))
-    boxes: list<Box<str>> = [Box("a"), Box("b")]
+    boxes: list<Box<str>> = [Box::new("a"), Box { value: "b" }]
     print(boxes)
 
     # The runtime type is checked through untyped paths.

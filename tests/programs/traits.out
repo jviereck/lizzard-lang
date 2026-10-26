@@ -1,0 +1,9 @@
+5.0
+shape of area 4.0 16.0
+rect 1.0x3.0 12.0
+9.0
+hi
+[3, 2, 1]
+True False
+rc-audit: ok
+[exit 0]

@@ -1064,35 +1064,12 @@ fn construct(th: &mut Thread, caller: Option<&mut Frame>, cls: Value, c: &'stati
         };
         return Ok(new_exception(cls, msg));
     }
-    let slots: Vec<AtomicU64> = c
-        .fields
-        .iter()
-        .map(|f| AtomicU64::new(if f.kind == SlotKind::Value { Value::UNINIT.0 } else { 0 }))
-        .collect();
-    let inst = Obj::alloc(Body::Instance(Instance { class: cls, ty, slots: slots.into_boxed_slice() }));
-    match c.methods.get("__init__") {
-        Some(&init) => match invoke(th, caller, init, Some(inst), None, args) {
-            Ok(r) => r.decref(),
-            Err(e) => {
-                inst.decref();
-                return Err(e);
-            }
-        },
-        None => {
-            if !args.is_empty() {
-                inst.decref();
-                return Err(th.raise("TypeError", format!("{}() takes no arguments", c.name)));
-            }
-        }
+    let _ = caller;
+    // A struct without fields (`raise Done`); others need a literal.
+    if c.fields.is_empty() && args.is_empty() {
+        return Ok(Obj::alloc(Body::Instance(Instance { class: cls, ty, slots: Box::new([]) })));
     }
-    let i = inst.as_instance().unwrap();
-    for (k, f) in c.fields.iter().enumerate() {
-        if f.kind == SlotKind::Value && i.slots[k].load(Ordering::Acquire) == Value::UNINIT.0 {
-            inst.decref();
-            return Err(th.raise("AttributeError", format!("`{}.__init__` did not initialize field `{}`", c.name, f.name)));
-        }
-    }
-    Ok(inst)
+    Err(th.raise("TypeError", format!("`{}` is a struct: create it with a literal `{} {{ .. }}` or an associated function", c.name, c.name)))
 }
 
 pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32, args: u32, _: u32) -> u32 {
@@ -1291,7 +1268,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
     for (idx, tname, targs) in &s.traits {
         let t = resolve_global(th, *idx);
         let Some(tr) = t.as_trait() else {
-            return Err(th.raise("TypeError", format!("class `{}`: `{tname}` is not a trait", s.name)));
+            return Err(th.raise("TypeError", format!("struct `{}`: `{tname}` is not a trait", s.name)));
         };
         if !targs.is_empty() {
             let mut args = Vec::new();
@@ -1299,7 +1276,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
                 match types::pre_resolve(th, a) {
                     Ok(a) => args.push(a),
                     Err(n) => {
-                        return Err(th.raise("NameError", format!("class `{}`: type `{n}` is used before it is defined", s.name)))
+                        return Err(th.raise("NameError", format!("struct `{}`: type `{n}` is used before it is defined", s.name)))
                     }
                 }
             }
@@ -1332,7 +1309,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
                 None => {
                     return Err(th.raise(
                         "TypeError",
-                        format!("class `{}` implements `{}` but does not define required method `{mname}`", s.name, tr.name),
+                        format!("struct `{}` implements `{}` but does not define required method `{mname}`", s.name, tr.name),
                     ))
                 }
             }
@@ -1397,6 +1374,13 @@ pub fn trait_arg(th: &mut Thread, o: Value, tr: u32, k: u32) -> VResult<Value> {
             format!("`{}` does not implement a generic `{}`", t.name, rtype::name(rtype::prim(Ctor::Trait(trv)))),
         )),
     }
+}
+
+/// dst = the runtime type of the value in `obj`.
+pub extern "C" fn f_load_type_of(_th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, _: u32, _: u32) -> u32 {
+    let t = rtype::type_of(frame.reg(obj as Reg));
+    frame.set(dst as Reg, t);
+    OK
 }
 
 /// dst = type argument `k` of the instance in `obj` (in a generic method).
@@ -1846,6 +1830,36 @@ pub extern "C" fn f_build_list(th: &mut Thread, frame: &mut Frame, dst: u32, arg
         }
         Err(Raised) => RAISED,
     }
+}
+
+/// A struct value from owned field values (declared order), each checked
+/// against its field type. On an error every value is released.
+pub extern "C" fn f_build_struct(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {
+    let t = match types::frame_type(th, frame, ty) {
+        Ok(t) => t,
+        Err(Raised) => return RAISED,
+    };
+    let vals = take_args(frame, args);
+    let Ctor::Class(cls) = t.ctor else { unreachable!("struct type") };
+    let c = cls.as_class().expect("struct class");
+    let slots: Vec<AtomicU64> = c.fields.iter().map(|f| AtomicU64::new(if f.kind == SlotKind::Value { Value::UNINIT.0 } else { 0 })).collect();
+    let inst = Obj::alloc(Body::Instance(Instance { class: cls, ty: t.value(), slots: slots.into_boxed_slice() }));
+    let i = inst.as_instance().unwrap();
+    let mut it = vals.into_iter().enumerate();
+    while let Some((k, v)) = it.next() {
+        let stored = check_store(th, i, k, v, StoreMode::Move).and_then(|_| to_slot(th, v, c.fields[k].kind));
+        match stored {
+            Ok(raw) => i.slots[k].store(raw, Ordering::Release),
+            Err(Raised) => {
+                v.decref();
+                it.for_each(|(_, v)| v.decref());
+                inst.decref();
+                return RAISED;
+            }
+        }
+    }
+    frame.set(dst as Reg, inst);
+    OK
 }
 
 pub extern "C" fn f_build_dict(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {

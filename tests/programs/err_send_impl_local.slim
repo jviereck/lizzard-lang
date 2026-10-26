@@ -1,5 +1,5 @@
-# There is no `Local` trait: a class is `Send` unless a field is not.
-class Counter(impl Local):
+# There is no `Local` trait: a struct is `Send` unless a field is not.
+struct Counter:
     n: int
-    def __init__(self) -> ():
-        self.n = 0
+
+impl Local for Counter

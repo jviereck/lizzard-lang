@@ -1,4 +1,4 @@
-  File "err_field_move_out.slim", line 7
+  File "err_field_move_out.slim", line 5
     x = p.name
          ^
 OwnershipError: cannot move field `name` (a borrowed `str`) into a variable; use `obj.name++` to create a new reference, or swap it out with `x <- obj.field <- new`

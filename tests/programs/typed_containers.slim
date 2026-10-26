@@ -1,8 +1,10 @@
 # Static element types: list<T>, dict<K, V> and the items of for loops.
-class Item:
+struct Item:
     name: str
-    def __init__(self, name: str + keep) -> ():
-        self.name <- name
+
+impl Item:
+    def new(name: str + keep) -> Self:
+        Item { name }
     def shout(self) -> str:
         self.name.upper()
 
@@ -13,7 +15,7 @@ def names(items: list<Item>) -> list<str>:
     out
 
 def main() -> ():
-    items: list<Item> = [Item("a" + ""), Item("b" + "")]
+    items: list<Item> = [Item::new("a" + ""), Item { name: "b" + "" }]
     print(names(items))
     first = items.first()
     if first is not None:

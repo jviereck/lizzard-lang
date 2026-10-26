@@ -377,6 +377,10 @@ pub fn make_type<B: Backend>(b: &mut B, dst: Reg, ty: u32) -> Flow<()> {
     b.frame_op(h::f_make_type, dst as u32, ty, 0, 0)
 }
 
+pub fn load_type_of<B: Backend>(b: &mut B, dst: Reg, obj: Reg) -> Flow<()> {
+    b.frame_op(h::f_load_type_of, dst as u32, obj as u32, 0, 0)
+}
+
 pub fn load_type_arg<B: Backend>(b: &mut B, dst: Reg, obj: Reg, k: u32) -> Flow<()> {
     b.frame_op(h::f_load_type_arg, dst as u32, obj as u32, k, 0)
 }
@@ -423,6 +427,10 @@ pub fn swap_index<B: Backend>(b: &mut B, dst: Reg, obj: Reg, idx: Reg, src: Reg)
 
 pub fn build_tuple<B: Backend>(b: &mut B, dst: Reg, args: u32) -> Flow<()> {
     b.frame_op(h::f_build_tuple, dst as u32, args, 0, 0)
+}
+
+pub fn build_struct<B: Backend>(b: &mut B, dst: Reg, args: u32, ty: u32) -> Flow<()> {
+    b.frame_op(h::f_build_struct, dst as u32, args, ty, 0)
 }
 
 pub fn build_list<B: Backend>(b: &mut B, dst: Reg, args: u32, ty: u32) -> Flow<()> {

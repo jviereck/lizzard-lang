@@ -1,0 +1,5 @@
+  File "err_struct_lit_infer.slim", line 4
+    b = Box { items: [] }
+                     ^
+TypeError: cannot infer the type of `[]`; annotate it (e.g. `xs: list<int> = []`)
+[exit 1]

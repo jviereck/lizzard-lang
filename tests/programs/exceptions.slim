@@ -1,12 +1,11 @@
-class AppError(impl Exception):
+struct AppError:
     msg: str
     code: int
-    def __init__(self, msg: str + keep, code: int) -> ():
-        self.msg <- msg
-        self.code = code
+
+impl Exception for AppError
 
 def fail(code: int) -> int:
-    raise AppError("app failed", code)
+    raise AppError { msg: "app failed", code }
 
 try:
     fail(7)

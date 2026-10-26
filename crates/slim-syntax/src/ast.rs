@@ -29,12 +29,11 @@ pub enum StmtKind {
     /// next one, the last target receives `value`.
     Move { targets: Vec<Expr>, value: Expr },
     Def(Box<FuncDef>),
-    Class(Box<ClassDef>),
+    Struct(Box<StructDef>),
     Trait(Box<TraitDef>),
-    /// `impl Trait for Class`: a program's trait for a native class (slim
-    /// classes list their traits in the header). `target` may be dotted
-    /// (`geom.Polygon`).
-    ImplFor { tr: String, targs: Vec<TypeExpr>, target: String, tspan: Span },
+    /// `impl<T> Target:` (inherent methods and associated functions) or
+    /// `impl<T> Trait<args> for Target:`.
+    Impl(Box<ImplDef>),
     Return(Option<Expr>),
     While { cond: Expr, body: Block },
     For { target: Expr, iter: Expr, body: Block },
@@ -78,6 +77,12 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Expr>),
     /// `f::<T, U>`: explicit type arguments.
     TypeApp(Box<Expr>, Vec<TypeExpr>),
+    /// `A::b`: an associated function (`Stack::new`) or a qualified method
+    /// (`Shape::area`). The base is a name, possibly with type arguments.
+    Path(Box<Expr>, String),
+    /// `Name { field: value, other }`: a struct value. The base is a name,
+    /// possibly with type arguments (`Stack::<int> { .. }`), or `Self`.
+    StructLit { ty: Box<Expr>, fields: Vec<(String, Expr, Span)> },
     /// `expr++`: a new counted reference.
     Dup(Box<Expr>),
     Unary(UnOp, Box<Expr>),
@@ -206,12 +211,20 @@ pub struct FieldDecl {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClassDef {
+pub struct StructDef {
     pub name: String,
     pub tparams: Vec<TypeParam>,
-    /// Implemented traits with their type arguments: `impl Iterable<T>`.
-    pub traits: Vec<(String, Vec<TypeExpr>, Span)>,
     pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImplDef {
+    pub tparams: Vec<TypeParam>,
+    /// The implemented trait and its arguments; `None` for an inherent impl.
+    pub tr: Option<(String, Vec<TypeExpr>, Span)>,
+    pub target: TypeExpr,
+    /// Methods (first parameter `self`) and associated functions.
     pub methods: Vec<FuncDef>,
     pub span: Span,
 }

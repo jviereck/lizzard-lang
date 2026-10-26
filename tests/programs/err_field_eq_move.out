@@ -1,4 +1,4 @@
-  File "err_field_eq_move.slim", line 4
+  File "err_field_eq_move.slim", line 6
             self.name = n
             ^
 OwnershipError: field `name` holds a move type (`str`); use `<-` to move a value in

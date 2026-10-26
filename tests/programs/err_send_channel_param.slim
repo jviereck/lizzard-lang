@@ -1,7 +1,9 @@
 # `Channel<T>` needs `T: Send`.
-class Pool<T>:
+struct Pool<T>:
     jobs: Channel<T>
-    def __init__(self) -> ():
-        self.jobs = Channel()
 
-p = Pool::<int>()
+impl<T> Pool<T>:
+    def new() -> Self:
+        Pool { jobs: Channel() }
+
+p = Pool::<int>::new()

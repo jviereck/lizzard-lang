@@ -1,9 +1,10 @@
-class Counter:
+struct Counter:
     n: int
     lock: Lock
-    def __init__(self) -> ():
-        self.n = 0
-        self.lock <- Lock()
+
+impl Counter:
+    def new() -> Self:
+        Counter { n: 0, lock: Lock() }
     def add(self, k: int) -> ():
         with self.lock:
             self.n += k
@@ -14,7 +15,7 @@ def work(c: Counter + keep, times: int) -> int:
     times
 
 def main() -> ():
-    c = Counter()
+    c = Counter::new()
     threads: list<Thread> = []
     for i in range(4):
         threads.append(spawn(work, c++, 10000))

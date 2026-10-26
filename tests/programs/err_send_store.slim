@@ -1,11 +1,13 @@
 # A value that is not `Send` cannot be stored as `any + Send`.
-class Bag:
+struct Bag:
     item: any
-    def __init__(self, item: any + keep) -> ():
-        self.item <- item
+
+impl Bag:
+    def new(item: any + keep) -> Self:
+        Bag { item }
 
 def main() -> ():
-    mine = Bag(1)
+    mine = Bag::new(1)
     shared: dict<str, any + Send> = {}
     shared["b"] <- mine
 

@@ -91,35 +91,15 @@ impl Parser {
         let span = self.span();
         let kind = match self.peek() {
             Tok::Def => StmtKind::Def(Box::new(self.funcdef()?)),
-            Tok::Class => StmtKind::Class(Box::new(self.classdef()?)),
-            Tok::Trait => StmtKind::Trait(Box::new(self.traitdef()?)),
-            Tok::Impl => {
-                self.advance();
-                let (tr, tspan) = self.name("trait name")?;
-                let mut targs = Vec::new();
-                if self.eat(&Tok::Lt) {
-                    loop {
-                        targs.push(self.type_expr()?);
-                        if !self.eat(&Tok::Comma) {
-                            break;
-                        }
-                    }
-                    self.close_angle()?;
-                }
-                if !self.eat(&Tok::For) {
-                    return Err(Error::syntax(
-                        format!("expected `for` in `impl {tr} for Class` (slim classes list their traits in the header: `class C(impl {tr})`)"),
-                        self.span(),
-                    ));
-                }
-                let (mut target, _) = self.name("class name")?;
-                while self.eat(&Tok::Dot) {
-                    target.push('.');
-                    target.push_str(&self.name("class name")?.0);
-                }
-                self.expect_line_end()?;
-                StmtKind::ImplFor { tr, targs, target, tspan }
+            Tok::Class => {
+                return Err(Error::syntax(
+                    "there are no classes: as in Rust, declare the data with `struct Name:` and the methods in `impl Name:` / `impl Trait for Name:` blocks",
+                    span,
+                ))
             }
+            Tok::Struct => StmtKind::Struct(Box::new(self.structdef()?)),
+            Tok::Trait => StmtKind::Trait(Box::new(self.traitdef()?)),
+            Tok::Impl => StmtKind::Impl(Box::new(self.impldef()?)),
             Tok::While => {
                 self.advance();
                 let cond = self.expr()?;
@@ -503,47 +483,25 @@ impl Parser {
         Ok(FuncDef { name, tparams, params, ret, body, is_lambda: false, span })
     }
 
-    fn classdef(&mut self) -> R<ClassDef> {
-        let span = self.expect(&Tok::Class, "`class`")?;
-        let (name, _) = self.name("class name")?;
+    fn structdef(&mut self) -> R<StructDef> {
+        let span = self.expect(&Tok::Struct, "`struct`")?;
+        let (name, _) = self.name("struct name")?;
         let tparams = self.type_params()?;
-        let mut traits = Vec::new();
-        if self.eat(&Tok::LParen) {
-            if !self.at(&Tok::RParen) {
-                if !self.at(&Tok::Impl) {
-                    return Err(Error::syntax(
-                        "classes cannot inherit; list implemented traits as `class C(impl T1, T2)`",
-                        self.span(),
-                    ));
-                }
-                self.advance();
-                loop {
-                    self.eat(&Tok::Impl);
-                    let (tname, tspan) = self.name("trait name")?;
-                    let mut targs = Vec::new();
-                    if self.eat(&Tok::Lt) {
-                        loop {
-                            targs.push(self.type_expr()?);
-                            if !self.eat(&Tok::Comma) {
-                                break;
-                            }
-                        }
-                        self.close_angle()?;
-                    }
-                    traits.push((tname, targs, tspan));
-                    if !self.eat(&Tok::Comma) || self.at(&Tok::RParen) {
-                        break;
-                    }
-                }
-            }
-            self.expect(&Tok::RParen, "`)`")?;
+        if self.at(&Tok::LParen) {
+            return Err(Error::syntax(
+                format!("structs cannot inherit or list traits; implement them with `impl Trait for {name}:`"),
+                self.span(),
+            ));
         }
-        self.expect(&Tok::Colon, "`:`")?;
         let mut fields = Vec::new();
-        let mut methods = Vec::new();
+        // `struct Marker`: no fields.
+        if !self.eat(&Tok::Colon) {
+            self.expect_line_end()?;
+            return Ok(StructDef { name, tparams, fields, span });
+        }
         self.expect(&Tok::Newline, "newline")?;
         if !self.eat(&Tok::Indent) {
-            return Err(self.unexpected("an indented class body"));
+            return Err(self.unexpected("an indented struct body"));
         }
         while !self.at(&Tok::Dedent) && !self.at(&Tok::Eof) {
             match self.peek().clone() {
@@ -551,20 +509,12 @@ impl Parser {
                     self.advance();
                 }
                 Tok::Def => {
-                    let f = self.funcdef()?;
-                    if f.body.is_none() {
-                        return Err(Error::syntax(
-                            "class methods need a body (`...` bodies are only allowed in traits)",
-                            f.span,
-                        ));
-                    }
-                    methods.push(f);
+                    return Err(Error::syntax(
+                        format!("a struct only declares fields; define methods in an `impl {name}:` block"),
+                        self.span(),
+                    ))
                 }
-                Tok::Pass => {
-                    self.advance();
-                    self.expect_line_end()?;
-                }
-                Tok::Str(_) => {
+                Tok::Pass | Tok::Str(_) => {
                     self.advance();
                     self.expect_line_end()?;
                 }
@@ -574,18 +524,64 @@ impl Parser {
                     let ty = self.type_expr()?;
                     if self.at(&Tok::Assign) {
                         return Err(Error::syntax(
-                            "fields cannot have default values; assign them in `__init__`",
+                            format!("fields cannot have default values; give every field in the literal `{name} {{ .. }}`"),
                             self.span(),
                         ));
                     }
                     self.expect_line_end()?;
                     fields.push(FieldDecl { name: n, ty, span: fspan });
                 }
-                _ => return Err(self.unexpected("a field declaration or method")),
+                _ => return Err(self.unexpected("a field declaration")),
             }
         }
         self.eat(&Tok::Dedent);
-        Ok(ClassDef { name, tparams, traits, fields, methods, span })
+        Ok(StructDef { name, tparams, fields, span })
+    }
+
+    /// `impl<T> Target:` or `impl<T> Trait<args> for Target:`, with an
+    /// optional body (`impl Exception for AppError` has none).
+    fn impldef(&mut self) -> R<ImplDef> {
+        let span = self.expect(&Tok::Impl, "`impl`")?;
+        let tparams = self.type_params()?;
+        let first = self.type_expr_with(false)?;
+        let (tr, target) = if self.eat(&Tok::For) {
+            let TypeExpr::Named(n, args, tspan) = first else {
+                return Err(Error::syntax("expected a trait name before `for`", first.span()));
+            };
+            (Some((n, args, tspan)), self.type_expr_with(false)?)
+        } else {
+            (None, first)
+        };
+        let mut methods = Vec::new();
+        if !self.eat(&Tok::Colon) {
+            self.expect_line_end()?;
+            return Ok(ImplDef { tparams, tr, target, methods, span });
+        }
+        self.expect(&Tok::Newline, "newline")?;
+        if !self.eat(&Tok::Indent) {
+            return Err(self.unexpected("an indented impl body"));
+        }
+        while !self.at(&Tok::Dedent) && !self.at(&Tok::Eof) {
+            match self.peek() {
+                Tok::Newline => {
+                    self.advance();
+                }
+                Tok::Def => {
+                    let f = self.funcdef()?;
+                    if f.body.is_none() {
+                        return Err(Error::syntax("methods in an `impl` need a body (`...` bodies are only allowed in traits)", f.span));
+                    }
+                    methods.push(f);
+                }
+                Tok::Pass | Tok::Str(_) => {
+                    self.advance();
+                    self.expect_line_end()?;
+                }
+                _ => return Err(self.unexpected("a method (`def`)")),
+            }
+        }
+        self.eat(&Tok::Dedent);
+        Ok(ImplDef { tparams, tr, target, methods, span })
     }
 
     fn traitdef(&mut self) -> R<TraitDef> {
@@ -679,7 +675,7 @@ impl Parser {
         loop {
             if self.at(&Tok::Plus) {
                 return Err(Error::syntax(
-                    "`+ local` was removed: as in Rust, a type is `Send` or not (a class is not `Send` when a field is not), and `any + Send` restricts an erased type to `Send` values",
+                    "`+ local` was removed: as in Rust, a type is `Send` or not (a struct is not `Send` when a field is not), and `any + Send` restricts an erased type to `Send` values",
                     self.span(),
                 ));
             }
@@ -976,9 +972,29 @@ impl Parser {
                 }
                 Tok::ColonColon => {
                     let span = self.advance().span;
-                    self.expect(&Tok::Lt, "`<` after `::` (type arguments: `f::<T>`)")?;
+                    if let Tok::Name(n) = self.peek().clone() {
+                        self.advance();
+                        e = Expr { kind: ExprKind::Path(Box::new(e), n), span };
+                        continue;
+                    }
+                    self.expect(&Tok::Lt, "`<` or a name after `::` (`f::<T>`, `Stack::new`)")?;
                     let args = self.angle_args()?;
                     e = Expr { kind: ExprKind::TypeApp(Box::new(e), args), span };
+                }
+                // `Name { .. }`: a struct literal.
+                Tok::LBrace if is_type_path(&e) => {
+                    let span = self.advance().span;
+                    let mut fields: Vec<(String, Expr, Span)> = Vec::new();
+                    while !self.at(&Tok::RBrace) {
+                        let (n, fspan) = self.name("field name")?;
+                        let v = if self.eat(&Tok::Colon) { self.expr()? } else { Expr { kind: ExprKind::Name(n.clone()), span: fspan } };
+                        fields.push((n, v, fspan));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RBrace, "`}`")?;
+                    e = Expr { kind: ExprKind::StructLit { ty: Box::new(e), fields }, span };
                 }
                 _ => return Ok(e),
             }
@@ -1078,6 +1094,17 @@ impl Parser {
     }
 }
 
+/// A name that may start a struct literal: `Name`, `m.Name` or
+/// `Name::<T>`.
+fn is_type_path(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Name(_) => true,
+        ExprKind::Attr(b, _) => matches!(b.kind, ExprKind::Name(_)),
+        ExprKind::TypeApp(b, _) => is_type_path(b),
+        _ => false,
+    }
+}
+
 fn is_ellipsis_body(b: &Block) -> bool {
     matches!(b.stmts.as_slice(), [Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Ellipsis, .. }), .. }])
 }
@@ -1100,18 +1127,22 @@ mod tests {
 trait Log:
     def log(self, msg: str) -> (): ...
 
-class Console(impl Log):
+struct Console
+
+impl Log for Console:
     def log(self, msg: str) -> ():
         print(msg)
 
-class Service(impl Log):
+struct Service:
     out: Console
     last: Option<str>
     count: int
-    def __init__(self, out: Console + keep) -> ():
-        self.out <- out
-        self.last <- None
-        self.count = 0
+
+impl Service:
+    def new(out: Console + keep) -> Self:
+        Service { out, last: None, count: 0 }
+
+impl Log for Service:
     def log(self, msg: str) -> ():
         self.out.log(msg)
         old <- self.last <- Some(msg++)
@@ -1135,8 +1166,10 @@ report = |n: int| {
     n
 }
 d: dict<str, list<int>>= {}
+s = Stack::<int>::new()
+p = Point { x: 1.0, y }
 "#;
         let m = parse(src).unwrap();
-        assert_eq!(m.body.stmts.len(), 7);
+        assert_eq!(m.body.stmts.len(), 12);
     }
 }
