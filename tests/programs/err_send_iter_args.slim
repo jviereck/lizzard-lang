@@ -1,0 +1,8 @@
+# `Iterator<T> + Send` needs a `Send` item type.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+def bags() -> Iterator<Bag> + Send:
+    yield Bag(1)

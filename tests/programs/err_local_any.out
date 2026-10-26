@@ -1,5 +1,0 @@
-  File "err_local_any.slim", line 11
-        print(show(Counter()))
-                          ^
-TypeError: `Counter` is local and cannot be used as `any`; use `any + Local`
-[exit 1]

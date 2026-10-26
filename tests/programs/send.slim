@@ -1,0 +1,124 @@
+# `Send`, as in Rust: a type is `Send` unless it holds something that is not.
+# `any`, `function`, `Iterator<T>` and trait types may hold values that are
+# not `Send`; `X + Send` restricts them to values that are.
+
+# `Send`: only an `int` field.
+class Counter:
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+    def inc(self) -> int:
+        self.n += 1
+        self.n
+
+# Not `Send`: an `any` field may hold anything.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+# Not `Send`: a field of a type that is not.
+class Holder:
+    b: Bag
+    def __init__(self, b: Bag + keep) -> ():
+        self.b <- b
+
+# `Send` exactly when `T` is.
+class Box<T>:
+    value: T
+    def __init__(self, value: T + keep) -> ():
+        self.value <- value
+
+trait Ticker:
+    def tick(self) -> int: ...
+
+class Clock(impl Ticker):
+    t: int
+    def __init__(self) -> ():
+        self.t = 0
+    def tick(self) -> int:
+        self.t += 10
+        self.t
+
+class BagClock(impl Ticker):
+    b: Bag
+    def __init__(self) -> ():
+        self.b <- Bag(1)
+    def tick(self) -> int:
+        1
+
+def show(x: any) -> str:
+    "got " + str(x)
+
+def tick_all(ts: list<Ticker>) -> int:
+    total = 0
+    for t in ts:
+        total += t.tick()
+    total
+
+def ticks() -> Iterator<int>:
+    b = Bag(0)
+    yield 1
+    yield 2
+
+def counts() -> Iterator<int> + Send:
+    c = Counter()
+    yield c.inc()
+    yield c.inc()
+
+def square(n: int) -> int:
+    n * n
+
+def bump(c: Counter + keep) -> int:
+    c.inc()
+
+def unbox(b: Box<Counter> + keep) -> int:
+    b.value.inc() + 10
+
+def total_len(xs: list<any + Send>) -> int:
+    len(xs)
+
+def run<T: Send>(f: function + Send, x: T + keep) -> Thread:
+    spawn(f, x)
+
+def make_bag() -> Bag:
+    Bag("made")
+
+def main() -> ():
+    b = Bag(5)
+    print(b.item, show(b))
+    h = Holder(Bag("x"))
+    print(h.b.item)
+    bb = Box(Bag(1))
+    print(bb.value.item)
+
+    # `Send` values cross threads.
+    print(spawn(bump, Counter()).join())
+    print(spawn(unbox, Box(Counter())).join())
+    xs: list<any + Send> = [1, "a", 2.5]
+    print(spawn(total_len, xs++).join())
+    double = |k: int| k * 2
+    print(spawn(double, 21).join())
+    print(run(square, 7).join())
+
+    # Erased types may hold values that are not `Send`.
+    print(tick_all([Clock(), BagClock()]))
+    peek = |k: int| k + len(str(b.item))
+    print(peek(100))
+    held: list<function> = [peek, double]
+    print(len(held))
+    for x in ticks():
+        print("tick", x)
+    for x in counts():
+        print("count", x)
+
+    # Statically unknown values are checked at runtime.
+    shared: list<any + Send> = []
+    mk = make_bag
+    try:
+        shared.append(mk())
+    except TypeError as e:
+        print("error:", e)
+    print(len(shared))
+
+main()

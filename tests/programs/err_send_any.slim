@@ -1,0 +1,13 @@
+# `any` may hold anything; `any + Send` only values that are `Send`.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+def keep_for_later(x: any + Send) -> str:
+    str(x)
+
+def main() -> ():
+    print(keep_for_later(Bag(1)))
+
+main()

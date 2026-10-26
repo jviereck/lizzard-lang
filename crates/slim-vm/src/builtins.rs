@@ -770,7 +770,7 @@ fn b_lock(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
 }
 
 fn b_channel(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
-    Ok(crate::threads::new_channel(rtype::intern(Ctor::Channel, &[rtype::any()])))
+    Ok(crate::threads::new_channel(rtype::intern(Ctor::Channel, &[rtype::any_send()])))
 }
 
 /// Calls a type value: `list<int>(xs)`, `dict<str, int>()`, `Channel<str>()`.
@@ -826,7 +826,7 @@ pub fn construct_type(th: &mut Thread, t: &'static RtType, args: &[Value]) -> VR
         Ctor::Channel if !t.is_bare() => {
             arity(th, 0)?;
             if t.arg(0).local {
-                return Err(th.raise("TypeError", format!("`{}`: channels connect threads and cannot carry local values", t.name)));
+                return Err(th.raise("TypeError", format!("`{}`: channel items must be `Send`, and `{}` is not", t.name, t.arg(0).name)));
             }
             Ok(crate::threads::new_channel(t.value()))
         }
@@ -905,9 +905,7 @@ const TRAITS: &[(&str, &[&str], &[&str], usize)] = &[
     ("Num", &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"], 0),
     ("Hash", &[], &[], 0),
     ("Len", &[], &["__len__"], 0),
-    // Locality markers: `impl Local` makes a class local; `Send` is the bound
-    // satisfied by every type that is not.
-    ("Local", &[], &[], 0),
+    // Automatic: every type that is not local (thread-confined) is `Send`.
     ("Send", &[], &[], 0),
 ];
 

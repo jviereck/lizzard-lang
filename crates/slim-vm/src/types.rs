@@ -136,7 +136,7 @@ pub fn value_type_name(v: Value) -> String {
 /// of type `container`.
 pub fn elem_error(th: &mut Thread, v: Value, elem: &RtType, container: &str) -> crate::interp::Raised {
     if rtype::has_shape(v, elem) && !rtype::local_ok(v, elem) {
-        return th.raise("TypeError", format!("cannot store local `{}` in `{container}`", value_type_name(v)));
+        return th.raise("TypeError", format!("cannot store `{}`, which is not `Send`, in `{container}`", value_type_name(v)));
     }
     th.raise("TypeError", format!("cannot store `{}` in `{container}`", value_type_name(v)))
 }

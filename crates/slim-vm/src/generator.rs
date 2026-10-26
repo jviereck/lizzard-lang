@@ -95,7 +95,8 @@ pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value>
         _ => unreachable!("generator of a non-function"),
     };
     let Some(Body::Function(func)) = f.body() else { unreachable!() };
-    // Only a generator declared `-> Iterator<T> + Local` may hold local values.
+    // A generator declared `-> Iterator<T> + Send` cannot hold values that
+    // are not `Send`.
     let mut ty = crate::rtype::iterator_of(item.value());
     if matches!(func.code.ret, crate::code::RetKind::Typed(crate::code::TypeDesc::Local(_))) {
         ty = crate::rtype::local_of(crate::rtype::as_type(ty).unwrap());
@@ -104,10 +105,11 @@ pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value>
         let held = regs.iter().zip(func.code.owned.iter()).find(|(v, owned)| **owned && v.is_local()).map(|(v, _)| *v);
         if held.is_some() || f.is_local() {
             let what = match held {
-                Some(v) => format!("holds local `{}`", crate::types::value_type_name(v)),
-                None => "captures local values".to_string(),
+                Some(v) => format!("holds `{}`, which is not `Send`", crate::types::value_type_name(v)),
+                None => "captures values that are not `Send`".to_string(),
             };
-            let msg = format!("generator `{}` {what}; declare it `-> {} + Local`", func.code.name, crate::rtype::name(ty));
+            let plain = crate::rtype::local_of(crate::rtype::as_type(ty).unwrap());
+            let msg = format!("generator `{}` is `{}` but {what}; declare it `-> {}`", func.code.name, crate::rtype::name(ty), crate::rtype::name(plain));
             for (v, owned) in regs.iter().zip(func.code.owned.iter()) {
                 if *owned {
                     v.decref();
@@ -232,7 +234,7 @@ fn resume_inner(th: &mut Thread, g: &Generator, sent: Value, throw: Option<Value
             let held = (!local).then(|| (0..regs.len()).find(|&i| func.code.owned[i] && regs[i].is_local())).flatten();
             if let Some(i) = held {
                 let msg = format!(
-                    "generator `{}` is not local and cannot keep local `{}` across a `yield`",
+                    "generator `{}` is `Send` and cannot keep `{}`, which is not, across a `yield`",
                     func.code.name,
                     crate::types::value_type_name(regs[i])
                 );

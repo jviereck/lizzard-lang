@@ -1,5 +1,5 @@
   File "err_send_bound.slim", line 7
         spawn(work, x)
                     ^
-TypeError: spawn(): argument 1 has type `T`, which may be local; add a `T: Send` bound
+TypeError: spawn(): argument 1 has type `T`, which may not be `Send`; add a `T: Send` bound
 [exit 1]

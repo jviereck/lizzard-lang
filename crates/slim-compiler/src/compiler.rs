@@ -75,7 +75,8 @@ impl Sig {
 }
 
 pub struct ClassInfo {
-    /// A native class whose instances are local to their thread.
+    /// The class is not `Send` (a native class over a non-`Send` Rust type,
+    /// or a class with a non-`Send` field): instances stay on their thread.
     pub local: bool,
     pub tparams: Vec<TParamSig>,
     pub fields: Vec<(String, Ty, TypeDesc)>,
@@ -105,11 +106,20 @@ const BUILTIN_TRAITS: &[(&str, usize, &[&str], &[&str])] = &[
     ("Num", 0, &["Ord"], &["__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"]),
     ("Hash", 0, &[], &[]),
     ("Len", 0, &[], &["__len__"]),
-    // `impl Local` makes a class local; `Send` (every type that is not local)
-    // is automatic and only used as a bound.
-    ("Local", 0, &[], &[]),
+    // Automatic, as in Rust: every type that is not local (thread-confined)
+    // is `Send`. Only used as a bound.
     ("Send", 0, &[], &[]),
 ];
+
+/// `d` (an erased type restricted to `Send`) as written: `any + Send`.
+fn send_name(d: &Ty) -> String {
+    let n = d.name();
+    if n.ends_with(" + Send") {
+        n
+    } else {
+        format!("{n} + Send")
+    }
+}
 
 /// Whether the bounds of a type parameter include `Send`.
 fn has_send(bounds: &[Ty]) -> bool {
@@ -163,13 +173,11 @@ impl ModInfo {
             }
             let mut bounds = Vec::new();
             for b in &tp.bounds {
-                if matches!(b, TypeExpr::Local(_)) || matches!(b, TypeExpr::Named(n, _, _) if n == "Local") {
-                    return Err(type_err(
-                        format!("`Local` cannot be a bound (a type parameter may always be local; `{}: Send` excludes local types)", tp.name),
-                        b.span(),
-                    ));
+                if matches!(b, TypeExpr::Named(n, _, _) if n == "Local") {
+                    return Err(type_err(format!("there is no `Local` trait: as in Rust, `{}: Send` is the bound for types that can cross threads", tp.name), b.span()));
                 }
-                let (ty, _) = self.resolve_scoped(b, scope)?;
+                // A trait used as a bound is a trait, not a value type.
+                let ty = self.resolve_scoped(b, scope)?.0.peel().clone();
                 if !matches!(ty, Ty::Trait(..)) {
                     return Err(type_err(format!("bound `{}` of `{}` is not a trait", ty.name(), tp.name), b.span()));
                 }
@@ -271,15 +279,34 @@ impl ModInfo {
         }
     }
 
-    /// Checks that the type arguments in `t` satisfy their bounds and that
-    /// dict keys are hashable.
+    /// Checks that the type arguments in `t` satisfy their bounds, that dict
+    /// keys are hashable, and that an erased type written `+ Send` has only
+    /// `Send` arguments (`Iterator<Counter> + Send` needs a `Send` `Counter`).
     fn check_wf(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>, span: Span) -> R<()> {
+        let args: &[Ty] = match t {
+            Ty::Iter(x) => std::slice::from_ref(&**x),
+            Ty::Trait(_, xs) => xs,
+            _ => &[],
+        };
+        if let Some(a) = args.iter().find(|a| self.is_local(a, &|n| !has_send(&pb(n)))) {
+            return Err(type_err(
+                match a {
+                    Ty::Param(n) => format!("`{} + Send` needs `{n}: Send`", t.name()),
+                    _ => format!("`{} + Send`: `{}` is not `Send`", t.name(), a.name()),
+                },
+                span,
+            ));
+        }
+        self.check_wf_parts(t, pb, span)
+    }
+
+    fn check_wf_parts(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>, span: Span) -> R<()> {
         match t {
-            Ty::Local(x) => self.check_wf(x, pb, span),
+            Ty::Local(x) => self.check_wf_parts(x, pb, span),
             Ty::Chan(x) if self.is_local(x, &|n| !has_send(&pb(n))) => Err(type_err(
                 match &**x {
-                    Ty::Param(n) => format!("`{}`: `{n}` may be local, and channels connect threads; add a `{n}: Send` bound", t.name()),
-                    _ => format!("`{}`: channels connect threads and cannot carry local values", t.name()),
+                    Ty::Param(n) => format!("`{}`: channel items must be `Send`, and `{n}` may not be; add a `{n}: Send` bound", t.name()),
+                    _ => format!("`{}`: channel items must be `Send`, and `{}` is not", t.name(), x.name()),
                 },
                 span,
             )),
@@ -315,11 +342,12 @@ impl ModInfo {
         }
     }
 
-    /// Whether values of type `t` may be local, as far as the static type
-    /// shows: a class implementing `Local` (or with a local field), a type
-    /// with a local argument, an erased type written `+ Local`, or a type
-    /// parameter for which `param_local` holds. Untyped values (`Unknown`)
-    /// are checked at runtime instead.
+    /// Whether values of type `t` may not be `Send` ("local": confined to
+    /// their thread), as far as the static type shows: a native class over a
+    /// non-`Send` Rust type, a class with such a field, a type with such an
+    /// argument, an erased type not written `+ Send`, or a type parameter for
+    /// which `param_local` holds. Untyped values (`Unknown`) are checked at
+    /// runtime instead.
     fn is_local(&self, t: &Ty, param_local: &dyn Fn(&str) -> bool) -> bool {
         let rec = |t: &Ty| self.is_local(t, param_local);
         match t {
@@ -366,25 +394,22 @@ pub fn compile_module(module: &Module, filename: &str) -> R<(Arc<Code>, Vec<Stri
     compile_module_with(module, filename, &[])
 }
 
-/// The static type of a native's parameter or result. A top-level `Any` or
-/// `Func` handle may hold a local value (`any + Local`): handles are `!Send`,
-/// so the Rust side cannot move them to another thread either. Inside a type
-/// argument the type matches the container's runtime type (`list<any>`).
-fn ntype_ty(t: &NType, classes: &HashMap<std::any::TypeId, String>, nested: bool) -> Ty {
-    let b = |t: &NType| Box::new(ntype_ty(t, classes, true));
+/// The static type of a native's parameter or result. `Any` and `Func` are
+/// `any` and `function`, which may hold values that are not `Send`: handles
+/// are `!Send`, so the Rust side cannot move them to another thread either.
+fn ntype_ty(t: &NType, classes: &HashMap<std::any::TypeId, String>) -> Ty {
+    let b = |t: &NType| Box::new(ntype_ty(t, classes));
     match t {
         NType::Int => Ty::Int,
         NType::Float => Ty::Float,
         NType::Bool => Ty::Bool,
         NType::Str => Ty::Str,
         NType::Unit => Ty::Unit,
-        NType::Any if nested => Ty::Any,
         NType::Any => Ty::Local(Box::new(Ty::Any)),
-        NType::Function if nested => Ty::Func,
         NType::Function => Ty::Local(Box::new(Ty::Func)),
         NType::List(x) => Ty::List(b(x)),
         NType::Dict(k, v) => Ty::Dict(b(k), b(v)),
-        NType::Option(x) => Ty::Option(Box::new(ntype_ty(x, classes, nested))),
+        NType::Option(x) => Ty::Option(b(x)),
         NType::Array(e) => Ty::Array(Some(*e)),
         NType::Class(id) => classes.get(id).map(|n| Ty::Instance(n.clone(), Vec::new())).unwrap_or(Ty::Unknown),
     }
@@ -395,9 +420,9 @@ fn native_sig(f: &FnSpec, classes: &HashMap<std::any::TypeId, String>) -> Sig {
         .params
         .iter()
         .enumerate()
-        .map(|(i, t)| ParamSig { name: format!("#{}", i + 1), keep: false, ty: ntype_ty(t, classes, false) })
+        .map(|(i, t)| ParamSig { name: format!("#{}", i + 1), keep: false, ty: ntype_ty(t, classes) })
         .collect();
-    Sig { tparams: Vec::new(), params, ret: ntype_ty(&f.ret, classes, false) }
+    Sig { tparams: Vec::new(), params, ret: ntype_ty(&f.ret, classes) }
 }
 
 /// Compiles a module that may import the native modules `natives`.
@@ -548,7 +573,13 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 let mut impls: Vec<(String, Vec<Ty>)> = Vec::new();
                 for (tname, targs, tspan) in &c.traits {
                     if tname == "Send" {
-                        return Err(type_err("`Send` is automatic: every type that is not local implements it", *tspan));
+                        return Err(type_err("`Send` is automatic: a class is `Send` when all of its fields are", *tspan));
+                    }
+                    if tname == "Local" {
+                        return Err(type_err(
+                            "there is no `Local` trait: as in Rust, a class is `Send` unless a field is not (e.g. an `any` field)",
+                            *tspan,
+                        ));
                     }
                     let arity = match (info.traits.get(tname), builtin_trait(tname)) {
                         (Some(t), _) => t.tparams.len(),
@@ -597,17 +628,16 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             _ => {}
         }
     }
-    // Locality: a class implementing `Local` is local, and so is a class with
-    // a field of local type (to a fixpoint: fields may name later classes).
-    // Within the class, its own type parameters count as non-local: the type
-    // arguments decide (`Box<Counter>` is local when `Counter` is).
+    // `Send`, as in Rust: a class is not `Send` (it is local) when a field
+    // type is not (to a fixpoint: fields may name later classes). Native
+    // classes over non-`Send` Rust types are the roots. Within the class, its
+    // own type parameters count as `Send`: the type arguments decide
+    // (`Box<Counter>` is not `Send` when `Counter` is not).
     loop {
         let found: Vec<String> = info
             .classes
             .iter()
-            .filter(|(_, ci)| {
-                !ci.local && (ci.impls.iter().any(|(t, _)| t == "Local") || ci.fields.iter().any(|(_, t, _)| info.is_local(t, &|_| false)))
-            })
+            .filter(|(_, ci)| !ci.local && ci.fields.iter().any(|(_, t, _)| info.is_local(t, &|_| false)))
             .map(|(n, _)| n.clone())
             .collect();
         if found.is_empty() {
@@ -854,8 +884,8 @@ struct FnCtx<'m> {
     yield_tys: Vec<Ty>,
     /// The declared item type of this generator (`-> Iterator<T>`).
     yield_decl: Option<Ty>,
-    /// This generator may hold local values (`-> Iterator<T> + Local`, or a
-    /// local item type).
+    /// This generator may hold values that are not `Send` (it is not
+    /// declared `-> Iterator<T> + Send`).
     gen_local: bool,
     /// Type parameters in scope, with the registers holding their types.
     tscope: Vec<TPar>,
@@ -930,11 +960,12 @@ impl<'m> FnCtx<'m> {
                 Some(t) => t,
                 None => {
                     let tys = std::mem::take(&mut self.yield_tys);
+                    let any = Ty::Local(Box::new(Ty::Any));
                     if tys.contains(&Ty::Unknown) {
-                        Ty::Any
+                        any
                     } else {
                         match join_all(tys) {
-                            Ty::NoneT => Ty::Option(Box::new(Ty::Any)),
+                            Ty::NoneT => Ty::Option(Box::new(any)),
                             t => t,
                         }
                     }
@@ -1093,7 +1124,8 @@ impl<'m> FnCtx<'m> {
 
     /// Whether a value of static type `v` may be used where `d` is expected
     /// (trait types are checked against the traits `v` implements, and a
-    /// non-local erased type does not take a value that may be local).
+    /// `Send`-restricted erased type does not take a value that may not be
+    /// `Send`).
     fn compatible(&self, d: &Ty, v: &Ty) -> bool {
         self.local_mismatch(d, v).is_none() && self.shape_compatible(d, v)
     }
@@ -1108,24 +1140,24 @@ impl<'m> FnCtx<'m> {
         }
     }
 
-    /// Whether values of static type `t` may be local (an unbounded type
-    /// parameter may be; `T: Send` excludes it).
+    /// Whether values of static type `t` may not be `Send` (an unbounded
+    /// type parameter may not be; `T: Send` excludes it).
     fn may_be_local(&self, t: &Ty) -> bool {
         self.m.is_local(t, &|n| !has_send(&self.pbounds(n)))
     }
 
     /// Why a value of type `v` cannot go where `d` is expected for reasons of
-    /// locality: `d` is (or contains, through `Option` and tuples) an erased
-    /// type that is not local, and `v` may be local.
+    /// `Send`: `d` is (or contains, through `Option` and tuples) an erased
+    /// type written `+ Send`, and `v` may not be `Send`.
     fn local_mismatch(&self, d: &Ty, v: &Ty) -> Option<String> {
         match (d, v) {
             (Ty::Option(a), Ty::Option(b)) => self.local_mismatch(a, b),
             (Ty::Option(a), b) => self.local_mismatch(a, b),
             (Ty::Tuple(Some(xs)), Ty::Tuple(Some(ys))) => xs.iter().zip(ys).find_map(|(x, y)| self.local_mismatch(x, y)),
             (Ty::Any | Ty::Func | Ty::Iter(_) | Ty::Trait(..), _) if !self.may_be_local(d) && self.may_be_local(v) => Some(match v {
-                Ty::Param(n) => format!("`{n}` may be local and cannot be used as `{}`; add a `{n}: Send` bound or use `{} + Local`", d.name(), d.name()),
-                Ty::Local(_) => format!("a `{}` may hold local values and cannot be used as `{}`", v.name(), d.name()),
-                _ => format!("`{}` is local and cannot be used as `{}`; use `{} + Local`", v.name(), d.name(), d.name()),
+                Ty::Param(n) => format!("`{n}` may not be `Send` and cannot be used as `{}`; add a `{n}: Send` bound", send_name(d)),
+                Ty::Local(_) => format!("a `{}` may hold values that are not `Send` and cannot be used as `{}`", v.name(), send_name(d)),
+                _ => format!("`{}` is not `Send` and cannot be used as `{}`", v.name(), send_name(d)),
             }),
             _ => None,
         }
@@ -1164,7 +1196,7 @@ impl<'m> FnCtx<'m> {
                 None => Err(type_err(format!("iterating over `{n}` requires a bound `{n}: Iterable<...>`"), span)),
             },
             Ty::Instance(..) | Ty::Trait(..) => {
-                Ok(self.trait_args_of(t, "Iterable").and_then(|a| a.into_iter().next()).map(|t| if t == Ty::Any { Ty::Unknown } else { t }).unwrap_or(Ty::Unknown))
+                Ok(self.trait_args_of(t, "Iterable").and_then(|a| a.into_iter().next()).map(|t| t.as_value()).unwrap_or(Ty::Unknown))
             }
             _ => Ok(t.item()),
         }
@@ -1452,7 +1484,7 @@ impl<'m> FnCtx<'m> {
                 let (ty, d) = self.resolve_type(ann)?;
                 if self.is_module && self.may_be_local(&ty) {
                     return Err(type_err(
-                        format!("module variable `{n}` cannot have the local type `{}` (module variables are shared between threads)", ty.name()),
+                        format!("module variable `{n}` cannot have type `{}`, which is not `Send` (module variables are shared between threads)", ty.name()),
                         ann.span(),
                     ));
                 }
@@ -2139,7 +2171,7 @@ impl<'m> FnCtx<'m> {
             return Err(type_err(format!("cannot infer the type of `{lit}`; annotate it (e.g. `{example}`)"), span));
         }
         if items.iter().any(|(t, _)| *t == Ty::Unknown) {
-            return Ok(Ty::Any);
+            return Ok(Ty::Local(Box::new(Ty::Any)));
         }
         match join_all(items.iter().map(|(t, _)| t.clone()).collect()) {
             Ty::Unknown => {
@@ -2974,7 +3006,7 @@ impl<'m> FnCtx<'m> {
         if self.is_module || (!self.locals.contains_key(n) && self.global_decls.contains(n)) {
             if self.may_be_local(&v.ty) {
                 return Err(type_err(
-                    format!("cannot store local `{}` in module variable `{n}` (module variables are shared between threads)", v.ty.name()),
+                    format!("cannot store `{}`, which is not `Send`, in module variable `{n}` (module variables are shared between threads)", v.ty.name()),
                     span,
                 ));
             }
@@ -3095,8 +3127,8 @@ impl<'m> FnCtx<'m> {
                 ));
             }
         }
-        // A move-type value may be a local object (which the VM must reject
-        // from a non-local list), so only scalars and strings are proven.
+        // Containers are invariant and `Send` is part of the type, so an exact
+        // static match proves the store.
         Ok(matches!(container, Ty::List(_)) && elem == v.ty && elem.is_precise())
     }
 
@@ -3402,15 +3434,15 @@ impl<'m> FnCtx<'m> {
     }
 
     /// Builtins that need a bound on type-parameter arguments.
-    /// `spawn(f, args...)`: nothing that may be local crosses to the new
-    /// thread, and `f`'s result (which `join` hands back) is not local.
+    /// `spawn(f, args...)`: everything that crosses to the new thread is
+    /// `Send`, including `f`'s result (which `join` hands back).
     fn check_spawn(&self, args: &[Expr], arg_tys: &[Ty]) -> R<()> {
         for (i, (a, t)) in args.iter().zip(arg_tys).enumerate() {
             if self.may_be_local(t) {
                 let what = if i == 0 { "the function".to_string() } else { format!("argument {i}") };
                 let msg = match t {
-                    Ty::Param(n) => format!("spawn(): {what} has type `{n}`, which may be local; add a `{n}: Send` bound"),
-                    _ => format!("spawn(): {what} is local (`{}`) and cannot be sent to another thread", t.name()),
+                    Ty::Param(n) => format!("spawn(): {what} has type `{n}`, which may not be `Send`; add a `{n}: Send` bound"),
+                    _ => format!("spawn(): {what} is not `Send` (`{}`) and cannot be sent to another thread", t.name()),
                 };
                 return Err(type_err(msg, a.span));
             }
@@ -3419,7 +3451,7 @@ impl<'m> FnCtx<'m> {
             // The callee's own type parameters are bound by the arguments.
             if self.m.is_local(&sig.ret, &|_| false) {
                 return Err(type_err(
-                    format!("spawn(): `{}` returns local `{}`, which cannot leave its thread", callee_name(&args[0]), sig.ret.name()),
+                    format!("spawn(): `{}` returns `{}`, which is not `Send` and cannot leave its thread", callee_name(&args[0]), sig.ret.name()),
                     args[0].span,
                 ));
             }
@@ -4025,9 +4057,9 @@ impl<'m> FnCtx<'m> {
         self.bind(&f.name, r, f.span)
     }
 
-    /// A generator that is not local may be resumed on another thread, so it
-    /// cannot hold a value that may be local (a live variable or a capture)
-    /// across a `yield`.
+    /// A generator declared `-> Iterator<T> + Send` may be resumed on another
+    /// thread, so it cannot hold a value that may not be `Send` (a live
+    /// variable or a capture) across a `yield`.
     fn check_held(&self, span: Span) -> R<()> {
         if self.gen_local {
             return Ok(());
@@ -4043,18 +4075,19 @@ impl<'m> FnCtx<'m> {
             .collect();
         held.sort_by(|a, b| a.0.cmp(b.0));
         let Some((n, t)) = held.first() else { return Ok(()) };
-        let decl = match self.ret_ty.peel() {
-            Ty::Unknown => "Iterator<T>".to_string(),
-            t => t.name(),
-        };
         Err(type_err(
-            format!("generator `{}` holds local `{}` (`{n}`) across a `yield`; declare it `-> {decl} + Local`", self.name, t.name()),
+            format!(
+                "generator `{}` is declared `Send` but holds `{}` (`{n}`), which is not `Send`, across a `yield`; declare it `-> {}`",
+                self.name,
+                t.name(),
+                self.ret_ty.name()
+            ),
             span,
         ))
     }
 
-    /// `function`, or `function + Local` for a closure or bound method that
-    /// holds a value that may be local.
+    /// `function + Send`, or `function` for a closure or bound method that
+    /// holds a value that may not be `Send`.
     fn func_ty(&self, local: bool) -> Ty {
         if local {
             Ty::Local(Box::new(Ty::Func))
@@ -4064,7 +4097,8 @@ impl<'m> FnCtx<'m> {
     }
 
     /// Compiles a nested function or lambda; captured locals move into it.
-    /// Returns its type (`function + Local` if it captures a local value).
+    /// Returns its type (`function` if it captures a value that may not be
+    /// `Send`, else `function + Send`).
     fn make_closure(&mut self, f: &FuncDef, dst: Reg) -> R<Ty> {
         let body = f.body.as_ref().unwrap();
         let mut used = HashSet::new();
@@ -4199,7 +4233,7 @@ fn join_all(tys: Vec<Ty>) -> Ty {
 }
 
 fn ty_compatible(d: &Ty, v: &Ty) -> bool {
-    // `X + Local` holds an `X`; whether a value may be local is checked by
+    // `X` holds an `X + Send`; whether a value may not be `Send` is checked by
     // `FnCtx::compatible`.
     if matches!(d, Ty::Local(_)) || matches!(v, Ty::Local(_)) {
         return ty_compatible(d.peel(), v.peel());
@@ -4400,7 +4434,10 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     for (tp, sig) in f.tparams.iter().zip(&sigs) {
         let mut descs = Vec::new();
         for b in &tp.bounds {
-            descs.push(ctx.resolve_type(b)?.1);
+            descs.push(match ctx.resolve_type(b)?.1 {
+                TypeDesc::Local(d) => *d,
+                d => d,
+            });
         }
         ctx.tscope.iter_mut().find(|t| t.name == tp.name).unwrap().bounds = sig.bounds.clone();
         ctx.code_tparams.push(TypeParamInfo { name: tp.name.clone(), bounds: descs });
@@ -4411,7 +4448,8 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         let (ty, desc) = match (&p.ty, is_self) {
             (_, true) => match owner {
                 Owner::Class(c) => (Ty::Instance(c.to_string(), self_ty(&owner_tps)), None),
-                Owner::Trait(t) => (Ty::Trait(t.to_string(), self_ty(&owner_tps)), None),
+                // Any implementing class, `Send` or not.
+                Owner::Trait(t) => (Ty::Local(Box::new(Ty::Trait(t.to_string(), self_ty(&owner_tps)))), None),
                 Owner::None => (Ty::Unknown, None),
             },
             (Some(t), _) => {
@@ -4464,7 +4502,9 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         None => (RetKind::Any, Ty::Unknown),
     };
     if ctx.is_generator {
-        ctx.gen_local = ctx.may_be_local(&ret_ty);
+        // Unless declared `-> Iterator<T> + Send`, a generator may hold
+        // values that are not `Send`.
+        ctx.gen_local = ret_ty == Ty::Unknown || ctx.may_be_local(&ret_ty);
         match ret_ty.peel() {
             Ty::Iter(t) => ctx.yield_decl = (**t != Ty::Unknown).then(|| (**t).clone()),
             Ty::Unknown => {}

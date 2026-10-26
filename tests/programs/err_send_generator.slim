@@ -1,0 +1,14 @@
+# A generator declared `+ Send` may be resumed on another thread, so it
+# cannot hold a value that is not `Send` across a `yield`.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+def ticks() -> Iterator<int> + Send:
+    b = Bag(1)
+    yield 1
+    yield 2
+
+for t in ticks():
+    print(t)

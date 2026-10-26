@@ -1,5 +1,0 @@
-  File "err_local_global.slim", line 8
-    counter = Counter()
-    ^
-TypeError: cannot store local `Counter` in module variable `counter` (module variables are shared between threads)
-[exit 1]

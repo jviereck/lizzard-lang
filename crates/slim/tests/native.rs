@@ -100,7 +100,7 @@ fn runtime() -> (Runtime, Log) {
             c.locked();
         });
         // Not Send: local to its thread.
-        m.class_local::<Cell>("Cell", |c| {
+        m.class_not_send::<Cell>("Cell", |c| {
             c.init(|v: i64| Cell(std::rc::Rc::new(std::cell::Cell::new(v))));
             c.method("get", |c: &Cell| c.0.get());
             c.method("set", |c: &Cell, v: i64| c.0.set(v));
@@ -288,8 +288,9 @@ log(str(a.get()))
 "#);
     assert_eq!(l, ["1200"]);
 
-    // Not Send: the class implements `Local`, so instances never leave their
-    // thread. `Any`/`Func` handles may hold local values.
+    // Not Send: a binding over a non-`Send` Rust type is a non-`Send` slim
+    // class, so instances never leave their thread. `Any`/`Func` handles are
+    // `any`/`function`, which may hold values that are not `Send`.
     let l = ok(r#"
 from util import log, apply
 from geom import Cell
@@ -304,7 +305,7 @@ main()
 "#);
     assert_eq!(l, ["2", "5", "12"]);
     let e = err("from geom import Cell\ndef show(x: Cell) -> int:\n    x.get()\ndef main() -> ():\n    spawn(show, Cell(1))\nmain()\n");
-    assert!(e.contains("spawn(): argument 1 is local (`geom.Cell`) and cannot be sent to another thread"), "{e}");
+    assert!(e.contains("spawn(): argument 1 is not `Send` (`geom.Cell`) and cannot be sent to another thread"), "{e}");
     let e = err("from geom import Cell\nshared = Cell(1)\n");
-    assert!(e.contains("cannot store local `geom.Cell` in module variable `shared`"), "{e}");
+    assert!(e.contains("cannot store `geom.Cell`, which is not `Send`, in module variable `shared`"), "{e}");
 }

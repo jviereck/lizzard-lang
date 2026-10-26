@@ -130,8 +130,8 @@ pub struct Class {
     /// Type arguments of generic implemented traits (`impl Iterable<T>`).
     pub trait_args: Vec<(Value, Vec<TypeDesc>)>,
     pub is_exception: bool,
-    /// The class implements `Local` (or has a field of local type), so every
-    /// instance is local.
+    /// The class is not `Send` (a field's type is not), so every instance is
+    /// local to its thread.
     pub always_local: bool,
     /// The type of instances of a non-generic class.
     pub canonical: std::sync::OnceLock<Value>,

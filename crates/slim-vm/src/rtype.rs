@@ -54,13 +54,14 @@ pub struct RtType {
     /// container type, which stands for any container of that kind.
     pub args: Box<[Value]>,
     pub name: String,
-    /// Values of this type may be confined to the thread that created them:
-    /// a class implementing `Local` (or with a local field), a type with a
-    /// local type argument, or an erased type written `+ Local`.
+    /// The type is not `Send`: its values are local (confined to the thread
+    /// that created them). True for native classes over non-`Send` Rust
+    /// types, classes with a non-`Send` field, types with a non-`Send`
+    /// argument, and erased types not written `+ Send`.
     pub local: bool,
     /// The type's own value (set when it is interned).
     this: OnceLock<Value>,
-    /// The same type without an explicit `+ Local` (erased types only).
+    /// The `+ Send` version of an erased type (`any + Send` for `any`).
     base: OnceLock<Value>,
     list_of: OnceLock<Value>,
     option_of: OnceLock<Value>,
@@ -112,14 +113,15 @@ fn implied_local(ctor: Ctor, args: &[Value]) -> bool {
         })
 }
 
-/// Types that do not show what their values hold: only these can be made
-/// local explicitly (`any + Local`); other types are local by their parts.
+/// Types that do not show what their values hold. As annotations they may
+/// hold values that are not `Send` (local values) unless written `+ Send`;
+/// other types are local by their parts.
 pub fn erased(c: Ctor) -> bool {
     matches!(c, Ctor::Any | Ctor::Function | Ctor::Iterator | Ctor::Trait(_))
 }
 
-/// `ctor<args>`, local if implied by its parts, or if `explicit` (`+ Local`)
-/// on an erased type.
+/// `ctor<args>`, local if implied by its parts, or if `explicit` on an
+/// erased type (`any` as opposed to `any + Send`).
 pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
     let implied = can_be_local(ctor) && implied_local(ctor, args);
     let explicit = explicit && erased(ctor);
@@ -135,7 +137,7 @@ pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
     let v = Obj::alloc_immortal(Body::Type(RtType {
         ctor,
         args: args.into(),
-        name: type_name(ctor, args, local && !implied),
+        name: type_name(ctor, args, erased(ctor) && !local),
         local,
         this: OnceLock::new(),
         base: OnceLock::new(),
@@ -148,23 +150,26 @@ pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
     v
 }
 
-/// `t + Local` for an erased type; `t` itself for any other type.
+/// The version of an erased type that may hold local values (`any` for
+/// `any + Send`); `t` itself for any other type.
 pub fn local_of(t: &RtType) -> Value {
     intern_with(t.ctor, &t.args, true)
 }
 
-/// `t` without an explicit `+ Local`.
+/// An erased type restricted to `Send` values (`any + Send` for `any`).
 fn base(t: &RtType) -> &'static RtType {
     let v = *t.base.get_or_init(|| if t.local && erased(t.ctor) { intern_with(t.ctor, &t.args, false) } else { t.value() });
     as_type(v).unwrap()
 }
 
-fn type_name(ctor: Ctor, args: &[Value], show_local: bool) -> String {
+/// `show_send`: an erased type restricted to `Send` values (`any + Send`).
+/// Traits are shown plainly (their type values are also used as bounds).
+fn type_name(ctor: Ctor, args: &[Value], show_send: bool) -> String {
     let n = type_name_plain(ctor, args);
-    if !show_local {
+    if !show_send || matches!(ctor, Ctor::Trait(_)) {
         return n;
     }
-    format!("{n} + Local")
+    format!("{n} + Send")
 }
 
 fn type_name_plain(ctor: Ctor, args: &[Value]) -> String {
@@ -259,7 +264,6 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
     let parts = || !t.is_bare() && t.args.iter().all(|a| satisfies(as_type(*a).unwrap(), tr));
     match trait_.name.as_str() {
         "Send" => !t.local,
-        "Local" => t.local,
         "Ord" => match t.ctor {
             Ctor::Int | Ctor::Float | Ctor::BigInt | Ctor::Bool | Ctor::Str => true,
             Ctor::Tuple => parts(),
@@ -354,8 +358,14 @@ macro_rules! cached_prims {
     };
 }
 
+/// `any`: any value except `None`, possibly not `Send`.
+pub fn any() -> Value {
+    static V: OnceLock<Value> = OnceLock::new();
+    *V.get_or_init(|| local_of(as_type(any_send()).unwrap()))
+}
+
 cached_prims! {
-    any => Ctor::Any,
+    any_send => Ctor::Any,
     int => Ctor::Int,
     float => Ctor::Float,
     bool_ => Ctor::Bool,
@@ -533,14 +543,15 @@ pub fn has_shape(v: Value, t: &RtType) -> bool {
     }
 }
 
-/// The type of a value, `a`, is `t`; `X + Local` also accepts an `X`.
+/// The type of a value, `a`, is `t`; an erased `X` also accepts an
+/// `X + Send`.
 #[inline]
 fn same(a: Value, t: &RtType) -> bool {
     as_type(a).is_some_and(|a| std::ptr::eq(a, t) || (t.local && std::ptr::eq(base(a), base(t))))
 }
 
-/// Locality allows `v` where `t` is expected: a non-local erased type
-/// (`any`, `function`, `Iterator<T>`, a trait) does not accept a local value.
+/// Locality allows `v` where `t` is expected: an erased type restricted to
+/// `Send` values (`any + Send`) does not accept a local value.
 /// (Other types are local exactly when their values are.)
 #[inline]
 pub fn local_ok(v: Value, t: &RtType) -> bool {

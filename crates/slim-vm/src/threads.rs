@@ -113,7 +113,7 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     // Local values never leave their thread.
     if let Some((i, v)) = std::iter::once(&f).chain(&fargs).enumerate().find(|(_, v)| v.is_local()) {
         let what = if i == 0 { "the function".to_string() } else { format!("argument {i}") };
-        let msg = format!("spawn(): {what} is local (`{}`) and cannot be sent to another thread", types::value_type_name(*v));
+        let msg = format!("spawn(): {what} is not `Send` (`{}`) and cannot be sent to another thread", types::value_type_name(*v));
         fargs.iter().for_each(|v| v.decref());
         return Err(th.raise("TypeError", msg));
     }
@@ -156,7 +156,7 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         };
         if leaving.is_local() {
             let what = if outcome.is_ok() { "result" } else { "exception" };
-            let msg = format!("the thread's {what} is local (`{}`) and cannot leave its thread", types::value_type_name(leaving));
+            let msg = format!("the thread's {what} is not `Send` (`{}`) and cannot leave its thread", types::value_type_name(leaving));
             leaving.decref();
             let _ = t.raise("TypeError", msg);
             let e = t.exc.take().expect("raised");

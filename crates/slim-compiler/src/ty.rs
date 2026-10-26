@@ -13,8 +13,8 @@ use slim_vm::code::{Ctor, TypeDesc};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ty {
     Unknown,
-    /// A declared `any` (`x: any`, `list<any>`): any non-local value. A
-    /// value read from such a slot is untyped (`Unknown`).
+    /// `any + Send` (a declared `any` is `Local(Any)`). A value read from
+    /// such a slot is untyped (`Unknown`).
     Any,
     Int,
     Float,
@@ -53,9 +53,11 @@ pub enum Ty {
     Array(Option<Elem>),
     /// A type used as a value (`list::<int>`); calling it builds that type.
     TypeVal(Box<Ty>),
-    /// `T + Local`: an erased type (`any`, `function`, `Iterator<T>`, a
-    /// trait) whose values may be local. Other types are local by what they
-    /// are (a class implementing `Local`, a container of local values).
+    /// An erased type (`any`, `function`, `Iterator<T>`, a trait) that may
+    /// hold values that are not `Send` ("local" values, confined to their
+    /// thread): what those annotations mean unless written `X + Send`, which
+    /// is the unwrapped type. Other types are `Send` or not by what they
+    /// contain.
     Local(Box<Ty>),
 }
 
@@ -70,15 +72,12 @@ pub fn elem_ty(e: Elem) -> Ty {
 
 /// A type argument as the static type of a value read from a container.
 fn read_ty(t: &Ty) -> Ty {
-    match t {
-        Ty::Any => Ty::Unknown,
-        t => t.clone(),
-    }
+    t.as_value()
 }
 
 impl Ty {
     /// The static type of a value read from a slot declared with this type:
-    /// a declared `any` holds untyped values.
+    /// a declared `any` (or `any + Send`) holds untyped values.
     pub fn as_value(&self) -> Ty {
         match self {
             Ty::Any => Ty::Unknown,
@@ -87,7 +86,7 @@ impl Ty {
         }
     }
 
-    /// The type without a top-level `+ Local`.
+    /// The type without the top-level "may be non-`Send`" wrapper.
     pub fn peel(&self) -> &Ty {
         match self {
             Ty::Local(t) => t,
@@ -222,7 +221,7 @@ impl Ty {
         };
         match self {
             Ty::Unknown => "?".into(),
-            Ty::Any => "any".into(),
+            Ty::Any => "any + Send".into(),
             Ty::Int => "int".into(),
             Ty::Float => "float".into(),
             Ty::Bool => "bool".into(),
@@ -234,7 +233,8 @@ impl Ty {
             Ty::Tuple(Some(ts)) => args("tuple", &ts.iter().collect::<Vec<_>>()),
             Ty::List(t) => args("list", &[t]),
             Ty::Dict(k, v) => args("dict", &[k, v]),
-            Ty::Func | Ty::StaticFn => "function".into(),
+            Ty::Func => "function + Send".into(),
+            Ty::StaticFn => "function".into(),
             Ty::Iter(t) => args("Iterator", &[t]),
             Ty::Chan(t) => args("Channel", &[t]),
             Ty::Instance(c, a) | Ty::Trait(c, a) if !a.is_empty() => args(c, &a.iter().collect::<Vec<_>>()),
@@ -244,8 +244,14 @@ impl Ty {
             Ty::Array(None) => "array".into(),
             Ty::Array(Some(e)) => format!("array<{}>", e.name()),
             Ty::TypeVal(t) => format!("type {}", t.name()),
-            Ty::Local(t) if **t == Ty::Unknown => "any + Local".into(),
-            Ty::Local(t) => format!("{} + Local", t.name()),
+            // Erased types are shown as written: `any`, and `any + Send` for
+            // the unwrapped type (`Iterator<T>` and traits are shown plainly
+            // either way, since their arguments may make them non-`Send`).
+            Ty::Local(t) => match &**t {
+                Ty::Unknown | Ty::Any => "any".into(),
+                Ty::Func => "function".into(),
+                t => t.name(),
+            },
         }
     }
 }
@@ -262,27 +268,42 @@ pub enum TypeName {
 
 /// Converts an annotation into a static type and a runtime descriptor.
 /// `lookup` resolves user class/trait names to their global slot.
+///
+/// As in Rust's `dyn Trait`, the erased types `any`, `function`,
+/// `Iterator<T>` and trait types may hold values that are not `Send`
+/// (`Ty::Local`); `X + Send` restricts them to `Send` values.
 pub fn resolve(
+    t: &TypeExpr,
+    lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
+) -> Result<(Ty, TypeDesc), String> {
+    if let TypeExpr::Send(inner) = t {
+        return match resolve(inner, lookup)? {
+            (Ty::Local(ty), TypeDesc::Local(d)) => Ok((*ty, *d)),
+            (Ty::Instance(c, _), _) => {
+                Err(format!("`+ Send` only applies to `any`, `function`, `Iterator<T>` and traits; `{c}` is `Send` exactly when its fields are"))
+            }
+            (ty @ (Ty::List(_) | Ty::Dict(..) | Ty::Tuple(_) | Ty::Option(_) | Ty::Chan(_)), _) => Err(format!(
+                "`+ Send` only applies to `any`, `function`, `Iterator<T>` and traits; `{}` is `Send` when its contents are",
+                ty.name()
+            )),
+            (ty, _) => Err(format!("`+ Send` only applies to `any`, `function`, `Iterator<T>` and traits; `{}` is always `Send`", ty.name())),
+        };
+    }
+    let (ty, d) = resolve_plain(t, lookup)?;
+    Ok(match ty {
+        Ty::Any | Ty::Func | Ty::Iter(_) | Ty::Trait(..) => (Ty::Local(Box::new(ty)), TypeDesc::Local(Box::new(d))),
+        ty => (ty, d),
+    })
+}
+
+/// `resolve` without the "may be non-`Send`" wrapper on erased types.
+fn resolve_plain(
     t: &TypeExpr,
     lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
 ) -> Result<(Ty, TypeDesc), String> {
     match t {
         TypeExpr::Unit(_) => Ok((Ty::Unit, TypeDesc::prim(Ctor::Unit))),
-        TypeExpr::Local(inner) => {
-            let (ty, d) = resolve(inner, lookup)?;
-            match &ty {
-                Ty::Any | Ty::Func | Ty::Iter(_) | Ty::Trait(..) => Ok((Ty::Local(Box::new(ty)), TypeDesc::Local(Box::new(d)))),
-                Ty::Instance(c, _) => Err(format!(
-                    "`+ Local` only applies to `any`, `function`, `Iterator<T>` and traits; a class is local by implementing `Local` (`class {c}(impl Local)`)"
-                )),
-                Ty::List(_) | Ty::Dict(..) | Ty::Tuple(_) | Ty::Option(_) => Err(format!(
-                    "`+ Local` only applies to `any`, `function`, `Iterator<T>` and traits; `{}` is local when its contents are",
-                    ty.name()
-                )),
-                Ty::Chan(_) => Err("channels connect threads and cannot be local".into()),
-                other => Err(format!("`{}` values cannot be local (only objects that hold references can)", other.name())),
-            }
-        }
+        TypeExpr::Send(_) => unreachable!("handled by `resolve`"),
         TypeExpr::Named(n, args, _) => {
             let arg = |i: usize| resolve(&args[i], lookup);
             let no_args = |ty: Ty, c: Ctor| -> Result<(Ty, TypeDesc), String> {

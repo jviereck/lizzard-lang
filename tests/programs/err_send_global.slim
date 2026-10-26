@@ -1,0 +1,8 @@
+# Module variables are shared between threads, so they must be `Send`
+# (like Rust statics).
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+bag = Bag(1)

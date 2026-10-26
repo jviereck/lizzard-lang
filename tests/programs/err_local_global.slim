@@ -1,8 +1,0 @@
-# Module variables are shared between threads, so they cannot hold local
-# values.
-class Counter(impl Local):
-    n: int
-    def __init__(self) -> ():
-        self.n = 0
-
-counter = Counter()

@@ -1,5 +1,0 @@
-  File "err_local_spawn.slim", line 15
-        spawn(work).join()
-              ^
-TypeError: spawn(): the function is local (`function + Local`) and cannot be sent to another thread
-[exit 1]

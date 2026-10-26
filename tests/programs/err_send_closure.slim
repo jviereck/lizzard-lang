@@ -1,0 +1,17 @@
+# A closure capturing a value that is not `Send` cannot be stored as
+# `function + Send`.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
+
+class Job:
+    run: function + Send
+    def __init__(self, run: function + Send + keep) -> ():
+        self.run <- run
+
+def main() -> ():
+    b = Bag(1)
+    job = Job(|| str(b.item))
+
+main()

@@ -659,7 +659,7 @@ pub extern "C" fn f_store_global(th: &mut Thread, frame: &mut Frame, idx: u32, s
         th.raise(
             "TypeError",
             format!(
-                "cannot store local `{}` in module variable `{}` (module variables are shared between threads)",
+                "cannot store `{}`, which is not `Send`, in module variable `{}` (module variables are shared between threads)",
                 types::value_type_name(v),
                 th.vm.global_names[idx as usize]
             ),
@@ -1465,7 +1465,7 @@ fn check_store(th: &mut Thread, inst: &Instance, i: usize, v: Value, mode: Store
     let t = types::field_type(th, inst, i)?;
     if !rtype::has_type(v, t) {
         let msg = if rtype::has_shape(v, t) {
-            format!("cannot store local `{}` in field `{}.{}` of non-local type `{}`", types::value_type_name(v), class.name, f.name, t.name)
+            format!("cannot store `{}`, which is not `Send`, in field `{}.{}` of type `{}`", types::value_type_name(v), class.name, f.name, t.name)
         } else {
             format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, t.name, types::value_type_name(v))
         };

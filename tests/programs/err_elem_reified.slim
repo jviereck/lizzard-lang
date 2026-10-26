@@ -1,5 +1,5 @@
 # The list checks stores itself: an untyped alias cannot break its type.
-def untyped(x: any) -> any:
+def untyped(x: any + Send) -> any + Send:
     x++
 
 counts = [1, 2, 3]

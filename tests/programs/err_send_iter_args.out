@@ -1,0 +1,5 @@
+  File "err_send_iter_args.slim", line 7
+    def bags() -> Iterator<Bag> + Send:
+                  ^
+TypeError: `Iterator<Bag> + Send`: `Bag` is not `Send`
+[exit 1]

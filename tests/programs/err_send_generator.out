@@ -1,0 +1,5 @@
+  File "err_send_generator.slim", line 10
+        yield 1
+        ^
+TypeError: generator `ticks` is declared `Send` but holds `Bag` (`b`), which is not `Send`, across a `yield`; declare it `-> Iterator<int>`
+[exit 1]

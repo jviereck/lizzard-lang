@@ -1,0 +1,5 @@
+  File "err_send_any.slim", line 11
+        print(keep_for_later(Bag(1)))
+                                ^
+TypeError: `Bag` is not `Send` and cannot be used as `any + Send`
+[exit 1]

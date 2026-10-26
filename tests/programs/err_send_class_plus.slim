@@ -1,0 +1,8 @@
+# `+ Send` only applies to types that hide what they hold.
+class Counter:
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+
+def f(c: Counter + Send) -> ():
+    print(c)

@@ -1,5 +1,0 @@
-  File "err_local_closure.slim", line 17
-        job = Job(|| c.inc())
-                  ^
-TypeError: a `function + Local` may hold local values and cannot be used as `function`
-[exit 1]

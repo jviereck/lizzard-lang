@@ -1,7 +1,10 @@
-# `Channel<T>` needs `T: Send`.
-class Pool<T>:
-    jobs: Channel<T>
-    def __init__(self) -> ():
-        self.jobs = Channel()
+# Channels connect threads, so their items must be `Send`.
+class Bag:
+    item: any
+    def __init__(self, item: any + keep) -> ():
+        self.item <- item
 
-p = Pool::<int>()
+def main() -> ():
+    ch: Channel<Bag> = Channel()
+
+main()

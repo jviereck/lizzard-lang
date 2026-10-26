@@ -13,9 +13,9 @@
 //! - [`Module::class`] (`T: Send + Sync`): `&self` methods run concurrently
 //!   from any thread; `&mut self` methods are exclusive.
 //! - [`Module::class_send`] (`T: Send`): every method call is exclusive.
-//! - [`Module::class_local`] (any `T`): the class implements `Local`, so
-//!   instances stay on the thread that created them, which is also checked
-//!   on every call (`ThreadError`), and are dropped on that thread.
+//! - [`Module::class_not_send`] (any `T`): the slim class is not `Send`
+//!   either, so instances stay on the thread that created them, which is
+//!   also checked on every call (`ThreadError`), and are dropped there.
 //!
 //! A call that conflicts with a running one (a `&mut self` method while
 //! another method runs) raises `BorrowError`, or waits for it to finish if
@@ -64,7 +64,7 @@ impl NType {
             NType::Str => rtype::str_(),
             NType::Unit => rtype::prim(Ctor::Unit),
             NType::Any => rtype::any(),
-            NType::Function => rtype::prim(Ctor::Function),
+            NType::Function => rtype::local_of(rtype::as_type(rtype::prim(Ctor::Function)).unwrap()),
             NType::List(t) => rtype::list_of(t.rt()),
             NType::Dict(k, v) => rtype::dict_of(k.rt(), v.rt()),
             NType::Option(t) => rtype::option_of(t.rt()),
@@ -252,7 +252,7 @@ impl<T: IntoSlim> IntoSlim for Vec<T> {
         let ty = <Self as IntoSlim>::ntype().rt();
         if items.iter().any(|v| v.is_local()) && !rtype::as_type(ty).unwrap().local {
             items.into_iter().for_each(|v| v.decref());
-            return Err(SlimError::type_error("cannot put local values in a non-local list"));
+            return Err(SlimError::type_error("cannot put values that are not `Send` in a `Send` list"));
         }
         Ok(Obj::list(ty, items))
     }
@@ -355,7 +355,7 @@ impl SlimType for Func {
 impl FromSlim for Func {
     fn from_slim(v: Value) -> Result<Self, SlimError> {
         // A local closure is fine: the handle is `!Send`, so it stays on
-        // this thread (the compiler types the parameter `function + Local`).
+        // this thread (the parameter is typed `function`, which may hold values that are not `Send`).
         if !rtype::has_shape(v, rtype::as_type(rtype::prim(Ctor::Function)).unwrap()) {
             return Err(expected(NType::Function, v));
         }
@@ -1032,7 +1032,7 @@ impl NativeObj {
     fn enter(&self, exclusive: bool) -> Result<Borrow<'_>, SlimError> {
         let c = self.class();
         if c.mode == Mode::Local && std::thread::current().id() != self.owner {
-            return Err(SlimError::new("ThreadError", format!("`{}` object is local to another thread", c.name)));
+            return Err(SlimError::new("ThreadError", format!("`{}` object belongs to another thread (it is not `Send`)", c.name)));
         }
         let exclusive = exclusive || c.mode == Mode::Send;
         let me = thread_tag();
@@ -1443,8 +1443,9 @@ impl Module {
         self.add_class(name, Mode::Send, build)
     }
 
-    /// Adds a class whose instances are local to their thread (any `T`).
-    pub fn class_local<T: 'static>(&mut self, name: &str, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
+    /// Adds a class over a Rust type that is not `Send` (any `T`): the slim
+    /// class is not `Send` either, so instances stay on their thread.
+    pub fn class_not_send<T: 'static>(&mut self, name: &str, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
         self.add_class(name, Mode::Local, build)
     }
 

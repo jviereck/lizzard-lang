@@ -23,8 +23,9 @@ pub enum TypeDesc {
     Param(u16, String),
     /// An already resolved type value.
     Resolved(Value),
-    /// `T + Local`: an erased type (`any`, `function`, `Iterator<T>`, a
-    /// trait) that may hold local values.
+    /// An erased type (`any`, `function`, `Iterator<T>`, a trait) that may
+    /// hold values that are not `Send`: what those annotations mean unless
+    /// written `X + Send` (the inner type).
     Local(Box<TypeDesc>),
 }
 
@@ -33,8 +34,9 @@ impl TypeDesc {
         TypeDesc::Builtin(c, Vec::new())
     }
 
+    /// `any`: any value, possibly not `Send`.
     pub fn any() -> TypeDesc {
-        TypeDesc::prim(Ctor::Any)
+        TypeDesc::Local(Box::new(TypeDesc::prim(Ctor::Any)))
     }
 
     pub fn option(t: TypeDesc) -> TypeDesc {
@@ -60,7 +62,12 @@ impl fmt::Display for TypeDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeDesc::Param(_, n) => f.write_str(n),
-            TypeDesc::Local(t) => write!(f, "{t} + Local"),
+            // Erased types as written: `any`, and `any + Send` unwrapped.
+            TypeDesc::Local(t) => match &**t {
+                TypeDesc::Builtin(Ctor::Any, a) if a.is_empty() => f.write_str("any"),
+                TypeDesc::Builtin(Ctor::Function, a) if a.is_empty() => f.write_str("function"),
+                t => write!(f, "{t}"),
+            },
             TypeDesc::Resolved(v) => f.write_str(crate::rtype::name(*v)),
             TypeDesc::Global(_, n, args) => {
                 f.write_str(n)?;
@@ -72,7 +79,7 @@ impl fmt::Display for TypeDesc {
             }
             TypeDesc::Builtin(c, args) => {
                 let base = match c {
-                    Ctor::Any => "any",
+                    Ctor::Any => "any + Send",
                     Ctor::Int => "int",
                     Ctor::Float => "float",
                     Ctor::Bool => "bool",
@@ -85,7 +92,7 @@ impl fmt::Display for TypeDesc {
                     Ctor::Option => "Option",
                     Ctor::Array(None) => "array",
                     Ctor::Array(Some(e)) => return write!(f, "array<{}>", e.name()),
-                    Ctor::Function => "function",
+                    Ctor::Function => "function + Send",
                     Ctor::Iterator => "Iterator",
                     Ctor::Channel => "Channel",
                     Ctor::Lock => "Lock",
@@ -170,8 +177,8 @@ pub struct ClassSpec {
     pub methods: Vec<(String, u32)>,
     /// Implemented traits: global slot, name and type arguments.
     pub traits: Vec<(u32, String, Vec<TypeDesc>)>,
-    /// Instances are local: the class implements `Local` or has a field of
-    /// local type.
+    /// Instances are local (the class is not `Send`): a field's type is not
+    /// `Send`.
     pub local: bool,
 }
 

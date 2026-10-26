@@ -1,5 +1,0 @@
-  File "err_local_generator.slim", line 13
-        yield c.inc()
-        ^
-TypeError: generator `ticks` holds local `Counter` (`c`) across a `yield`; declare it `-> Iterator<int> + Local`
-[exit 1]

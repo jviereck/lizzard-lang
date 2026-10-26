@@ -226,16 +226,16 @@ pub enum TypeExpr {
     Unit(Span),
     /// `Name` or `Name<args>`
     Named(String, Vec<TypeExpr>, Span),
-    /// `T + Local`: an erased type (`any`, `function`, `Iterator<T>`, a
-    /// trait) that may hold local values.
-    Local(Box<TypeExpr>),
+    /// `T + Send`: an erased type (`any`, `function`, `Iterator<T>`, a
+    /// trait) restricted to values that are `Send`.
+    Send(Box<TypeExpr>),
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Unit(s) | TypeExpr::Named(_, _, s) => *s,
-            TypeExpr::Local(t) => t.span(),
+            TypeExpr::Send(t) => t.span(),
         }
     }
 }
@@ -244,7 +244,7 @@ impl std::fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TypeExpr::Unit(_) => f.write_str("()"),
-            TypeExpr::Local(t) => write!(f, "{t} + Local"),
+            TypeExpr::Send(t) => write!(f, "{t} + Send"),
             TypeExpr::Named(n, args, _) => {
                 f.write_str(n)?;
                 if !args.is_empty() {

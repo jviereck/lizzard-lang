@@ -4,7 +4,7 @@ def apply(f: function, x: int) -> int:
 double = |x: int| x * 2
 print(apply(double, 21))
 
-def make_counter(start: int) -> function:
+def make_counter(start: int) -> function + Send:
     prefix = "count"
     |step: int| {
         print(prefix, start + step)

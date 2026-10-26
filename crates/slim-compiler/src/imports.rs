@@ -212,7 +212,7 @@ impl Rewriter<'_> {
     fn ty(&mut self, t: &mut TypeExpr) {
         match t {
             TypeExpr::Unit(_) => {}
-            TypeExpr::Local(inner) => self.ty(inner),
+            TypeExpr::Send(inner) => self.ty(inner),
             TypeExpr::Named(n, args, _) => {
                 if let Some(q) = self.names.get(n.as_str()) {
                     *n = q.clone();

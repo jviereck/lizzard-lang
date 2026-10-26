@@ -447,9 +447,10 @@ impl Parser {
             }
             let mut bounds = Vec::new();
             if self.eat(&Tok::Colon) {
-                bounds.push(self.type_expr()?);
+                // `T: Ord + Send`: `+` separates bounds here.
+                bounds.push(self.type_expr_with(false)?);
                 while self.eat(&Tok::Plus) {
-                    bounds.push(self.type_expr()?);
+                    bounds.push(self.type_expr_with(false)?);
                 }
             }
             out.push(TypeParam { name, bounds, span });
@@ -609,6 +610,12 @@ impl Parser {
     // ---------------------------------------------------------------- types
 
     pub fn type_expr(&mut self) -> R<TypeExpr> {
+        self.type_expr_with(true)
+    }
+
+    /// `send_suffix`: a trailing `+ Send` belongs to the type (not in bound
+    /// lists, where `+` separates bounds).
+    fn type_expr_with(&mut self, send_suffix: bool) -> R<TypeExpr> {
         let span = self.span();
         if self.at(&Tok::LParen) {
             self.advance();
@@ -618,12 +625,23 @@ impl Parser {
         let (name, span) = self.name("a type")?;
         let args = if self.eat(&Tok::Lt) { self.angle_args()? } else { Vec::new() };
         let t = TypeExpr::Named(name, args, span);
-        // `T + Local`: an erased type that may hold local values. (`+ keep`
+        // `any + Send`: an erased type restricted to `Send` values. (`+ keep`
         // after a parameter's type is left to the caller.)
-        if self.at(&Tok::Plus) && matches!(self.peek_at(1), Tok::Name(n) if n == "Local") {
-            self.advance();
-            self.advance();
-            return Ok(TypeExpr::Local(Box::new(t)));
+        if send_suffix && self.at(&Tok::Plus) {
+            match self.peek_at(1) {
+                Tok::Name(n) if n == "Send" => {
+                    self.advance();
+                    self.advance();
+                    return Ok(TypeExpr::Send(Box::new(t)));
+                }
+                Tok::Name(n) if n == "Local" => {
+                    return Err(Error::syntax(
+                        "`+ Local` was removed: as in Rust, types are `Send` or not. `any`, `function`, `Iterator<T>` and trait types may hold values that are not `Send`; write `any + Send` for one that can cross threads",
+                        self.toks[self.pos + 1].span,
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(t)
     }
@@ -634,7 +652,7 @@ impl Parser {
         loop {
             if self.at(&Tok::Plus) {
                 return Err(Error::syntax(
-                    "`+ local` was removed: a class is local by implementing `Local` (`class Counter(impl Local)`), and erased types are written `any + Local`",
+                    "`+ local` was removed: as in Rust, a type is `Send` or not (a class is not `Send` when a field is not), and `any + Send` restricts an erased type to `Send` values",
                     self.span(),
                 ));
             }

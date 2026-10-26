@@ -1,0 +1,5 @@
+# There is no `Local` trait: a class is `Send` unless a field is not.
+class Counter(impl Local):
+    n: int
+    def __init__(self) -> ():
+        self.n = 0

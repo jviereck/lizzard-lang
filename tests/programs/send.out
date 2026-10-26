@@ -1,0 +1,19 @@
+5 got Bag(item=5)
+x
+1
+1
+11
+3
+42
+49
+11
+101
+2
+tick 1
+tick 2
+count 1
+count 2
+error: cannot store `Bag`, which is not `Send`, in `list<any + Send>`
+0
+rc-audit: ok
+[exit 0]
