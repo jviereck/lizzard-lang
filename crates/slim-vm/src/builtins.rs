@@ -16,6 +16,7 @@ use crate::display;
 use crate::generator;
 use crate::helpers::{self, values_eq};
 use crate::interp::{Raised, Thread, VResult};
+use crate::array::{ArrayObj, Elem, Scalar, StoreError};
 use crate::list::ListObj;
 use crate::object::{Body, Builtin, BuiltinFn, Class, Field, Obj, SlotKind, Trait};
 use crate::rc;
@@ -26,6 +27,8 @@ use crate::value::Value;
 pub enum IterKind {
     /// Iterates a list by index (holds a reference to the list).
     List { list: Value, idx: usize },
+    /// Iterates an array by index (holds a reference to the array).
+    Array { arr: Value, idx: usize },
     /// Owned items handed out one by one.
     Items { items: std::vec::IntoIter<Value> },
     Range { cur: i64, end: i64, step: i64 },
@@ -36,7 +39,7 @@ pub enum IterKind {
 impl IterKind {
     pub(crate) fn release(&mut self) {
         match self {
-            IterKind::List { list, .. } => list.decref(),
+            IterKind::List { list, .. } | IterKind::Array { arr: list, .. } => list.decref(),
             IterKind::Items { items } => items.by_ref().for_each(|v| v.decref()),
             IterKind::Range { .. } => {}
             IterKind::Object { obj } => obj.decref(),
@@ -58,6 +61,10 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
         Some(Body::List(_)) => {
             v.incref();
             Ok(new_iter(IterKind::List { list: v, idx: 0 }))
+        }
+        Some(Body::Array(_)) => {
+            v.incref();
+            Ok(new_iter(IterKind::Array { arr: v, idx: 0 }))
         }
         Some(Body::Tuple(t)) => {
             let items: Vec<Value> = t.to_vec();
@@ -124,6 +131,17 @@ pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
                             *idx += 1;
                             Ok(Some(v))
                         }
+                        None => Ok(None),
+                    }
+                }
+                IterKind::Array { arr, idx } => {
+                    let a = arr.as_array().unwrap();
+                    match a.get(*idx) {
+                        Some(Ok(v)) => {
+                            *idx += 1;
+                            Ok(Some(v))
+                        }
+                        Some(Err(())) => Err(th.raise("OverflowError", "u64 element does not fit in an int")),
                         None => Ok(None),
                     }
                 }
@@ -379,6 +397,7 @@ fn b_len(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(Body::Tuple(t)) => t.len(),
         Some(Body::List(l)) => l.len(),
         Some(Body::Dict(d)) => d.len(),
+        Some(Body::Array(a)) => a.len(),
         Some(Body::Channel(_)) => return crate::helpers::call_simple(th, type_method(v, "__len__").unwrap(), Some(v), &[]),
         Some(Body::Instance(inst)) if inst.class().methods.contains_key("__len__") => {
             let m = inst.class().methods["__len__"];
@@ -522,6 +541,50 @@ fn b_list(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         None => Vec::new(),
     };
     Ok(Obj::list(items))
+}
+
+/// `array(kind, n)`: `n` zeros; `array(kind, iterable)`: the items, converted.
+fn b_array(th: &mut Thread, args: &[Value]) -> VResult<Value> {
+    let elem = match args[0].body() {
+        Some(Body::ElemType(e)) => Some(*e),
+        Some(Body::Builtin(b)) if b.name == "bool" => Some(Elem::Bool),
+        _ => None,
+    };
+    let Some(elem) = elem else {
+        return Err(th.raise(
+            "TypeError",
+            format!("array() needs an element type (i8 .. u64, f32, f64, bool), got '{}'", args[0].type_name()),
+        ));
+    };
+    if let Some(n) = args[1].as_int() {
+        if n < 0 {
+            return Err(th.raise("ValueError", "array() length must not be negative"));
+        }
+        return Ok(Obj::alloc(Body::Array(ArrayObj::zeroed(elem, n as usize))));
+    }
+    let items = collect(th, args[1])?;
+    let a = ArrayObj::zeroed(elem, items.len());
+    let mut err = None;
+    for (i, v) in items.iter().enumerate() {
+        if err.is_none() {
+            err = a.set(i, *v).err().map(|e| (e, *v));
+        }
+    }
+    let r = match err {
+        None => Ok(Obj::alloc(Body::Array(a))),
+        Some((e, v)) => Err(store_error(th, e, v, elem)),
+    };
+    items.into_iter().for_each(|v| v.decref());
+    r
+}
+
+fn store_error(th: &mut Thread, e: StoreError, v: Value, elem: Elem) -> Raised {
+    match e {
+        StoreError::Type => {
+            th.raise("TypeError", format!("cannot store a '{}' in an array of {}", v.type_name(), elem.name()))
+        }
+        StoreError::Overflow => th.raise("OverflowError", format!("{} does not fit in {}", display::repr(v), elem.name())),
+    }
 }
 
 fn b_tuple(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -698,6 +761,7 @@ const FUNCTIONS: &[BuiltinDef] = &[
     def("rc_auto", b_rc_auto, 1, 1, 0),
     def("rc_live", b_rc_live, 0, 0, 0),
     def("list", b_list, 0, 1, 0),
+    def("array", b_array, 2, 2, 0),
     def("tuple", b_tuple, 0, 1, 0),
     def("dict", b_dict, 0, 0, 0),
     def("isinstance", b_isinstance, 2, 2, 0),
@@ -760,6 +824,7 @@ pub fn names() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = FUNCTIONS.iter().map(|d| d.name).collect();
     v.extend(TRAITS.iter().map(|t| t.0));
     v.extend(EXCEPTIONS.iter().map(|e| e.0));
+    v.extend(Elem::ALL.iter().map(|e| e.name()).filter(|n| *n != "bool"));
     v
 }
 
@@ -797,6 +862,10 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
         classes.push((*name, c));
     }
     let exception = traits[0].1;
+    // Element types for `array(...)`; `bool` doubles as the conversion builtin.
+    for e in Elem::ALL.iter().filter(|e| **e != Elem::Bool) {
+        all.push((e.name(), Obj::alloc_immortal(Body::ElemType(*e))));
+    }
     all.extend(traits.iter().copied());
     all.extend(classes.iter().copied());
     (all, crate::interp::Builtins { exception, classes })
@@ -1138,6 +1207,102 @@ fn m_dict_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     Ok(Obj::alloc(Body::Dict(d)))
 }
 
+fn array_of(v: Value) -> &'static ArrayObj {
+    v.as_array().unwrap()
+}
+
+/// `a.fill(x)`: sets every element to `x`.
+fn m_arr_fill(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let arr = array_of(a[0]);
+    match arr.encode(a[1]) {
+        Ok(bits) => {
+            arr.fill_bits(bits);
+            Ok(Value::UNIT)
+        }
+        Err(e) => Err(store_error(th, e, a[1], arr.elem)),
+    }
+}
+
+/// `a.copy_from(b)`: copies all elements of an array of the same type and length.
+fn m_arr_copy_from(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let dst = array_of(a[0]);
+    let Some(src) = a[1].as_array() else {
+        return Err(th.raise("TypeError", format!("copy_from() needs an array, got '{}'", a[1].type_name())));
+    };
+    if src.elem != dst.elem || src.len() != dst.len() {
+        return Err(th.raise(
+            "ValueError",
+            format!(
+                "copy_from() needs an array<{}> of length {}, got array<{}> of length {}",
+                dst.elem.name(),
+                dst.len(),
+                src.elem.name(),
+                src.len()
+            ),
+        ));
+    }
+    dst.copy_from(src);
+    Ok(Value::UNIT)
+}
+
+fn m_arr_to_list(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let arr = array_of(a[0]);
+    let mut items = Vec::with_capacity(arr.len());
+    for i in 0..arr.len() {
+        match arr.get(i).unwrap() {
+            Ok(v) => items.push(v),
+            Err(()) => {
+                items.into_iter().for_each(|v: Value| v.decref());
+                return Err(th.raise("OverflowError", "u64 element does not fit in an int"));
+            }
+        }
+    }
+    Ok(Obj::list(items))
+}
+
+/// `a.sum()`: an int for integer and bool arrays, a float for float arrays.
+fn m_arr_sum(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let arr = array_of(a[0]);
+    if arr.elem.is_float() {
+        let s: f64 = (0..arr.len())
+            .map(|i| match arr.get_num(i) {
+                Some(Scalar::Float(f)) => f,
+                _ => 0.0,
+            })
+            .sum();
+        return Ok(Value::float(s));
+    }
+    let s: i128 = (0..arr.len())
+        .map(|i| match arr.get_num(i) {
+            Some(Scalar::Int(n)) => n,
+            Some(Scalar::Bool(b)) => b as i128,
+            _ => 0,
+        })
+        .sum();
+    i64::try_from(s).map(Value::from_i64).map_err(|_| th.raise("OverflowError", "array sum does not fit in an int"))
+}
+
+/// `a.view(start, n)`: an array sharing `n` elements of `a` from `start`.
+fn m_arr_view(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let (start, n) = (arg_int!(th, a[1], "start"), arg_int!(th, a[2], "length"));
+    let len = array_of(a[0]).len();
+    if start < 0 || n < 0 {
+        return Err(th.raise("IndexError", format!("view({start}, {n}) out of range for array of length {len}")));
+    }
+    match ArrayObj::view(a[0], start as usize, n as usize) {
+        Some(v) => Ok(Obj::alloc(Body::Array(v))),
+        None => Err(th.raise("IndexError", format!("view({start}, {n}) out of range for array of length {len}"))),
+    }
+}
+
+/// `a.copy()`: a new array with its own memory.
+fn m_arr_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let src = array_of(a[0]);
+    let dst = ArrayObj::zeroed(src.elem, src.len());
+    dst.copy_from(src);
+    Ok(Obj::alloc(Body::Array(dst)))
+}
+
 fn m_send(th: &mut Thread, a: &[Value]) -> VResult<Value> {
     match generator::resume(th, a[0], a[1], None)? {
         Some(v) => Ok(v),
@@ -1254,6 +1419,17 @@ fn method_table() -> &'static MethodTable {
             ]),
         );
         t.insert(
+            "array",
+            mk(&[
+                def("fill", m_arr_fill, 2, 2, 0),
+                def("copy_from", m_arr_copy_from, 2, 2, 0),
+                def("to_list", m_arr_to_list, 1, 1, 0),
+                def("sum", m_arr_sum, 1, 1, 0),
+                def("view", m_arr_view, 3, 3, 0),
+                def("copy", m_arr_copy, 1, 1, 0),
+            ]),
+        );
+        t.insert(
             "generator",
             mk(&[def("send", m_send, 2, 2, 1 << 1), def("throw", m_throw, 2, 2, 1 << 1), def("close", m_close, 1, 1, 0)]),
         );
@@ -1272,6 +1448,7 @@ pub fn type_method(recv: Value, name: &str) -> Option<Value> {
         Some(Body::List(_)) => "list",
         Some(Body::Tuple(_)) => "tuple",
         Some(Body::Dict(_)) => "dict",
+        Some(Body::Array(_)) => "array",
         Some(Body::Generator(_)) => "generator",
         Some(Body::Thread(_)) => "thread",
         Some(Body::Lock(_)) => "lock",

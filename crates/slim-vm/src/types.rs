@@ -18,6 +18,7 @@ pub fn check(th: &Thread, v: Value, t: &TypeDesc) -> bool {
         TypeDesc::Tuple => matches!(v.body(), Some(Body::Tuple(_))),
         TypeDesc::List => matches!(v.body(), Some(Body::List(_))),
         TypeDesc::Dict => matches!(v.body(), Some(Body::Dict(_))),
+        TypeDesc::Array(e) => v.as_array().is_some_and(|a| e.is_none_or(|e| a.elem == e)),
         TypeDesc::Function => matches!(
             v.body(),
             Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Class(_))

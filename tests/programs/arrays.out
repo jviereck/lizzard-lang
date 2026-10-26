@@ -1,0 +1,16 @@
+array(f64, [0.0, 2.5, 3.0, 0.0]) 4 2.5 5.5
+array(u8, [1, 2, 255]) [1, 2, 255] True
+array(f64, [9.0, 3.0]) array(f64, [0.0, 9.0, 3.0, 0.0])
+array(bool, [False, True, False]) 1
+array(f32, [0.1, 1.5])
+1
+2
+255
+True True
+32.0
+3.0
+200 200
+array(i32, [10, 11])
+10 array(i32, [7, 11])
+rc-audit: ok
+[exit 0]

@@ -144,6 +144,7 @@ opcodes! {
     SwapField { dst: Reg, obj: Reg, name: u32, src: Reg } => sem::swap_field;
     /// dst = borrow of obj[idx]
     LoadIndex { dst: Reg, obj: Reg, idx: Reg } => sem::load_index;
+    LoadElem { dst: Reg, obj: Reg, idx: Reg } => sem::load_elem;
     StoreIndex { obj: Reg, idx: Reg, src: Reg, mode: StoreMode } => sem::store_index;
     SwapIndex { dst: Reg, obj: Reg, idx: Reg, src: Reg } => sem::swap_index;
 
@@ -179,7 +180,7 @@ impl Instr {
             .map(|(k, v)| {
                 let reg = matches!(*k, "dst" | "src" | "a" | "b" | "reg" | "obj" | "func" | "recv" | "cond" | "exc" | "iter" | "idx")
                     && !matches!(self, Instr::LoadConst { .. } | Instr::LoadGlobal { .. } | Instr::StoreGlobal { .. } | Instr::TakeGlobal { .. } | Instr::LoadCapture { .. });
-                if reg || (*k == "idx" && matches!(self, Instr::LoadIndex { .. } | Instr::StoreIndex { .. } | Instr::SwapIndex { .. })) {
+                if reg || (*k == "idx" && matches!(self, Instr::LoadIndex { .. } | Instr::LoadElem { .. } | Instr::StoreIndex { .. } | Instr::SwapIndex { .. })) {
                     let r: usize = v.parse().unwrap_or(0);
                     match code.reg_names.get(r).and_then(|n| n.as_ref()) {
                         Some(n) => format!("r{v}({n})"),

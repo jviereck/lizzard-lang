@@ -18,7 +18,7 @@ use slim_vm::ops::{BinKind, Instr, StoreMode, UnKind};
 use slim_vm::Value;
 
 use crate::scan;
-use crate::ty::{resolve, Ty, TypeName};
+use crate::ty::{elem_ty, resolve, Ty, TypeName};
 
 type R<T> = Result<T, Error>;
 
@@ -1104,6 +1104,14 @@ impl<'m> FnCtx<'m> {
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
                 let i = self.expr(idx)?;
+                if let Ty::Array(e) = o.ty {
+                    // Array elements are scalars: read an owned copy.
+                    let dst = self.tmp_owned();
+                    self.emit(Instr::LoadElem { dst, obj: o.reg, idx: i.reg });
+                    self.discard(&i);
+                    self.discard(&o);
+                    return Ok(owned(dst, e.map(elem_ty).unwrap_or(Ty::Unknown)));
+                }
                 let dst = self.tmp_borrow();
                 self.emit(Instr::LoadIndex { dst, obj: o.reg, idx: i.reg });
                 self.discard(&i);
@@ -1915,6 +1923,16 @@ impl<'m> FnCtx<'m> {
                         span,
                     ));
                 }
+                if let Ty::Array(Some(e)) = o.ty {
+                    let ok = match (elem_ty(e), &v.ty) {
+                        (_, Ty::Unknown) => true,
+                        (Ty::Float, Ty::Int | Ty::Float) => true,
+                        (t, vt) => t == *vt,
+                    };
+                    if !ok {
+                        return Err(type_err(format!("cannot store a `{}` in an `array<{}>`", v.ty.name(), e.name()), value.span));
+                    }
+                }
                 let v = self.to_owned(v, value.span, "an element")?;
                 self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: v.reg, mode: StoreMode::Copy });
                 self.discard(&i);
@@ -2221,6 +2239,12 @@ impl<'m> FnCtx<'m> {
                 "list" | "sorted" => Ty::List,
                 "tuple" => Ty::Tuple,
                 "dict" => Ty::Dict,
+                "array" => Ty::Array(match args.first().map(|a| &a.kind) {
+                    Some(ExprKind::Name(n)) if !self.locals.contains_key(n) && !self.m.module_vars.contains(n) => {
+                        slim_vm::array::Elem::from_name(n)
+                    }
+                    _ => None,
+                }),
                 "print" | "rc_auto" => Ty::Unit,
                 "Some" => match al.args.first().and_then(|a| self.reg_ty.get(&a.reg)).cloned() {
                     Some(t) => Ty::Option(Box::new(t)),
@@ -2351,7 +2375,7 @@ impl<'m> FnCtx<'m> {
             }
         }
         let builtin_mask = match &r.ty {
-            Ty::Str | Ty::List | Ty::Dict | Ty::Tuple | Ty::Generator => slim_vm::builtins::method_keep_mask(mname),
+            Ty::Str | Ty::List | Ty::Dict | Ty::Tuple | Ty::Generator | Ty::Array(_) => slim_vm::builtins::method_keep_mask(mname),
             _ => None,
         };
         let any_mask = if mname == "some_or" { Some(1u64 << 1) } else { None };

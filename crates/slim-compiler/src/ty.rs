@@ -4,6 +4,7 @@
 //! type; when it cannot tell (`Unknown`) it emits dynamically checked
 //! instructions instead.
 
+use slim_vm::array::Elem;
 use slim_syntax::ast::TypeExpr;
 use slim_vm::code::TypeDesc;
 
@@ -33,6 +34,17 @@ pub enum Ty {
     /// A class object (immortal, copied freely).
     Class(String),
     Option(Box<Ty>),
+    /// `array` (element type unknown) or `array<T>`.
+    Array(Option<Elem>),
+}
+
+/// The slim type of an array element read.
+pub fn elem_ty(e: Elem) -> Ty {
+    match e {
+        Elem::F32 | Elem::F64 => Ty::Float,
+        Elem::Bool => Ty::Bool,
+        _ => Ty::Int,
+    }
 }
 
 impl Ty {
@@ -83,6 +95,8 @@ impl Ty {
             Ty::Instance(c) | Ty::Trait(c) | Ty::Opaque(c) => c.clone(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Option(t) => format!("Option<{}>", t.name()),
+            Ty::Array(None) => "array".into(),
+            Ty::Array(Some(e)) => format!("array<{}>", e.name()),
         }
     }
 }
@@ -117,6 +131,14 @@ pub fn resolve(
                 "function" | "Callable" | "Fn" => no_args(Ty::Func, TypeDesc::Function),
                 "any" | "Any" => no_args(Ty::Unknown, TypeDesc::Any),
                 "Lock" | "Channel" | "Thread" => no_args(Ty::Opaque(n.clone()), TypeDesc::Builtin(n.clone())),
+                "array" => match args.as_slice() {
+                    [] => Ok((Ty::Array(None), TypeDesc::Array(None))),
+                    [TypeExpr::Named(e, eargs, _)] if eargs.is_empty() && Elem::from_name(e).is_some() => {
+                        let e = Elem::from_name(e);
+                        Ok((Ty::Array(e), TypeDesc::Array(e)))
+                    }
+                    _ => Err("`array` takes one element type: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 or bool".into()),
+                },
                 "Option" => {
                     if args.len() != 1 {
                         return Err("`Option` takes exactly one type argument: `Option<T>`".into());

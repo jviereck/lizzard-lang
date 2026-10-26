@@ -1,5 +1,6 @@
 //! `str()` / `repr()` formatting.
 
+use crate::array::{Elem, Scalar};
 use crate::object::Body;
 use crate::value::Value;
 
@@ -18,6 +19,14 @@ pub fn format_float(f: f64) -> String {
         return s;
     }
     format!("{f:e}")
+}
+
+/// Shortest form that reads back as the same `f32`.
+fn format_f32(f: f32) -> String {
+    if !f.is_finite() || (f == f.trunc() && f.abs() < 1e7) {
+        return format_float(f as f64);
+    }
+    format!("{f}")
 }
 
 fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
@@ -97,6 +106,25 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             }
             out.push('}');
         }
+        Body::Array(a) => {
+            out.push_str("array(");
+            out.push_str(a.elem.name());
+            out.push_str(", [");
+            for i in 0..a.len() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                match a.get_num(i) {
+                    Some(Scalar::Int(n)) => out.push_str(&n.to_string()),
+                    Some(Scalar::Float(f)) if a.elem == Elem::F32 => out.push_str(&format_f32(f as f32)),
+                    Some(Scalar::Float(f)) => out.push_str(&format_float(f)),
+                    Some(Scalar::Bool(b)) => out.push_str(if b { "True" } else { "False" }),
+                    None => {}
+                }
+            }
+            out.push_str("])");
+        }
+        Body::ElemType(e) => out.push_str(e.name()),
         Body::Iter(_) => out.push_str("<iterator>"),
         Body::Thread(_) => out.push_str("<Thread>"),
         Body::Lock(_) => out.push_str("<Lock>"),

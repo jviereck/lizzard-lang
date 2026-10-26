@@ -1,0 +1,12 @@
+IndexError: index 3 out of range for array of length 3
+IndexError: index -1 out of range for array of length 3
+OverflowError: 256 does not fit in u8
+OverflowError: -1 does not fit in u8
+TypeError: cannot store a 'float' in an array of u8
+IndexError: index 5 out of range for array of length 3
+IndexError: view(2, 2) out of range for array of length 3
+ValueError: copy_from() needs an array<f64> of length 2, got array<f32> of length 2
+TypeError: array() needs an element type (i8 .. u64, f32, f64, bool), got 'function'
+array(u8, [0, 0, 0])
+rc-audit: ok
+[exit 0]

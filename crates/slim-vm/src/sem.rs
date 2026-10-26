@@ -387,6 +387,11 @@ pub fn load_index<B: Backend>(b: &mut B, dst: Reg, obj: Reg, idx: Reg) -> Flow<(
     b.frame_op(h::f_load_index, dst as u32, obj as u32, idx as u32, 0)
 }
 
+/// `a[i]` as an owned copy-type value (array elements).
+pub fn load_elem<B: Backend>(b: &mut B, dst: Reg, obj: Reg, idx: Reg) -> Flow<()> {
+    b.frame_op(h::f_load_elem, dst as u32, obj as u32, idx as u32, 0)
+}
+
 pub fn store_index<B: Backend>(b: &mut B, obj: Reg, idx: Reg, src: Reg, mode: StoreMode) -> Flow<()> {
     b.frame_op(h::f_store_index, obj as u32, idx as u32, src as u32, mode as u32)
 }

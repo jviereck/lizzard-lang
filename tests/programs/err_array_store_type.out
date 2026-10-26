@@ -1,0 +1,5 @@
+  File "err_array_store_type.slim", line 2
+    b[0] = 1.5
+           ^
+TypeError: cannot store a `float` in an `array<u8>`
+[exit 1]

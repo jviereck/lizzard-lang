@@ -1,6 +1,7 @@
 //! The slim virtual machine: values, objects, reference counting, the opcode
 //! table with backend-generic semantics, and the interpreter.
 
+pub mod array;
 pub mod backend;
 pub mod builtins;
 pub mod code;

@@ -3,6 +3,7 @@
 //! Value helpers (`Helper1`/`Helper2`) return `Value::UNINIT` when they raise.
 //! Frame helpers return 0 (ok), 1 (raised), 2 (returned) or 3 (yielded).
 
+use crate::array::{ArrayObj, Scalar, StoreError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -352,6 +353,8 @@ pub fn is_truthy(th: &mut Thread, v: Value) -> VResult<bool> {
         Some(Body::Str(s)) => !s.is_empty(),
         Some(Body::Tuple(t)) => !t.is_empty(),
         Some(Body::List(l)) => !l.is_empty(),
+        Some(Body::Array(a)) => !a.is_empty(),
+        Some(Body::Dict(d)) => !d.is_empty(),
         _ => true,
     })
 }
@@ -387,6 +390,16 @@ pub fn values_eq(a: Value, b: Value) -> bool {
             }
             let (x, y) = (x.snapshot(), y.snapshot());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_eq(*p, *q))
+        }
+        (Some(Body::Array(x)), Some(Body::Array(y))) => {
+            x.len() == y.len()
+                && (0..x.len()).all(|i| match (x.get_num(i), y.get_num(i)) {
+                    (Some(Scalar::Int(p)), Some(Scalar::Int(q))) => p == q,
+                    (Some(Scalar::Bool(p)), Some(Scalar::Bool(q))) => p == q,
+                    (Some(Scalar::Float(p)), Some(Scalar::Float(q))) => p == q,
+                    (Some(Scalar::Float(p)), Some(Scalar::Int(q))) | (Some(Scalar::Int(q)), Some(Scalar::Float(p))) => p == q as f64,
+                    _ => false,
+                })
         }
         _ => false,
     }
@@ -473,6 +486,14 @@ fn contains_impl(th: &mut Thread, item: Value, container: Value) -> VResult<bool
             Ok(l.snapshot().iter().any(|v| values_eq(*v, item)))
         }
         Some(Body::Dict(d)) => Ok(d.get(item).is_some()),
+        Some(Body::Array(a)) => Ok((0..a.len()).any(|i| match a.get(i) {
+            Some(Ok(v)) => {
+                let eq = values_eq(v, item);
+                v.decref();
+                eq
+            }
+            _ => false,
+        })),
         _ => Err(th.raise("TypeError", format!("argument of type '{}' is not iterable", container.type_name()))),
     }
 }
@@ -1212,11 +1233,70 @@ pub(crate) fn index_error(th: &mut Thread, i: i64, what: &str, len: usize) -> Ra
     th.raise("IndexError", format!("index {i} out of range for {what} of length {len}"))
 }
 
+/// Element `k` of an array, owned.
+fn array_get(th: &mut Thread, a: &ArrayObj, k: Value) -> VResult<Value> {
+    let i = index_of(th, k, a.len(), "array")?;
+    match a.get(i).unwrap() {
+        Ok(v) => Ok(v),
+        Err(()) => Err(th.raise("OverflowError", format!("u64 element {} does not fit in an int", a.bits(i).unwrap()))),
+    }
+}
+
+/// Stores scalar `v` at `a[k]`.
+fn array_set(th: &mut Thread, a: &ArrayObj, k: Value, v: Value) -> VResult<()> {
+    let i = index_of(th, k, a.len(), "array")?;
+    a.set(i, v).map_err(|e| match e {
+        StoreError::Type => th.raise(
+            "TypeError",
+            format!("cannot store a '{}' in an array of {}", v.type_name(), a.elem.name()),
+        ),
+        StoreError::Overflow => {
+            th.raise("OverflowError", format!("{} does not fit in {}", crate::display::repr(v), a.elem.name()))
+        }
+    })
+}
+
+/// `a[i]` as an owned value (copy types): arrays produce a fresh scalar;
+/// other containers yield a copy of a copy-type element.
+pub extern "C" fn f_load_elem(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, idx: u32, _: u32) -> u32 {
+    let o = frame.reg(obj as Reg);
+    let k = frame.reg(idx as Reg);
+    let r = match o.body() {
+        Some(Body::Array(a)) => array_get(th, a, k),
+        _ => {
+            let r = f_load_index(th, frame, dst, obj, idx, 0);
+            if r != OK {
+                return r;
+            }
+            let v = frame.reg(dst as Reg);
+            if v.is_copy() {
+                v.incref();
+                Ok(v)
+            } else {
+                frame.set(dst as Reg, Value::UNINIT);
+                Err(th.raise(
+                    "OwnershipError",
+                    format!("cannot take ownership of an element (a borrowed {}); use `++` to create a new reference", v.type_name()),
+                ))
+            }
+        }
+    };
+    match r {
+        Ok(v) => {
+            frame.set(dst as Reg, v);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
 pub extern "C" fn f_load_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, idx: u32, _: u32) -> u32 {
     let o = frame.reg(obj as Reg);
     let k = frame.reg(idx as Reg);
     let r = (|| -> VResult<Value> {
         match o.body() {
+            // A boxed scalar lives as long as the borrow can.
+            Some(Body::Array(a)) => array_get(th, a, k).map(rc::autorelease),
             Some(Body::List(l)) => {
                 let i = int_index(th, k)?;
                 match usize::try_from(i).ok().and_then(|i| l.get(i)) {
@@ -1257,6 +1337,13 @@ pub extern "C" fn f_store_index(th: &mut Thread, frame: &mut Frame, obj: u32, id
             return Err(th.raise("OwnershipError", format!("`=` can only store copy types into an element; use `<-` to move a {} in", v.type_name())));
         }
         match o.body() {
+            Some(Body::Array(a)) => {
+                // The scalar is copied into the array; the operand is consumed.
+                array_set(th, a, k, v)?;
+                frame.set(src as Reg, Value::MOVED);
+                v.decref();
+                Ok(())
+            }
             Some(Body::List(l)) => {
                 let i = int_index(th, k)?;
                 let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));
@@ -1288,6 +1375,17 @@ pub extern "C" fn f_swap_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     let v = frame.reg(src as Reg);
     let r = (|| -> VResult<()> {
         match o.body() {
+            Some(Body::Array(a)) => {
+                let old = array_get(th, a, k)?;
+                if let Err(e) = array_set(th, a, k, v) {
+                    old.decref();
+                    return Err(e);
+                }
+                frame.set(src as Reg, Value::MOVED);
+                v.decref();
+                frame.set(dst as Reg, old);
+                Ok(())
+            }
             Some(Body::List(l)) => {
                 let i = int_index(th, k)?;
                 let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));

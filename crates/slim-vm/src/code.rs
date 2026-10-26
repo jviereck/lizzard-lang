@@ -27,6 +27,8 @@ pub enum TypeDesc {
     /// A class or trait bound to a module-level name (resolved at check time).
     Global(u32, String),
     Option(Box<TypeDesc>),
+    /// `array` (any element type) or `array<T>`.
+    Array(Option<crate::array::Elem>),
 }
 
 impl fmt::Display for TypeDesc {
@@ -46,6 +48,8 @@ impl fmt::Display for TypeDesc {
             TypeDesc::Builtin(n) => f.write_str(n),
             TypeDesc::Global(_, n) => f.write_str(n),
             TypeDesc::Option(t) => write!(f, "Option<{t}>"),
+            TypeDesc::Array(None) => f.write_str("array"),
+            TypeDesc::Array(Some(e)) => write!(f, "array<{}>", e.name()),
         }
     }
 }

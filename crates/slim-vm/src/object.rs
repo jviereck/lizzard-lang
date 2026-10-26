@@ -52,6 +52,10 @@ pub enum Body {
     Instance(Instance),
     BoundMethod { recv: Value, func: Value },
     Dict(crate::dict::Dict),
+    /// `array<T>`: fixed-size packed scalars.
+    Array(crate::array::ArrayObj),
+    /// An array element type (`f64`, `u8`, ...), as passed to `array(...)`.
+    ElemType(crate::array::Elem),
     Iter(Mutex<crate::builtins::IterKind>),
     Generator(crate::generator::Generator),
     Thread(crate::threads::ThreadHandle),
@@ -319,7 +323,8 @@ impl Obj {
             Body::Generator(g) => g.release(),
             Body::Thread(t) => t.release(),
             Body::Channel(c) => c.release(),
-            Body::Lock(_) => {}
+            Body::Array(a) => a.release(),
+            Body::Lock(_) | Body::ElemType(_) => {}
             Body::Int(_)
             | Body::Float(_)
             | Body::BigInt(_)
@@ -339,6 +344,13 @@ impl Value {
     pub fn as_str(self) -> Option<&'static str> {
         match self.body() {
             Some(Body::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(self) -> Option<&'static crate::array::ArrayObj> {
+        match self.body() {
+            Some(Body::Array(a)) => Some(a),
             _ => None,
         }
     }
@@ -388,6 +400,8 @@ impl Value {
             Some(Body::Trait(_)) => "trait",
             Some(Body::Instance(i)) => return i.class().name.clone(),
             Some(Body::Dict(_)) => "dict",
+            Some(Body::Array(_)) => "array",
+            Some(Body::ElemType(_)) => "type",
             Some(Body::Iter(_)) => "iterator",
             Some(Body::Generator(_)) => "generator",
             Some(Body::Thread(_)) => "Thread",
