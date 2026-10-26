@@ -1,0 +1,25 @@
+# Static element types: list<T>, dict<K, V> and the items of for loops.
+class Item:
+    name: str
+    def __init__(self, name: str + keep) -> ():
+        self.name <- name
+    def shout(self) -> str:
+        self.name.upper()
+
+def names(items: list<Item>) -> list<str>:
+    out = []
+    for it in items:
+        out.append(it.shout())
+    out
+
+def main() -> ():
+    items: list<Item> = [Item("a" + ""), Item("b" + "")]
+    print(names(items))
+    first = items.first()
+    if first is not None:
+        print(first.name)
+    counts: dict<str, int> = {}
+    counts["x"] = 1
+    for k in counts:
+        print(k, counts[k] + 1)
+main()

@@ -20,8 +20,10 @@ pub enum Ty {
     /// The type of the literal `None` (only valid as an `Option`).
     NoneT,
     Tuple,
-    List,
-    Dict,
+    /// `list<T>`; `Unknown` when the element type is not known.
+    List(Box<Ty>),
+    /// `dict<K, V>`.
+    Dict(Box<Ty>, Box<Ty>),
     Func,
     /// A module-level `def` (immortal, copied freely).
     StaticFn,
@@ -48,6 +50,34 @@ pub fn elem_ty(e: Elem) -> Ty {
 }
 
 impl Ty {
+    pub fn list(t: Ty) -> Ty {
+        Ty::List(Box::new(t))
+    }
+
+    pub fn dict(k: Ty, v: Ty) -> Ty {
+        Ty::Dict(Box::new(k), Box::new(v))
+    }
+
+    /// The element type produced by indexing (a borrow) or `None` if unknown.
+    pub fn elem(&self) -> Option<Ty> {
+        let t = match self {
+            Ty::List(t) => (**t).clone(),
+            Ty::Dict(_, v) => (**v).clone(),
+            Ty::Array(Some(e)) => elem_ty(*e),
+            Ty::Str => Ty::Str,
+            _ => return None,
+        };
+        (t != Ty::Unknown).then_some(t)
+    }
+
+    /// The type of the items a `for` loop over this type produces.
+    pub fn item(&self) -> Ty {
+        match self {
+            Ty::Dict(k, _) => (**k).clone(),
+            _ => self.elem().unwrap_or(Ty::Unknown),
+        }
+    }
+
     /// `Some(true)` for copy types, `Some(false)` for move types.
     pub fn is_copy(&self) -> Option<bool> {
         match self {
@@ -72,6 +102,8 @@ impl Ty {
             (Ty::NoneT, t) | (t, Ty::NoneT) if *t != Ty::Unknown => Ty::Option(Box::new(t.clone())),
             (Ty::Option(a), b) | (b, Ty::Option(a)) if **a == *b => Ty::Option(a.clone()),
             (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+            (Ty::List(a), Ty::List(b)) => Ty::list(a.join(b)),
+            (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => Ty::dict(k1.join(k2), v1.join(v2)),
             _ => Ty::Unknown,
         }
     }
@@ -87,8 +119,10 @@ impl Ty {
             Ty::Unit => "()".into(),
             Ty::NoneT => "None".into(),
             Ty::Tuple => "tuple".into(),
-            Ty::List => "list".into(),
-            Ty::Dict => "dict".into(),
+            Ty::List(t) if **t == Ty::Unknown => "list".into(),
+            Ty::List(t) => format!("list<{}>", t.name()),
+            Ty::Dict(k, v) if **k == Ty::Unknown && **v == Ty::Unknown => "dict".into(),
+            Ty::Dict(k, v) => format!("dict<{}, {}>", k.name(), v.name()),
             Ty::Func | Ty::StaticFn => "function".into(),
             Ty::Generator => "generator".into(),
             Ty::Iter => "iterator".into(),
@@ -126,8 +160,18 @@ pub fn resolve(
                 "bigint" => no_args(Ty::BigInt, TypeDesc::BigInt),
                 "str" => no_args(Ty::Str, TypeDesc::Str),
                 "tuple" => no_args(Ty::Tuple, TypeDesc::Tuple),
-                "list" => no_args(Ty::List, TypeDesc::List),
-                "dict" => no_args(Ty::Dict, TypeDesc::Dict),
+                // Element types are checked statically; at runtime only the
+                // container type is.
+                "list" => match args.as_slice() {
+                    [] => Ok((Ty::list(Ty::Unknown), TypeDesc::List)),
+                    [t] => Ok((Ty::list(resolve(t, lookup)?.0), TypeDesc::List)),
+                    _ => Err("`list` takes one element type: `list<T>`".into()),
+                },
+                "dict" => match args.as_slice() {
+                    [] => Ok((Ty::dict(Ty::Unknown, Ty::Unknown), TypeDesc::Dict)),
+                    [k, v] => Ok((Ty::dict(resolve(k, lookup)?.0, resolve(v, lookup)?.0), TypeDesc::Dict)),
+                    _ => Err("`dict` takes a key and a value type: `dict<K, V>`".into()),
+                },
                 "function" | "Callable" | "Fn" => no_args(Ty::Func, TypeDesc::Function),
                 "any" | "Any" => no_args(Ty::Unknown, TypeDesc::Any),
                 "Lock" | "Channel" | "Thread" => no_args(Ty::Opaque(n.clone()), TypeDesc::Builtin(n.clone())),
