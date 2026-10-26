@@ -1096,7 +1096,7 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
 /// Finds a method for `recv.name`.
 pub fn lookup_method(recv: Value, name: &str) -> Option<Value> {
     match recv.body() {
-        Some(Body::Instance(inst)) => inst.class().methods.get(name).copied(),
+        Some(Body::Instance(inst)) => inst.class().method(name),
         Some(Body::Native(n)) => n.class().methods.get(name).copied(),
         _ => crate::builtins::type_method(recv, name),
     }
@@ -1113,7 +1113,7 @@ fn native_default(th: &Thread, recv: Value, name: &str) -> Option<Value> {
 /// native object.
 pub fn dunder(v: Value, name: &str) -> Option<Value> {
     match v.body() {
-        Some(Body::Instance(i)) => i.class().methods.get(name).copied(),
+        Some(Body::Instance(i)) => i.class().method(name),
         Some(Body::Native(n)) => n.class().methods.get(name).copied(),
         _ => None,
     }
@@ -1139,10 +1139,60 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
             let field = r.as_instance().and_then(|inst| inst.class().field_index(mname).map(|i| inst.get_borrowed(i)));
             match field {
                 Some(f) => invoke(th, Some(frame), f, None, None, &cargs),
-                None => Err(no_attribute(th, r, mname)),
+                None => match r.as_instance().map(|i| i.class().ambiguous(mname)).filter(|t| !t.is_empty()) {
+                    Some(traits) => Err(ambiguous_method(th, r, mname, &traits)),
+                    None => Err(no_attribute(th, r, mname)),
+                },
             }
         }
     };
+    if al.pins {
+        rc::unpin();
+    }
+    match result {
+        Ok(v) => {
+            frame.set(dst as Reg, v);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
+fn ambiguous_method(th: &mut Thread, v: Value, name: &str, traits: &[Value]) -> Raised {
+    let names: Vec<String> = traits.iter().filter_map(|t| t.as_trait()).map(|t| format!("`{}::{name}`", t.name)).collect();
+    let first = traits.first().and_then(|t| t.as_trait()).map(|t| t.name.as_str()).unwrap_or("Trait");
+    th.raise(
+        "TypeError",
+        format!("`{name}` is ambiguous for `{}`: {}; call it as `{first}::{name}(x)`", v.type_name(), names.join(" or ")),
+    )
+}
+
+/// `Trait::name(recv, args)`: the method trait `tr` provides for `recv`.
+pub extern "C" fn f_call_trait_method(th: &mut Thread, frame: &mut Frame, dst: u32, recv: u32, call: u32, args: u32) -> u32 {
+    let code = frame.code();
+    let (tg, name) = code.trait_calls[call as usize];
+    let mname = &code.names[name as usize];
+    let al = &code.arglists[args as usize];
+    let r = frame.reg(recv as Reg);
+    let cargs = collect_args(frame, &al.args);
+    if r.is_dead() {
+        raise_dead(th, frame, recv as Reg);
+        return RAISED;
+    }
+    let trv = th.vm.global(tg);
+    let m = match r.body() {
+        Some(Body::Instance(i)) => i.class().trait_method(trv, mname).or_else(|| i.class().implements(trv).then(|| i.class().method(mname)).flatten()),
+        _ => lookup_method(r, mname).or_else(|| native_default(th, r, mname)),
+    };
+    let Some(m) = m else {
+        let t = trv.as_trait().map(|t| t.name.clone()).unwrap_or_default();
+        th.raise("TypeError", format!("`{}` has no method `{t}::{mname}`", r.type_name()));
+        return RAISED;
+    };
+    if al.pins {
+        rc::pin();
+    }
+    let result = invoke(th, Some(frame), m, Some(r), Some(recv as Reg), &cargs);
     if al.pins {
         rc::unpin();
     }
@@ -1291,21 +1341,27 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
             }
         }
     }
+    let func = |ci: u32| Obj::alloc_immortal(Body::Function(Function { code: codes[ci as usize].clone(), captures: Box::new([]) }));
     let mut methods: HashMap<String, Value> = HashMap::new();
     for (name, ci) in &s.methods {
-        let f = Obj::alloc_immortal(Body::Function(Function { code: codes[*ci as usize].clone(), captures: Box::new([]) }));
-        methods.insert(name.clone(), f);
+        methods.insert(name.clone(), func(*ci));
+    }
+    let mut trait_methods: HashMap<String, Vec<(Value, Value)>> = HashMap::new();
+    for (tg, name, ci) in &s.trait_methods {
+        trait_methods.entry(name.clone()).or_default().push((resolve_global(th, *tg), func(*ci)));
     }
     for t in &traits {
         let tr = t.as_trait().unwrap();
         for (mname, default) in &tr.methods {
-            if methods.contains_key(mname) {
+            let entry = trait_methods.entry(mname.clone()).or_default();
+            if entry.iter().any(|(x, _)| x == t) {
                 continue;
             }
             match default {
-                Some(d) => {
-                    methods.insert(mname.clone(), *d);
-                }
+                Some(d) => entry.push((*t, *d)),
+                // Defined by the impl of a trait implying this one (`Num`
+                // provides `Ord`'s `__lt__`).
+                None if !entry.is_empty() || methods.contains_key(mname) => {}
                 None => {
                     return Err(th.raise(
                         "TypeError",
@@ -1322,6 +1378,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         .iter()
         .map(|f| Field::new(f.name.clone(), f.ty.clone(), slot_kind(&f.ty)))
         .collect();
+    trait_methods.retain(|_, v| !v.is_empty());
     let always_local = s.local;
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
     Ok(Obj::alloc_immortal(Body::Class(Class {
@@ -1330,6 +1387,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         tparams: s.tparams.clone(),
         fields,
         methods,
+        trait_methods,
         traits,
         trait_args,
         is_exception,

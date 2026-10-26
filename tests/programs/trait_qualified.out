@@ -1,0 +1,10 @@
+16370116.0 4046.0
+shape area 16370116.0
+land area 4046.0
+16370116.0 4046.0
+inherent name trait name
+8092.0 inherent name
+8092.0
+TypeError: `area` is ambiguous for `Plot`: `Shape::area` or `Land::area`; call it as `Shape::area(x)`
+rc-audit: ok
+[exit 0]

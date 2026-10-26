@@ -80,7 +80,11 @@ pub struct ClassInfo {
     pub local: bool,
     pub tparams: Vec<TParamSig>,
     pub fields: Vec<(String, Ty, TypeDesc)>,
+    /// Inherent methods (and a native class's Rust methods).
     pub methods: HashMap<String, Sig>,
+    /// Methods of trait impls, including inherited defaults: name ->
+    /// (trait, signature). Two traits may define the same name.
+    pub trait_methods: HashMap<String, Vec<(String, Sig)>>,
     /// Implemented traits with their type arguments (in terms of the class's
     /// type parameters), including the traits they imply.
     pub impls: Vec<(String, Vec<Ty>)>,
@@ -95,9 +99,41 @@ pub struct ClassInfo {
     pub trait_descs: Vec<(String, Vec<TypeDesc>)>,
 }
 
+/// How `x.name()` resolves on a struct, as in Rust: an inherent method
+/// first, else the single trait method of that name.
+enum MethodRef {
+    Inherent(Sig),
+    Trait(String, Sig),
+    /// Several traits define it: a qualified call (`Trait::name(x)`) is needed.
+    Ambiguous(Vec<String>),
+}
+
+impl ClassInfo {
+    fn lookup(&self, name: &str) -> Option<MethodRef> {
+        if let Some(s) = self.methods.get(name) {
+            return Some(MethodRef::Inherent(s.clone()));
+        }
+        match self.trait_methods.get(name).map(|v| v.as_slice()) {
+            Some([(t, s)]) => Some(MethodRef::Trait(t.clone(), s.clone())),
+            Some(v) if !v.is_empty() => {
+                let mut ts: Vec<String> = v.iter().map(|(t, _)| t.clone()).collect();
+                ts.sort();
+                Some(MethodRef::Ambiguous(ts))
+            }
+            _ => None,
+        }
+    }
+
+    fn trait_method(&self, tr: &str, name: &str) -> Option<Sig> {
+        self.trait_methods.get(name)?.iter().find(|(t, _)| t == tr).map(|(_, s)| s.clone())
+    }
+}
+
 /// A method of a struct from one of its `impl` blocks, for code generation.
 #[derive(Clone)]
 pub struct ImplMethod {
+    /// The trait of a trait impl; `None` for an inherent method.
+    pub tr: Option<String>,
     pub def: FuncDef,
     /// The impl's names for the struct's type parameters, in order
     /// (`impl<U> Stack<U>` names the first one `U`).
@@ -504,7 +540,7 @@ fn native_class_info(c: &slim_vm::native::ClassSpec, m: &ModuleSpec, names: &Nat
         // A generic family implements what every instantiation does.
         impls = first.impls.iter().filter(|t| instances.iter().all(|(_, i)| i.impls.contains(t))).cloned().collect();
     }
-    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls, instances, native: true, trait_descs: Vec::new() }
+    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, trait_methods: HashMap::new(), impls, instances, native: true, trait_descs: Vec::new() }
 }
 
 fn native_sig(f: &FnSpec, classes: &NativeNames) -> Sig {
@@ -615,6 +651,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                     tparams: names(&c.tparams),
                     fields: Vec::new(),
                     methods: HashMap::new(),
+                    trait_methods: HashMap::new(),
                     impls: Vec::new(),
                     instances: Vec::new(),
                     native: false,
@@ -712,7 +749,10 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 if let Some(tm) = info.trait_methods_for(&tname, &targs, self_ty.clone()) {
                     let ci = info.classes.get_mut(&c.name).unwrap();
                     for (n, sig) in tm {
-                        ci.methods.entry(n).or_insert(sig);
+                        let e = ci.trait_methods.entry(n).or_default();
+                        if !e.iter().any(|(t, _)| *t == tname) {
+                            e.push((tname.clone(), sig));
+                        }
                     }
                 }
             }
@@ -857,7 +897,8 @@ fn collect_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
             return Err(type_err(format!("a destructor is defined by implementing `Drop`: `impl Drop for {tn}:`"), m.span));
         }
         let sig = info.sig_of(m, true, &outer)?.subst(&to_class);
-        if sigs.iter().any(|(n, _, _)| *n == m.name) || info.classes[tn].methods.contains_key(&m.name) {
+        let twice = sigs.iter().any(|(n, _, _)| *n == m.name) || (i.tr.is_none() && info.classes[tn].methods.contains_key(&m.name));
+        if twice {
             return Err(type_err(format!("method `{}` of `{tn}` is defined twice", m.name), m.span));
         }
         sigs.push((m.name.clone(), sig, m.span));
@@ -866,11 +907,17 @@ fn collect_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
         check_trait_impl(info, module, tn, &self_ty, tr, trargs, *trspan, &scope, &to_class, &sigs, i.span)?;
     }
     let ci = info.classes.get_mut(tn).unwrap();
+    let tr = i.tr.as_ref().map(|t| t.0.clone());
     for (n, sig, _) in sigs {
-        ci.methods.insert(n, sig);
+        match &tr {
+            Some(t) => ci.trait_methods.entry(n).or_default().push((t.clone(), sig)),
+            None => {
+                ci.methods.insert(n, sig);
+            }
+        }
     }
     let methods = i.methods.iter().filter(|m| m.params.first().is_some_and(|p| p.name == "self")).cloned();
-    info.impl_methods.entry(tn.clone()).or_default().extend(methods.map(|def| ImplMethod { def, tparams: pnames.clone() }));
+    info.impl_methods.entry(tn.clone()).or_default().extend(methods.map(|def| ImplMethod { tr: tr.clone(), def, tparams: pnames.clone() }));
     Ok(())
 }
 
@@ -1055,7 +1102,9 @@ fn impl_for(info: &mut ModInfo, module: &Module, tr: &str, targs: &[TypeExpr], t
             }
         }
         for (n, sig) in &defaults {
-            k.methods.entry(n.clone()).or_insert_with(|| sig.clone());
+            if !k.methods.contains_key(n) {
+                k.trait_methods.entry(n.clone()).or_default().push((tr.to_string(), sig.clone()));
+            }
         }
     };
     let ci = info.classes.get_mut(target).unwrap();
@@ -1218,6 +1267,7 @@ struct FnCtx<'m> {
     consts: Vec<Value>,
     names: Vec<String>,
     arglists: Vec<ArgList>,
+    trait_calls: Vec<(u32, u32)>,
     types: Vec<TypeDesc>,
     codes: Vec<Arc<Code>>,
     classes: Vec<ClassSpec>,
@@ -1288,6 +1338,7 @@ impl<'m> FnCtx<'m> {
             consts: Vec::new(),
             names: Vec::new(),
             arglists: Vec::new(),
+            trait_calls: Vec::new(),
             types: Vec::new(),
             codes: Vec::new(),
             classes: Vec::new(),
@@ -1362,6 +1413,7 @@ impl<'m> FnCtx<'m> {
             consts: self.consts,
             names: self.names,
             arglists: self.arglists,
+            trait_calls: self.trait_calls,
             types: self.types,
             type_cache,
             tparams: self.code_tparams,
@@ -2590,7 +2642,7 @@ impl<'m> FnCtx<'m> {
             if let Some(ci) = self.m.class_info(c, args) {
                 if let Some((_, fty, _)) = ci.fields.iter().find(|(n, _, _)| n == name) {
                     ty = fty.subst(&class_map(ci, args)).as_value();
-                } else if ci.methods.contains_key(name) {
+                } else if ci.lookup(name).is_some() {
                     ty = self.func_ty(self.may_be_local(&o.ty));
                 } else {
                     return Err(Error::new("AttributeError", format!("`{c}` has no field or method `{name}`"), span));
@@ -2598,7 +2650,7 @@ impl<'m> FnCtx<'m> {
             }
         }
         if let Ty::Param(n) = &o.ty {
-            if self.param_method(n, name).is_none() {
+            if self.param_method(n, name).is_empty() {
                 return Err(type_err(param_field_msg(n, name), span));
             }
             ty = self.func_ty(self.may_be_local(&o.ty));
@@ -3696,12 +3748,12 @@ impl<'m> FnCtx<'m> {
             return Ok(g);
         }
         match self.m.classes.get(tn) {
-            Some(ci) if ci.methods.contains_key(n) => {
+            Some(ci) if ci.lookup(n).is_some() => {
                 Err(type_err(format!("`{n}` is a method of `{tn}`, not an associated function: call it on a value (`x.{n}(...)`)"), span))
             }
             Some(_) => Err(Error::new("AttributeError", format!("`{tn}` has no associated function `{n}`"), span)),
             None if self.m.traits.contains_key(tn) || builtin_trait(tn).is_some() => {
-                Err(type_err(format!("qualified trait calls (`{tn}::{n}(x)`) are not supported yet; call `x.{n}()`"), span))
+                Err(type_err(format!("`{tn}::{n}` is a trait method: call it with a receiver (`{tn}::{n}(x, ..)` or `x.{n}()`)"), span))
             }
             None => Err(name_err(format!("`{tn}` is not a struct"), span)),
         }
@@ -3805,6 +3857,19 @@ impl<'m> FnCtx<'m> {
         // `Type::f(...)` / `Type::<T>::f(...)`: the module function `Type::f`
         // (its leading type parameters are the impl's).
         if let ExprKind::Path(base, n) = &f.kind {
+            // `Trait::m(x, ..)` / `Type::m(x, ..)`: a method with `x` as `self`.
+            if let ExprKind::Name(tn) = &base.kind {
+                let is_trait = self.m.traits.contains_key(tn);
+                let is_method = !is_trait
+                    && !self.m.funcs.contains_key(&format!("{tn}::{n}"))
+                    && self.m.classes.get(tn).is_some_and(|ci| ci.lookup(n).is_some());
+                if is_trait || is_method {
+                    let Some((recv, rest)) = args.split_first() else {
+                        return Err(type_err(format!("`{tn}::{n}` needs the receiver as its first argument: `{tn}::{n}(x, ..)`"), span));
+                    };
+                    return self.method_call_q(recv, n, rest, expect, span, is_trait.then_some(tn.as_str()));
+                }
+            }
             let (b, targs) = match &base.kind {
                 ExprKind::TypeApp(b, ts) => (&**b, Some(ts)),
                 _ => (&**base, None),
@@ -4233,38 +4298,85 @@ impl<'m> FnCtx<'m> {
         }
     }
 
-    /// A method of a value of type parameter `n`, from its bounds:
-    /// `Some(Some(sig))` for a user trait's method, `Some(None)` for a
-    /// builtin trait's, `None` if no bound provides it.
-    fn param_method(&self, n: &str, mname: &str) -> Option<Option<Sig>> {
+    /// The bounds of type parameter `n` that provide method `mname`: (trait,
+    /// signature) for a user trait's method, (trait, `None`) for a builtin
+    /// trait's.
+    fn param_method(&self, n: &str, mname: &str) -> Vec<(String, Option<Sig>)> {
+        let mut out = Vec::new();
         for b in self.pbounds(n) {
             let Ty::Trait(bn, bargs) = &b else { continue };
             if let Some(ms) = self.m.trait_methods_for(bn, bargs, Ty::Param(n.into())) {
                 if let Some(s) = ms.get(mname) {
-                    return Some(Some(s.clone()));
+                    out.push((bn.clone(), Some(s.clone())));
                 }
             } else if let Some((_, _, implies, methods)) = builtin_trait(bn) {
                 let implied = implies.iter().filter_map(|i| builtin_trait(i)).any(|t| t.3.contains(&mname));
                 if methods.contains(&mname) || implied {
-                    return Some(None);
+                    out.push((bn.clone(), None));
                 }
             }
         }
-        None
+        out
+    }
+
+    /// Emits a call of method `mname` on `recv`: by name, or as the method
+    /// of trait `qual` (`Trait::name(x)`).
+    fn emit_method_call(&mut self, dst: Reg, recv: Reg, mname: &str, args: u32, qual: Option<&str>) {
+        let name = self.name_idx(mname);
+        match qual {
+            Some(t) => {
+                let tc = (self.m.gindex[t], name);
+                let call = match self.trait_calls.iter().position(|x| *x == tc) {
+                    Some(i) => i as u32,
+                    None => {
+                        self.trait_calls.push(tc);
+                        (self.trait_calls.len() - 1) as u32
+                    }
+                };
+                self.emit(Instr::CallTraitMethod { dst, recv, call, args });
+            }
+            None => {
+                self.emit(Instr::CallMethod { dst, recv, name, args });
+            }
+        }
     }
 
     fn method_call(&mut self, recv: &Expr, mname: &str, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
+        self.method_call_q(recv, mname, args, expect, span, None)
+    }
+
+    /// A method call; `force`: the trait of a qualified call
+    /// (`Trait::name(x, ..)`).
+    fn method_call_q(&mut self, recv: &Expr, mname: &str, args: &[Expr], expect: Option<Ty>, span: Span, force: Option<&str>) -> R<Res> {
         let r = self.expr(recv)?;
         if mname != "some_or" {
             self.option_check(&r, &format!("calling `.{mname}()`"), span)?;
         }
         let mut sig: Option<Sig> = None;
-        match &r.ty {
+        // The trait whose method this is: the call is qualified with it.
+        let mut qual: Option<String> = force.map(String::from);
+        let ambiguous = |c: &str, ts: &[String]| {
+            let names: Vec<String> = ts.iter().map(|t| format!("`{t}::{mname}`")).collect();
+            type_err(format!("`{mname}` is ambiguous for `{c}`: {}; call it as `{}::{mname}(x)`", names.join(" or "), ts[0]), span)
+        };
+        match r.ty.peel() {
             Ty::Instance(c, cargs) => {
                 if let Some(ci) = self.m.class_info(c, cargs) {
-                    match ci.methods.get(mname) {
-                        Some(s) => sig = Some(s.subst(&class_map(ci, cargs))),
-                        None => {
+                    let map = class_map(ci, cargs);
+                    match (force, ci.lookup(mname)) {
+                        (Some(t), _) => match ci.trait_method(t, mname) {
+                            Some(s) => sig = Some(s.subst(&map)),
+                            // A native class's Rust method implements its traits.
+                            None if ci.native && ci.methods.contains_key(mname) => sig = ci.methods.get(mname).map(|s| s.subst(&map)),
+                            None => return Err(type_err(format!("`{c}` has no method `{t}::{mname}`"), span)),
+                        },
+                        (None, Some(MethodRef::Inherent(s))) => sig = Some(s.subst(&map)),
+                        (None, Some(MethodRef::Trait(t, s))) => {
+                            sig = Some(s.subst(&map));
+                            qual = Some(t);
+                        }
+                        (None, Some(MethodRef::Ambiguous(ts))) => return Err(ambiguous(c, &ts)),
+                        (None, None) => {
                             if !ci.fields.iter().any(|(n, _, _)| n == mname) {
                                 return Err(Error::new("AttributeError", format!("`{c}` has no method `{mname}`"), span));
                             }
@@ -4275,21 +4387,43 @@ impl<'m> FnCtx<'m> {
             Ty::Trait(t, targs) => {
                 if let Some(tm) = self.m.trait_methods(t, targs) {
                     match tm.get(mname) {
-                        Some(s) => sig = Some(s.clone()),
+                        Some(s) => {
+                            sig = Some(s.clone());
+                            qual = Some(t.clone());
+                        }
                         None => return Err(Error::new("AttributeError", format!("trait `{t}` has no method `{mname}`"), span)),
                     }
                 }
             }
-            Ty::Param(n) => match self.param_method(n, mname) {
-                Some(s) => sig = s,
-                None => {
-                    return Err(type_err(
-                        format!("type parameter `{n}` has no method `{mname}`; add a bound whose trait provides it (`{n}: SomeTrait`)"),
-                        span,
-                    ))
+            Ty::Param(n) => {
+                let mut found = self.param_method(n, mname);
+                if let Some(t) = force {
+                    found.retain(|(b, _)| b == t);
                 }
-            },
+                match found.as_slice() {
+                    [] => {
+                        return Err(type_err(
+                            format!("type parameter `{n}` has no method `{mname}`; add a bound whose trait provides it (`{n}: SomeTrait`)"),
+                            span,
+                        ))
+                    }
+                    [(t, s)] => {
+                        sig = s.clone();
+                        // Builtin traits' methods are found by name.
+                        if s.is_some() {
+                            qual = Some(t.clone());
+                        }
+                    }
+                    many => {
+                        let ts: Vec<String> = many.iter().map(|(t, _)| t.clone()).collect();
+                        return Err(ambiguous(n, &ts));
+                    }
+                }
+            }
             _ => {}
+        }
+        if qual.as_ref().is_some_and(|t| !self.m.gindex.contains_key(t)) {
+            qual = None;
         }
         if let Some(s) = sig.clone().filter(|s| !s.tparams.is_empty()) {
             // A generic method: infer its own type arguments.
@@ -4308,8 +4442,7 @@ impl<'m> FnCtx<'m> {
             }
             let dst = self.tmp_owned();
             let a = self.arglist(al.clone());
-            let n = self.name_idx(mname);
-            self.emit(Instr::CallMethod { dst, recv: r.reg, name: n, args: a });
+            self.emit_method_call(dst, r.reg, mname, a, qual.as_deref());
             self.after_call(&al);
             if r.own == Own::Owned {
                 self.emit(Instr::Drop { reg: r.reg });
@@ -4364,8 +4497,7 @@ impl<'m> FnCtx<'m> {
         }
         let dst = self.tmp_owned();
         let a = self.arglist(al.clone());
-        let n = self.name_idx(mname);
-        self.emit(Instr::CallMethod { dst, recv: r.reg, name: n, args: a });
+        self.emit_method_call(dst, r.reg, mname, a, qual.as_deref());
         self.after_call(&al);
         if r.own == Own::Owned {
             self.emit(Instr::Drop { reg: r.reg });
@@ -4788,16 +4920,21 @@ impl<'m> FnCtx<'m> {
             args.iter().try_for_each(|a| self.m.check_wf(a, &pb, c.span))?;
         }
         let mut methods = Vec::new();
+        let mut trait_methods = Vec::new();
         for im in self.m.impl_methods.get(&c.name).into_iter().flatten() {
             let code = compile_function(self.m, &im.def, Owner::Class(&c.name, &im.tparams), &[], &[])?;
             self.codes.push(Arc::new(code));
-            methods.push((im.def.name.clone(), (self.codes.len() - 1) as u32));
+            let ci = (self.codes.len() - 1) as u32;
+            match &im.tr {
+                Some(t) => trait_methods.push((self.m.gindex[t], im.def.name.clone(), ci)),
+                None => methods.push((im.def.name.clone(), ci)),
+            }
         }
         let fields = info.fields.iter().map(|(n, _, d)| FieldSpec { name: n.clone(), ty: d.clone() }).collect();
         let traits = info.trait_descs.iter().map(|(t, ds)| (self.m.gindex[t], t.clone(), ds.clone())).collect();
         let tparams = c.tparams.iter().map(|t| t.name.clone()).collect();
         let local = info.local;
-        self.classes.push(ClassSpec { name: c.name.clone(), tparams, fields, methods, traits, local });
+        self.classes.push(ClassSpec { name: c.name.clone(), tparams, fields, methods, trait_methods, traits, local });
         let dst = self.tmp_owned();
         self.emit(Instr::MakeClass { dst, spec: (self.classes.len() - 1) as u32 });
         let idx = self.m.gindex[&c.name];

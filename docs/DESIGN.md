@@ -107,7 +107,12 @@ report = |n: int| {
 - **Structs, impls and traits (10d).** As in Rust: `struct Name<T>:` declares the fields (or `struct Marker` none), `impl<T> Name<T>:` adds methods (first parameter `self`) and associated functions (no `self`, called `Name::f(..)` or `Name::<int>::f(..)`), and `impl<T> Trait<args> for Name<T>:` implements a trait. A marker impl has no body (`impl Exception for AppError`).
   - **Traits** are defined as before: `trait Shape:` with required methods (`...` body) and defaults (real bodies). `Self` in a trait's signatures is the implementing type; in a default method it is `self`'s runtime type. Traits are used in annotations (`s: Shape`, `list<Shape + Send>`), as bounds (`T: Shape`) and with `isinstance`.
   - **Checks.** An impl of a trait must define every required method with the trait's parameter types (after substituting `Self` and the trait's arguments) and a compatible return type, and nothing the trait doesn't declare; defaults are inherited. `Send` is never implemented (it follows the fields), and a struct cannot implement another struct.
-  - **Methods** of several `impl` blocks are merged; a name defined twice (or both a field and a method) is an error. Operator dunders (`__add__`, `__lt__`, ...) may be inherent methods; `__drop__` only in `impl Drop for T`. Structs are sealed (fixed slots, no monkeypatching).
+  - **Methods** of several inherent `impl` blocks are merged; an inherent name defined twice (or both a field and a method) is an error.
+  - **Trait-qualified methods (10e).** Each trait impl keeps its own methods, so two traits may define the same name for one type (`Shape::area` and `Land::area`). As in Rust:
+    - `x.m()` on a struct-typed receiver picks the inherent method if there is one, else the single trait method named `m`; with several, it is a compile error naming the candidates.
+    - `Trait::m(x, ..)` calls trait `Trait`'s method with `x` as `self`; `Type::m(x, ..)` calls `Type`'s method (inherent first) the same way.
+    - A trait-typed receiver (`s: Shape`), a bounded one (`T: Shape`; ambiguous across bounds is an error) and `self` in a trait's default methods use that trait's method.
+    - These calls compile to `CallTraitMethod` (the trait's global plus the method name), which finds the method in the class's per-trait table. An untyped receiver keeps the dynamic `CallMethod`, which raises `TypeError` "`area` is ambiguous for `Plot`" when only several traits provide the name. Operator dunders (`__add__`, `__lt__`, ...) may be inherent methods; `__drop__` only in `impl Drop for T`. Structs are sealed (fixed slots, no monkeypatching).
   - **Impls cover the whole struct**: `impl<A, B> Pair<A, B>` with the struct's own bounds (any names). Specialized or conditional impls are not supported yet.
   - **Items are order-independent.** Traits, structs (with their impls) and associated functions are defined at module start, before the module's statements run, so an impl may come before its trait.
   - Calling a struct (`Point(1.0, 2.0)`) is an error; `class` is a syntax error that explains the replacement.
@@ -325,7 +330,7 @@ pub trait Backend {
 8. **Lock-free-read `list` and `dict`;** no negative indexes.
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
-10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`.
+10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`. **10e:** trait-qualified methods (`Trait::m(x)`).
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**

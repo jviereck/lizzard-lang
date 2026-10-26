@@ -1,0 +1,5 @@
+  File "err_trait_method_missing.slim", line 15
+    print(Land::acres(p))
+                     ^
+TypeError: `Plot` has no method `Land::acres`
+[exit 1]

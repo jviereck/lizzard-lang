@@ -173,8 +173,10 @@ pub struct ClassSpec {
     /// Type parameter names (`Param(k)` in field and trait types).
     pub tparams: Vec<String>,
     pub fields: Vec<FieldSpec>,
-    /// (method name, index into `Code::codes`)
+    /// Inherent methods: (method name, index into `Code::codes`).
     pub methods: Vec<(String, u32)>,
+    /// Methods of trait impls: (trait global slot, method name, code index).
+    pub trait_methods: Vec<(u32, String, u32)>,
     /// Implemented traits: global slot, name and type arguments.
     pub traits: Vec<(u32, String, Vec<TypeDesc>)>,
     /// Instances are local (the class is not `Send`): a field's type is not
@@ -213,6 +215,8 @@ pub struct Code {
     pub consts: Vec<Value>,
     pub names: Vec<String>,
     pub arglists: Vec<ArgList>,
+    /// `CallTraitMethod` targets: (trait global slot, index into `names`).
+    pub trait_calls: Vec<(u32, u32)>,
     pub types: Vec<TypeDesc>,
     /// Runtime type values of `types`, filled in on first use (for types
     /// that do not mention type parameters).

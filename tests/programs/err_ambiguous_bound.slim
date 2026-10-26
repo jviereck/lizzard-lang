@@ -1,0 +1,8 @@
+trait Shape:
+    def area(self) -> float: ...
+
+trait Land:
+    def area(self) -> float: ...
+
+def f<T: Shape + Land>(x: T) -> float:
+    x.area()

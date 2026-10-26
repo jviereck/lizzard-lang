@@ -124,7 +124,11 @@ pub struct Class {
     /// Type parameter names; field and trait types refer to them by index.
     pub tparams: Vec<String>,
     pub fields: Vec<Field>,
+    /// Inherent methods.
     pub methods: HashMap<String, Value>,
+    /// Methods of trait impls (and inherited defaults), by name: (trait,
+    /// function). Two traits may define the same name.
+    pub trait_methods: HashMap<String, Vec<(Value, Value)>>,
     /// Trait objects this class implements (including implied ones).
     pub traits: Vec<Value>,
     /// Type arguments of generic implemented traits (`impl Iterable<T>`).
@@ -144,6 +148,31 @@ impl Class {
 
     pub fn implements(&self, tr: Value) -> bool {
         self.traits.contains(&tr)
+    }
+
+    /// `x.name()` without a trait: the inherent method, else the only trait
+    /// method of that name (`None` if there is none or it is ambiguous).
+    pub fn method(&self, name: &str) -> Option<Value> {
+        if let Some(m) = self.methods.get(name) {
+            return Some(*m);
+        }
+        match self.trait_methods.get(name).map(|v| v.as_slice()) {
+            Some([(_, m)]) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// `Trait::name(x)`: the method of trait `tr`.
+    pub fn trait_method(&self, tr: Value, name: &str) -> Option<Value> {
+        self.trait_methods.get(name)?.iter().find(|(t, _)| *t == tr).map(|(_, m)| *m)
+    }
+
+    /// The traits defining `name` when an unqualified call is ambiguous.
+    pub fn ambiguous(&self, name: &str) -> Vec<Value> {
+        match self.trait_methods.get(name) {
+            Some(v) if v.len() > 1 && !self.methods.contains_key(name) => v.iter().map(|(t, _)| *t).collect(),
+            _ => Vec::new(),
+        }
     }
 }
 

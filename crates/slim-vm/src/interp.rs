@@ -199,7 +199,7 @@ impl Thread {
             FreeCheck::Skip => return false,
         }
         if let Body::Instance(inst) = &obj.body {
-            if let Some(&m) = inst.class().methods.get("__drop__") {
+            if let Some(m) = inst.class().method("__drop__") {
                 let me = Value(p as u64);
                 // Hold a temporary reference while the destructor runs.
                 obj.hold_for_drop();

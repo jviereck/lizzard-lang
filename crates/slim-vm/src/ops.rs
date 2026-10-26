@@ -129,6 +129,8 @@ opcodes! {
 
     Call { dst: Reg, func: Reg, args: u32 } => sem::call;
     CallMethod { dst: Reg, recv: Reg, name: u32, args: u32 } => sem::call_method;
+    /// `Trait::name(recv, ..)`: the method of trait `trait_calls[call]`.
+    CallTraitMethod { dst: Reg, recv: Reg, call: u32, args: u32 } => sem::call_trait_method;
     Return { src: Reg } => sem::ret;
     Yield { dst: Reg, src: Reg } => sem::yield_;
 

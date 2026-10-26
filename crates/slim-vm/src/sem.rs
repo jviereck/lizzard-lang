@@ -365,6 +365,10 @@ pub fn make_trait<B: Backend>(b: &mut B, dst: Reg, spec: u32) -> Flow<()> {
     b.frame_op(h::f_make_trait, dst as u32, spec, 0, 0)
 }
 
+pub fn call_trait_method<B: Backend>(b: &mut B, dst: Reg, recv: Reg, call: u32, args: u32) -> Flow<()> {
+    b.frame_op(h::f_call_trait_method, dst as u32, recv as u32, call, args)
+}
+
 pub fn impl_native<B: Backend>(b: &mut B, tr: u32, class: u32) -> Flow<()> {
     b.frame_op(h::f_impl_native, tr, class, 0, 0)
 }

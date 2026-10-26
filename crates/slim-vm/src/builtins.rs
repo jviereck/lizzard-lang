@@ -92,14 +92,14 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
         }
         Some(Body::Instance(inst)) => {
             let class = inst.class();
-            if let Some(&m) = class.methods.get("__iter__") {
+            if let Some(m) = class.method("__iter__") {
                 let it = helpers::call_simple(th, m, Some(v), &[])?;
                 if it.as_instance().is_some() {
                     return Ok(new_iter(rtype::any(), IterKind::Object { obj: it }));
                 }
                 return Ok(it);
             }
-            if class.methods.contains_key("__next__") {
+            if class.method("__next__").is_some() {
                 v.incref();
                 return Ok(new_iter(rtype::any(), IterKind::Object { obj: v }));
             }
@@ -167,7 +167,7 @@ pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
                 IterKind::Object { obj } => {
                     let obj = *obj;
                     drop(k);
-                    let Some(&m) = obj.as_instance().and_then(|i| i.class().methods.get("__next__")) else {
+                    let Some(m) = obj.as_instance().and_then(|i| i.class().method("__next__")) else {
                         return Err(th.raise("TypeError", format!("'{}' object is not an iterator", obj.type_name())));
                     };
                     match helpers::call_simple(th, m, Some(obj), &[]) {
@@ -992,6 +992,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
             tparams: Vec::new(),
             fields: vec![Field::new("msg".into(), TypeDesc::prim(Ctor::Str), SlotKind::Value)],
             methods: HashMap::new(),
+            trait_methods: HashMap::new(),
             traits: tr,
             trait_args: Vec::new(),
             is_exception: true,
