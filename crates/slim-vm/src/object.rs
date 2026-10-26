@@ -185,9 +185,9 @@ pub struct Trait {
     pub methods: Vec<(String, Option<Value>)>,
     /// Traits implied by this one (e.g. `KeyError`'s `LookupError` implies `Exception`).
     pub implies: Vec<Value>,
-    /// Native classes the program implements this trait for
-    /// (`impl Describe for Polygon`).
-    pub native_impls: std::sync::RwLock<Vec<Value>>,
+    /// Registered impls of this trait (and of traits implying it): for
+    /// builtin types, native classes, specialized or conditional targets.
+    pub impls: std::sync::RwLock<Vec<&'static crate::rtype::RtImpl>>,
 }
 
 pub struct Instance {

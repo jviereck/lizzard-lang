@@ -165,6 +165,7 @@ fn stack<T: FromSlim + IntoSlim + Clone + 'static>(c: &mut ClassBuilder<Stack<T>
     c.method("peek", |s: &Stack<T>| s.items.last().cloned());
     c.method("len", |s: &Stack<T>| s.items.len() as i64);
     c.method("__len__", |s: &Stack<T>| s.items.len() as i64);
+    c.implements("Len");
     c.locked();
 }
 
@@ -454,7 +455,6 @@ trait Describe:
         "area " + str(self.area())
 
 impl Describe for Polygon
-impl Len for Stack
 
 def tri(k: float) -> Polygon:
     p = Polygon()
@@ -527,8 +527,57 @@ main()
     // Items are order-independent: an impl may come before its trait.
     let l = ok("from util import log\nfrom geom import Polygon\nimpl D for Polygon\nlog(Polygon().d())\ntrait D:\n    def area(self) -> float: ...\n    def d(self) -> str:\n        str(self.area())\n");
     assert_eq!(l, ["0.0"]);
+    // A program's traits for native classes, with bodies; for every
+    // instantiation of a generic one, or a single one.
+    let l = ok(r#"
+from util import log
+from geom import Polygon, Stack
+trait Describe:
+    def area(self) -> float: ...
+    def name(self) -> str:
+        "a shape"
+    def describe(self) -> str:
+        self.name() + " of area " + str(self.area())
+impl Describe for Polygon:
+    def name(self) -> str:
+        "polygon"
+trait Count:
+    def count(self) -> int: ...
+impl<T> Count for Stack<T>:
+    def count(self) -> int:
+        self.len()
+trait Top:
+    def top(self) -> str: ...
+impl Top for Stack<str>:
+    def top(self) -> str:
+        self.peek().some_or("empty")
+def total<T: Count>(xs: list<T>) -> int:
+    n = 0
+    for x in xs:
+        n = n + x.count()
+    n
+def main() -> ():
+    p = Polygon()
+    p.add(0.0, 0.0)
+    p.add(4.0, 0.0)
+    p.add(0.0, 3.0)
+    log(p.describe() + ", " + str(Describe::area(p)))
+    s = Stack::<int>()
+    s.push(1)
+    s.push(2)
+    t = Stack::<str>()
+    log(str(s.count()) + " " + str(Count::count(t)) + " " + t.top() + " " + str(total([s++, s++])))
+    t.push("x")
+    log(t.top() + " " + str(isinstance(s, Count)) + " " + str(isinstance(s, Top)) + " " + str(isinstance(t, Top)))
+main()
+"#);
+    assert_eq!(l, ["polygon of area 6.0, 6.0", "2 0 empty 4", "x True False True"]);
+    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl<T> C for Stack<T>:\n    def c(self) -> int:\n        1\nimpl C for Stack<int>:\n    def c(self) -> int:\n        2\n");
+    assert!(e.contains("conflicting implementations of `C`: `impl C for geom.Stack<int>` overlaps `impl C for geom.Stack<T>`"), "{e}");
+    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl C for Stack<float>:\n    def c(self) -> int:\n        1\n");
+    assert!(e.contains("`geom.Stack<float>` is not available"), "{e}");
     let e = err("from geom import Polygon\nimpl Len for Polygon\n");
-    assert!(e.contains("`geom.Polygon` already implements `Len`"), "{e}");
+    assert!(e.contains("`impl Len for geom.Polygon`: both are foreign"), "{e}");
 
     let e = err("from geom import Stack, Point\ndef untyped(x):\n    x++\ndef main() -> ():\n    xs: list<any + Send> = []\n    xs.append(untyped(Stack::<Point>()))\nmain()\n");
     assert!(e.contains("cannot store `Stack<Point>`, which is not `Send`, in `list<any + Send>`"), "{e}");

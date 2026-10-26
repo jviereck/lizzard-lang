@@ -1,0 +1,5 @@
+  File "err_impl_overlap_struct.slim", line 11
+    impl D for Box<int>:
+    ^
+TypeError: conflicting implementations of `D`: `impl D for Box<int>` overlaps the implementation for every `Box`
+[exit 1]

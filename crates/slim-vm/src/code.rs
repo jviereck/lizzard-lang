@@ -184,6 +184,27 @@ pub struct ClassSpec {
     pub local: bool,
 }
 
+/// An impl that does not cover a whole struct of the program: for a builtin
+/// type (`impl Describe for int`), a native class, a specialized struct
+/// (`impl Describe for Box<int>`) or with extra bounds (`impl<T: Ord> Ord
+/// for Box<T>`). It is registered at runtime and matched against the type of
+/// a value.
+#[derive(Clone, Debug)]
+pub struct ImplSpec {
+    /// `impl Describe for int`, for messages.
+    pub name: String,
+    /// The target type; `Param(k)` is the impl's `k`th type parameter.
+    pub target: TypeDesc,
+    pub nparams: usize,
+    /// Bounds of the impl's type parameters: (parameter, trait type).
+    pub bounds: Vec<(u16, TypeDesc)>,
+    /// The trait's global slot (`None` for an inherent impl).
+    pub tr: Option<u32>,
+    pub trait_args: Vec<TypeDesc>,
+    /// (method name, index into `Code::codes`)
+    pub methods: Vec<(String, u32)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TraitSpec {
     pub name: String,
@@ -228,6 +249,7 @@ pub struct Code {
     pub codes: Vec<Arc<Code>>,
     pub classes: Vec<ClassSpec>,
     pub traits: Vec<TraitSpec>,
+    pub impls: Vec<ImplSpec>,
     pub exc_table: Vec<ExcEntry>,
     pub ncaptures: u16,
     pub is_generator: bool,

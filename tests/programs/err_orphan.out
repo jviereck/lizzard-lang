@@ -1,0 +1,5 @@
+  File "err_orphan.slim", line 1
+    impl Ord for int:
+         ^
+TypeError: `impl Ord for int`: both are foreign (orphan rule: the trait or the type must be defined in this program)
+[exit 1]

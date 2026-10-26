@@ -69,6 +69,8 @@ fn type_prologue(th: &mut Thread, code: &crate::code::Code, regs: &mut [Value], 
             Instr::LoadTraitArg { dst, obj, tr, k } => {
                 regs[dst as usize] = crate::helpers::trait_arg(th, regs[obj as usize], tr, k)?
             }
+            Instr::LoadTypeOf { dst, obj } => regs[dst as usize] = crate::rtype::type_of(regs[obj as usize]),
+            Instr::LoadImplArg { dst, obj, ty, k } => regs[dst as usize] = crate::helpers::impl_arg(th, code, regs[obj as usize], ty, k)?,
             Instr::LoadCapture { dst, idx } if code.reg_names[dst as usize].as_deref().is_some_and(|n| n.starts_with('<')) => {
                 regs[dst as usize] = captures[idx as usize]
             }

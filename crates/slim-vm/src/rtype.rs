@@ -269,10 +269,11 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
     let native_impl = |name: &str| {
         native.is_some_and(|(_, nc)| nc.builtin_traits.contains(&name) || nc.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name)))
     };
-    let script_impl = || native.is_some_and(|(v, _)| trait_.native_impls.read().unwrap().contains(&v));
-    let implements = |name: &str| {
-        class.is_some_and(|c| c.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name))) || native_impl(name) || script_impl()
-    };
+    let implements = |name: &str| class.is_some_and(|c| c.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name))) || native_impl(name);
+    // A registered impl (`impl Describe for int`, `impl<T: Ord> Ord for Box<T>`).
+    if trait_.name != "Send" && trait_.impls.read().unwrap().iter().any(|i| i.provides(t, tr)) {
+        return true;
+    }
     // Tuples (and `Option`s, for hashing) qualify when all their parts do.
     let parts = || !t.is_bare() && t.args.iter().all(|a| satisfies(as_type(*a).unwrap(), tr));
     match trait_.name.as_str() {
@@ -304,7 +305,7 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
             };
             item.is_some_and(|item| tr.is_bare() || tr.args[0] == item)
         }
-        _ if native.is_some() => native.is_some_and(|(_, nc)| nc.traits.contains(&trv)) || script_impl(),
+        _ if native.is_some() => native.is_some_and(|(_, nc)| nc.traits.contains(&trv)),
         _ => match class {
             Some(c) => {
                 // A class implementing `Iterator<T>` also provides `Iterable<T>`.
@@ -320,6 +321,71 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
             }
             None => matches!(t.ctor, Ctor::Trait(x) if x == trv && (tr.is_bare() || t.args == tr.args)),
         },
+    }
+}
+
+/// A registered impl (`code::ImplSpec` with classes and traits resolved).
+pub struct RtImpl {
+    pub name: String,
+    /// The target type: `Param(k)` is the impl's `k`th type parameter.
+    pub target: TypeDesc,
+    pub nparams: usize,
+    pub bounds: Vec<(u16, TypeDesc)>,
+    /// `None` for an inherent impl.
+    pub trait_: Option<Value>,
+    pub trait_args: Vec<TypeDesc>,
+    /// The impl's methods and the trait's default methods it inherits.
+    pub methods: HashMap<String, Value>,
+}
+
+impl RtImpl {
+    /// The impl's type arguments for values of type `t`, if it applies to
+    /// them (the target matches and the bounds hold).
+    pub fn bind(&self, t: &RtType) -> Option<Vec<Value>> {
+        let mut env = vec![Value::UNINIT; self.nparams];
+        if !match_desc(&self.target, t, &mut env) || env.contains(&Value::UNINIT) {
+            return None;
+        }
+        for (k, b) in &self.bounds {
+            let bt = as_type(subst(b, &env)?)?;
+            if !satisfies(as_type(env[*k as usize])?, bt) {
+                return None;
+            }
+        }
+        Some(env)
+    }
+
+    /// The implemented trait type for type arguments `env`.
+    pub fn trait_type(&self, env: &[Value]) -> Option<Value> {
+        let args = self.trait_args.iter().map(|a| subst(a, env)).collect::<Option<Vec<_>>>()?;
+        Some(intern(Ctor::Trait(self.trait_?), &args))
+    }
+
+    /// Whether the impl provides trait type `tr` (bare: any arguments) for `t`.
+    fn provides(&self, t: &RtType, tr: &RtType) -> bool {
+        self.bind(t).is_some_and(|env| tr.is_bare() || self.trait_type(&env).and_then(as_type).is_some_and(|x| x.args == tr.args))
+    }
+}
+
+/// Matches type `t` against `d` (classes and traits resolved), binding
+/// `Param(k)` to `env[k]`.
+pub fn match_desc(d: &TypeDesc, t: &RtType, env: &mut [Value]) -> bool {
+    match d {
+        TypeDesc::Param(k, _) => {
+            let slot = &mut env[*k as usize];
+            if *slot == Value::UNINIT {
+                *slot = t.value();
+                true
+            } else {
+                *slot == t.value()
+            }
+        }
+        TypeDesc::Local(inner) => match_desc(inner, t, env),
+        TypeDesc::Resolved(v) => *v == t.value(),
+        TypeDesc::Builtin(c, args) => {
+            *c == t.ctor && args.len() == t.args.len() && args.iter().zip(t.args.iter()).all(|(a, x)| match_desc(a, as_type(*x).unwrap(), env))
+        }
+        TypeDesc::Global(..) => false,
     }
 }
 
@@ -562,7 +628,7 @@ pub fn has_shape(v: Value, t: &RtType) -> bool {
             _ => false,
         },
         Ctor::Trait(tr) => match v.body() {
-            Some(Body::Instance(i)) if t.is_bare() => i.class().implements(tr),
+            Some(Body::Instance(i)) if t.is_bare() && i.class().implements(tr) => true,
             Some(Body::Generator(_) | Body::Iter(_)) if t.is_bare() => tr.as_trait().is_some_and(|t| t.name == "Iterator" || t.name == "Iterable"),
             _ => v != Value::NONE && satisfies(as_type(type_of(v)).unwrap(), t),
         },

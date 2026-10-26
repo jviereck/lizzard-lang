@@ -92,14 +92,14 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
         }
         Some(Body::Instance(inst)) => {
             let class = inst.class();
-            if let Some(m) = class.method("__iter__") {
+            if let Ok(m) = helpers::find_method(th, v, "__iter__") {
                 let it = helpers::call_simple(th, m, Some(v), &[])?;
                 if it.as_instance().is_some() {
                     return Ok(new_iter(rtype::any(), IterKind::Object { obj: it }));
                 }
                 return Ok(it);
             }
-            if class.method("__next__").is_some() {
+            if helpers::find_method(th, v, "__next__").is_ok() {
                 v.incref();
                 return Ok(new_iter(rtype::any(), IterKind::Object { obj: v }));
             }
@@ -167,7 +167,7 @@ pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
                 IterKind::Object { obj } => {
                     let obj = *obj;
                     drop(k);
-                    let Some(m) = obj.as_instance().and_then(|i| i.class().method("__next__")) else {
+                    let Some(m) = obj.as_instance().and_then(|_| helpers::find_method(th, obj, "__next__").ok()) else {
                         return Err(th.raise("TypeError", format!("'{}' object is not an iterator", obj.type_name())));
                     };
                     match helpers::call_simple(th, m, Some(obj), &[]) {
@@ -444,8 +444,8 @@ fn b_len(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(Body::Dict(d)) => d.len(),
         Some(Body::Array(a)) => a.len(),
         Some(Body::Channel(_)) => return crate::helpers::call_simple(th, type_method(v, "__len__").unwrap(), Some(v), &[]),
-        Some(Body::Instance(_) | Body::Native(_)) if helpers::dunder(v, "__len__").is_some() => {
-            return helpers::call_simple(th, helpers::dunder(v, "__len__").unwrap(), Some(v), &[]);
+        Some(Body::Instance(_) | Body::Native(_)) if helpers::dunder(th, v, "__len__").is_some() => {
+            return helpers::call_simple(th, helpers::dunder(th, v, "__len__").unwrap(), Some(v), &[]);
         }
         _ => return Err(th.raise("TypeError", format!("object of type '{}' has no len()", v.type_name()))),
     };
@@ -652,9 +652,8 @@ fn b_isinstance(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(Body::Class(_)) => v.as_instance().is_some_and(|i| i.class == t),
         Some(Body::NativeClass(c)) => matches!(v.body(), Some(Body::Native(n)) if c.covers(t, n.class)),
         Some(Body::Trait(_)) => match v.body() {
-            Some(Body::Instance(i)) => i.class().implements(t),
-            Some(Body::Native(n)) => rtype::satisfies(rtype::as_type(n.ty).unwrap(), rtype::as_type(rtype::prim(Ctor::Trait(t))).unwrap()),
-            _ => false,
+            Some(Body::Instance(i)) if i.class().implements(t) => true,
+            _ => v != Value::NONE && !v.is_dead() && rtype::satisfies(rtype::as_type(rtype::type_of(v)).unwrap(), rtype::as_type(rtype::prim(Ctor::Trait(t))).unwrap()),
         },
         _ => return Err(th.raise("TypeError", "isinstance() arg 2 must be a class or trait")),
     };
@@ -979,7 +978,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
             nparams: *nparams,
             methods,
             implies,
-            native_impls: Default::default(),
+            impls: Default::default(),
         }));
         traits.push((name, t));
     }
@@ -1624,6 +1623,13 @@ fn method_table() -> &'static MethodTable {
 }
 
 /// Method `name` of a builtin type (or of every value, like `some_or`).
+/// Whether builtin values of kind `ty` (`"str"`, `"list"`, ... as in
+/// `type_method`; `""` for numbers) have a method `name`.
+pub fn has_type_method(ty: &str, name: &str) -> bool {
+    let t = method_table();
+    t.get(ty).is_some_and(|m| m.contains_key(name)) || t["any"].contains_key(name)
+}
+
 pub fn type_method(recv: Value, name: &str) -> Option<Value> {
     let ty = match recv.body() {
         Some(Body::Str(_)) => "str",

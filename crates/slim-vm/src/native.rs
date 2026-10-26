@@ -1581,7 +1581,7 @@ impl Module {
             nparams: 0,
             methods: t.methods.iter().map(|m| (m.name.clone(), None)).collect(),
             implies: Vec::new(),
-            native_impls: Default::default(),
+            impls: Default::default(),
         }));
         self.traits.push((TraitSpec { name: name.into(), methods: t.methods }, tr));
         self

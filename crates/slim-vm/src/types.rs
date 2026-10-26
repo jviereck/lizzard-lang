@@ -43,6 +43,26 @@ fn undefined(th: &mut Thread, n: &str) -> crate::interp::Raised {
 
 /// The runtime type of `code.types[idx]`, which mentions no type parameters
 /// (cached in the code object).
+/// `d` with its classes and traits resolved (`Global` becomes `Builtin`
+/// with a class or trait constructor); type parameters stay. `Err` names an
+/// undefined global.
+pub fn resolve_globals(th: &Thread, d: &TypeDesc) -> Result<TypeDesc, String> {
+    Ok(match d {
+        TypeDesc::Builtin(c, args) => TypeDesc::Builtin(*c, args.iter().map(|a| resolve_globals(th, a)).collect::<Result<_, _>>()?),
+        TypeDesc::Global(idx, n, args) => {
+            let v = th.vm.global(*idx);
+            let args = args.iter().map(|a| resolve_globals(th, a)).collect::<Result<_, _>>()?;
+            match v.body() {
+                Some(Body::Class(_) | Body::NativeClass(_)) => TypeDesc::Builtin(Ctor::Class(v), args),
+                Some(Body::Trait(_)) => TypeDesc::Builtin(Ctor::Trait(v), args),
+                _ => return Err(n.clone()),
+            }
+        }
+        TypeDesc::Local(t) => TypeDesc::Local(Box::new(resolve_globals(th, t)?)),
+        d => d.clone(),
+    })
+}
+
 pub fn code_type(th: &mut Thread, code: &Code, idx: u32) -> VResult<&'static RtType> {
     let slot = &code.type_cache[idx as usize];
     if let Some(v) = slot.get() {

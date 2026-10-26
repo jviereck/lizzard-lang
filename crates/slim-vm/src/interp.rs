@@ -53,9 +53,8 @@ pub struct Vm {
     pub builtins: Builtins,
     pub next_class_id: AtomicU32,
     pub recursion_limit: u32,
-    /// Trait default methods of native classes, from the program's
-    /// `impl Trait for NativeClass`: (class, method name) -> function.
-    pub native_methods: std::sync::RwLock<std::collections::HashMap<(Value, String), Value>>,
+    /// Registered impls by method name (see `rtype::RtImpl`).
+    pub impls: std::sync::RwLock<std::collections::HashMap<String, Vec<&'static crate::rtype::RtImpl>>>,
 }
 
 impl Vm {

@@ -1,0 +1,5 @@
+  File "err_inherent_builtin.slim", line 1
+    impl int:
+         ^
+TypeError: inherent impls are only allowed for this program's structs; for `int`, define a trait and implement it (`impl MyTrait for int:`)
+[exit 1]

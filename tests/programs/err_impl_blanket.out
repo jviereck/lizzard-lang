@@ -1,0 +1,5 @@
+  File "err_impl_blanket.slim", line 4
+    impl<T> D for T:
+                  ^
+TypeError: blanket impls (`impl<T> Trait for T`) are not supported; implement the trait for each type
+[exit 1]

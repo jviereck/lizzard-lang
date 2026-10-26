@@ -109,7 +109,7 @@ fn dunder_binop(th: &mut Thread, op: &str, a: Value, b: Value) -> Option<VResult
         "**" => "__pow__",
         _ => return None,
     };
-    let m = dunder(a, name)?;
+    let m = dunder(th, a, name)?;
     Some(call_simple(th, m, Some(a), &[b]))
 }
 
@@ -343,7 +343,7 @@ pub extern "C" fn neg(th: &mut Thread, a: Value) -> Value {
         },
         Some(Num::Big(b)) => big_value(-b),
         Some(Num::Float(f)) => Value::float(-f),
-        None => match dunder(a, "__neg__") {
+        None => match dunder(th, a, "__neg__") {
             Some(m) => vres(call_simple(th, m, Some(a), &[])),
             None => vres(Err(unary_error(th, "-", a))),
         },
@@ -459,15 +459,15 @@ fn order(th: &mut Thread, op: &str, a: Value, b: Value) -> VResult<std::cmp::Ord
             seq_order(th, op, &x, &y)
         }
         // Instances of a class implementing `Ord` compare with `__lt__`.
-        (Some(Body::Instance(_) | Body::Native(_)), _) if dunder(a, "__lt__").is_some() => {
-            let m = dunder(a, "__lt__").unwrap();
+        (Some(Body::Instance(_) | Body::Native(_)), _) if dunder(th, a, "__lt__").is_some() => {
+            let m = dunder(th, a, "__lt__").unwrap();
             let less = call_simple(th, m, Some(a), &[b])?;
             let is_less = is_truthy(th, less);
             less.decref();
             if is_less? {
                 return Ok(O::Less);
             }
-            let greater = match dunder(b, "__lt__") {
+            let greater = match dunder(th, b, "__lt__") {
                 Some(m2) => {
                     let r = call_simple(th, m2, Some(b), &[a])?;
                     let g = is_truthy(th, r);
@@ -1093,28 +1093,74 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
     }
 }
 
-/// Finds a method for `recv.name`.
-pub fn lookup_method(recv: Value, name: &str) -> Option<Value> {
+/// Finds the method for `recv.name()`, as in Rust: an inherent method (of
+/// the struct, the native class or the builtin type), then one of a
+/// registered inherent impl, then the only trait method of that name (of the
+/// struct's impls or registered ones). `Err` lists the traits when several
+/// define it (empty when there is none).
+pub fn find_method(th: &Thread, recv: Value, name: &str) -> Result<Value, Vec<Value>> {
+    let class = recv.as_instance().map(|i| i.class());
+    let own = match recv.body() {
+        Some(Body::Instance(i)) => i.class().methods.get(name).copied(),
+        Some(Body::Native(n)) => n.class().methods.get(name).copied(),
+        _ => crate::builtins::type_method(recv, name),
+    };
+    if let Some(m) = own {
+        return Ok(m);
+    }
+    let mut traits: Vec<(Value, Value)> = class.and_then(|c| c.trait_methods.get(name)).cloned().unwrap_or_default();
+    let registry = th.vm.impls.read().unwrap();
+    if let Some(impls) = registry.get(name).filter(|_| !recv.is_dead() && recv != Value::NONE) {
+        let t = rtype::as_type(rtype::type_of(recv)).unwrap();
+        for i in impls.iter().filter(|i| i.bind(t).is_some()) {
+            let m = i.methods[name];
+            match i.trait_ {
+                None => return Ok(m),
+                Some(tr) if !traits.iter().any(|(x, _)| *x == tr) => traits.push((tr, m)),
+                Some(_) => {}
+            }
+        }
+    }
+    match traits.as_slice() {
+        [(_, m)] => Ok(*m),
+        _ => Err(traits.iter().map(|(t, _)| *t).collect()),
+    }
+}
+
+/// `find_method`, without telling an ambiguous name from a missing one.
+pub fn lookup_method(th: &Thread, recv: Value, name: &str) -> Option<Value> {
+    find_method(th, recv, name).ok()
+}
+
+/// The method trait `tr` provides for `recv` (`Trait::name(recv)`): from the
+/// struct's impl, a registered impl, or the type itself (a struct
+/// implementing a trait that implies `tr`, a native class's Rust method, a
+/// builtin type's method).
+pub fn trait_method_for(th: &Thread, recv: Value, tr: Value, name: &str) -> Option<Value> {
+    if let Some(m) = recv.as_instance().and_then(|i| i.class().trait_method(tr, name)) {
+        return Some(m);
+    }
+    if let Some(t) = tr.as_trait() {
+        let impls = t.impls.read().unwrap();
+        if !impls.is_empty() && !recv.is_dead() && recv != Value::NONE {
+            let ty = rtype::as_type(rtype::type_of(recv)).unwrap();
+            if let Some(i) = impls.iter().find(|i| i.methods.contains_key(name) && i.bind(ty).is_some()) {
+                return Some(i.methods[name]);
+            }
+        }
+    }
     match recv.body() {
-        Some(Body::Instance(inst)) => inst.class().method(name),
+        Some(Body::Instance(i)) => i.class().implements(tr).then(|| lookup_method(th, recv, name)).flatten(),
         Some(Body::Native(n)) => n.class().methods.get(name).copied(),
         _ => crate::builtins::type_method(recv, name),
     }
 }
 
-/// A trait default method of a native object's class, from the program's
-/// `impl Trait for Class`.
-fn native_default(th: &Thread, recv: Value, name: &str) -> Option<Value> {
-    let Some(Body::Native(n)) = recv.body() else { return None };
-    th.vm.native_methods.read().unwrap().get(&(n.class, name.to_string())).copied()
-}
-
 /// An operator method (`__add__`, `__lt__`, `__len__`) of an instance or a
 /// native object.
-pub fn dunder(v: Value, name: &str) -> Option<Value> {
+pub fn dunder(th: &Thread, v: Value, name: &str) -> Option<Value> {
     match v.body() {
-        Some(Body::Instance(i)) => i.class().method(name),
-        Some(Body::Native(n)) => n.class().methods.get(name).copied(),
+        Some(Body::Instance(_) | Body::Native(_)) => lookup_method(th, v, name),
         _ => None,
     }
 }
@@ -1132,17 +1178,15 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
     if al.pins {
         rc::pin();
     }
-    let result = match lookup_method(r, mname).or_else(|| native_default(th, r, mname)) {
-        Some(m) => invoke(th, Some(frame), m, Some(r), Some(recv as Reg), &cargs),
-        None => {
+    let result = match find_method(th, r, mname) {
+        Ok(m) => invoke(th, Some(frame), m, Some(r), Some(recv as Reg), &cargs),
+        Err(traits) => {
             // A callable stored in a field: `self.callback(x)`.
             let field = r.as_instance().and_then(|inst| inst.class().field_index(mname).map(|i| inst.get_borrowed(i)));
             match field {
                 Some(f) => invoke(th, Some(frame), f, None, None, &cargs),
-                None => match r.as_instance().map(|i| i.class().ambiguous(mname)).filter(|t| !t.is_empty()) {
-                    Some(traits) => Err(ambiguous_method(th, r, mname, &traits)),
-                    None => Err(no_attribute(th, r, mname)),
-                },
+                None if traits.len() > 1 => Err(ambiguous_method(th, r, mname, &traits)),
+                None => Err(no_attribute(th, r, mname)),
             }
         }
     };
@@ -1180,10 +1224,7 @@ pub extern "C" fn f_call_trait_method(th: &mut Thread, frame: &mut Frame, dst: u
         return RAISED;
     }
     let trv = th.vm.global(tg);
-    let m = match r.body() {
-        Some(Body::Instance(i)) => i.class().trait_method(trv, mname).or_else(|| i.class().implements(trv).then(|| i.class().method(mname)).flatten()),
-        _ => lookup_method(r, mname).or_else(|| native_default(th, r, mname)),
-    };
+    let m = trait_method_for(th, r, trv, mname);
     let Some(m) = m else {
         let t = trv.as_trait().map(|t| t.name.clone()).unwrap_or_default();
         th.raise("TypeError", format!("`{}` has no method `{t}::{mname}`", r.type_name()));
@@ -1268,38 +1309,110 @@ pub extern "C" fn f_make_trait(th: &mut Thread, frame: &mut Frame, dst: u32, spe
         })
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new(), native_impls: Default::default() }));
+    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new(), impls: Default::default() }));
     frame.set(dst as Reg, t);
     OK
 }
 
-/// `impl Trait for NativeClass`: records the class (each instantiation of a
-/// generic one) as implementing the trait and the traits it implies, and
-/// makes the trait's default methods available on it.
-pub extern "C" fn f_impl_native(th: &mut Thread, _frame: &mut Frame, tr: u32, class: u32, _: u32, _: u32) -> u32 {
-    let (trv, cv) = (th.vm.global(tr), th.vm.global(class));
-    let (Some(t), Some(Body::NativeClass(c))) = (trv.as_trait(), cv.body()) else {
-        th.raise("TypeError", "`impl ... for ...` needs a trait and a native class");
-        return RAISED;
+/// Registers `impls[spec]`: under its trait and the traits that trait
+/// implies (for bounds and `Trait::name(x)`), and by method name (for
+/// `x.name()`). A trait impl inherits the trait's default methods, except
+/// those a native target's Rust class defines.
+pub extern "C" fn f_make_impl(th: &mut Thread, frame: &mut Frame, spec: u32, _: u32, _: u32, _: u32) -> u32 {
+    let c = frame.code();
+    let s = &c.impls[spec as usize];
+    let resolve = |d: &TypeDesc| types::resolve_globals(th, d);
+    let parts = (|| -> Result<_, String> {
+        let target = resolve(&s.target)?;
+        let bounds = s.bounds.iter().map(|(k, b)| Ok((*k, resolve(b)?))).collect::<Result<Vec<_>, String>>()?;
+        let trait_args = s.trait_args.iter().map(&resolve).collect::<Result<Vec<_>, _>>()?;
+        Ok((target, bounds, trait_args))
+    })();
+    let (target, bounds, trait_args) = match parts {
+        Ok(p) => p,
+        Err(n) => {
+            th.raise("NameError", format!("type `{n}` is used before it is defined"));
+            return RAISED;
+        }
     };
-    let classes = if c.is_family() { c.instances.clone() } else { vec![cv] };
-    let mut defaults = th.vm.native_methods.write().unwrap();
-    for k in classes {
-        let Some(Body::NativeClass(kc)) = k.body() else { continue };
-        for x in std::iter::once(trv).chain(t.implies.iter().copied()) {
-            let Some(xt) = x.as_trait() else { continue };
-            let mut impls = xt.native_impls.write().unwrap();
-            if !impls.contains(&k) {
-                impls.push(k);
+    let mut methods: HashMap<String, Value> = s
+        .methods
+        .iter()
+        .map(|(n, ci)| (n.clone(), Obj::alloc_immortal(Body::Function(Function { code: c.codes[*ci as usize].clone(), captures: Box::new([]) }))))
+        .collect();
+    let trait_ = s.tr.map(|g| th.vm.global(g));
+    let mut traits = Vec::new();
+    if let Some(t) = trait_.and_then(|t| t.as_trait()) {
+        traits.push(trait_.unwrap());
+        traits.extend(t.implies.iter().copied());
+    }
+    // Rust methods of a native target implement the trait's methods.
+    let rust: Vec<String> = match &target {
+        TypeDesc::Builtin(Ctor::Class(k), _) => match k.body() {
+            Some(Body::NativeClass(nc)) => {
+                let all = if nc.is_family() { nc.instances.clone() } else { vec![*k] };
+                all.iter().filter_map(|i| match i.body() {
+                    Some(Body::NativeClass(x)) => Some(x.methods.keys().cloned().collect::<Vec<_>>()),
+                    _ => None,
+                }).flatten().collect()
             }
-            for (m, d) in &xt.methods {
-                if let (Some(d), false) = (d, kc.methods.contains_key(m)) {
-                    defaults.entry((k, m.clone())).or_insert(*d);
-                }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for x in &traits {
+        for (m, d) in &x.as_trait().unwrap().methods {
+            if let (Some(d), false) = (d, rust.contains(m)) {
+                methods.entry(m.clone()).or_insert(*d);
             }
         }
     }
+    let imp: &'static rtype::RtImpl =
+        Box::leak(Box::new(rtype::RtImpl { name: s.name.clone(), target, nparams: s.nparams, bounds, trait_, trait_args, methods }));
+    for x in &traits {
+        x.as_trait().unwrap().impls.write().unwrap().push(imp);
+    }
+    let mut by_name = th.vm.impls.write().unwrap();
+    for m in imp.methods.keys() {
+        by_name.entry(m.clone()).or_default().push(imp);
+    }
     OK
+}
+
+/// Type parameter `k` of the impl whose target is `code.types[ty]`, as the
+/// type of `o` matches it.
+pub fn impl_arg(th: &mut Thread, code: &Code, o: Value, ty: u32, k: u32) -> VResult<Value> {
+    let d = match types::resolve_globals(th, &code.types[ty as usize]) {
+        Ok(d) => d,
+        Err(n) => return Err(th.raise("NameError", format!("type `{n}` is used before it is defined"))),
+    };
+    let t = rtype::as_type(rtype::type_of(o)).unwrap();
+    let mut env = vec![Value::UNINIT; k as usize + 1];
+    fn grow(d: &TypeDesc, n: &mut usize) {
+        match d {
+            TypeDesc::Param(k, _) => *n = (*n).max(*k as usize + 1),
+            TypeDesc::Builtin(_, a) | TypeDesc::Global(_, _, a) => a.iter().for_each(|x| grow(x, n)),
+            TypeDesc::Local(x) => grow(x, n),
+            TypeDesc::Resolved(_) => {}
+        }
+    }
+    let mut n = env.len();
+    grow(&d, &mut n);
+    env.resize(n, Value::UNINIT);
+    if !rtype::match_desc(&d, t, &mut env) || env[k as usize] == Value::UNINIT {
+        return Err(th.raise("TypeError", format!("`{}` does not match the impl's target `{}`", t.name, code.types[ty as usize])));
+    }
+    Ok(env[k as usize])
+}
+
+pub extern "C" fn f_load_impl_arg(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, ty: u32, k: u32) -> u32 {
+    match impl_arg(th, frame.code(), frame.reg(obj as Reg), ty, k) {
+        Ok(a) => {
+            frame.set(dst as Reg, a);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
 }
 
 pub fn slot_kind(ty: &TypeDesc) -> SlotKind {
@@ -1420,11 +1533,17 @@ pub fn type_arg(th: &mut Thread, o: Value, k: u32) -> VResult<Value> {
 pub fn trait_arg(th: &mut Thread, o: Value, tr: u32, k: u32) -> VResult<Value> {
     let trv = th.vm.global(tr);
     let t = rtype::as_type(rtype::type_of(o)).unwrap();
+    let registered = || {
+        let tr = trv.as_trait()?;
+        let impls = tr.impls.read().unwrap();
+        impls.iter().filter(|i| i.trait_ == Some(trv)).find_map(|i| i.trait_type(&i.bind(t)?))
+    };
     let found = rtype::impls_of(t)
         .iter()
-        .map(|i| rtype::as_type(*i).unwrap())
-        .find(|i| i.ctor == Ctor::Trait(trv))
-        .and_then(|i| i.args.get(k as usize).copied());
+        .copied()
+        .find(|i| rtype::as_type(*i).unwrap().ctor == Ctor::Trait(trv))
+        .or_else(registered)
+        .and_then(|i| rtype::as_type(i).unwrap().args.get(k as usize).copied());
     match found {
         Some(a) => Ok(a),
         None => Err(th.raise(
@@ -1534,7 +1653,7 @@ pub extern "C" fn f_load_field(th: &mut Thread, frame: &mut Frame, dst: u32, obj
             return OK;
         }
     }
-    if let Some(m) = lookup_method(o, n) {
+    if let Some(m) = lookup_method(th, o, n) {
         o.incref();
         let bm = rc::autorelease(Obj::alloc(Body::BoundMethod { recv: o, func: m }));
         frame.set(dst as Reg, bm);

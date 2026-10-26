@@ -369,8 +369,12 @@ pub fn call_trait_method<B: Backend>(b: &mut B, dst: Reg, recv: Reg, call: u32, 
     b.frame_op(h::f_call_trait_method, dst as u32, recv as u32, call, args)
 }
 
-pub fn impl_native<B: Backend>(b: &mut B, tr: u32, class: u32) -> Flow<()> {
-    b.frame_op(h::f_impl_native, tr, class, 0, 0)
+pub fn make_impl<B: Backend>(b: &mut B, spec: u32) -> Flow<()> {
+    b.frame_op(h::f_make_impl, spec, 0, 0, 0)
+}
+
+pub fn load_impl_arg<B: Backend>(b: &mut B, dst: Reg, obj: Reg, ty: u32, k: u32) -> Flow<()> {
+    b.frame_op(h::f_load_impl_arg, dst as u32, obj as u32, ty, k)
 }
 
 pub fn check_type<B: Backend>(b: &mut B, reg: Reg, ty: u32, what: u32) -> Flow<()> {

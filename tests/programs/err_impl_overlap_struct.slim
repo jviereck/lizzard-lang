@@ -1,0 +1,13 @@
+trait D:
+    def d(self) -> str: ...
+
+struct Box<T>:
+    value: T
+
+impl<T> D for Box<T>:
+    def d(self) -> str:
+        "any box"
+
+impl D for Box<int>:
+    def d(self) -> str:
+        "int box"

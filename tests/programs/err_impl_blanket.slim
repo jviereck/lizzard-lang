@@ -1,0 +1,6 @@
+trait D:
+    def d(self) -> str: ...
+
+impl<T> D for T:
+    def d(self) -> str:
+        "anything"

@@ -137,9 +137,8 @@ opcodes! {
     MakeFunction { dst: Reg, code: u32, captures: u32 } => sem::make_function;
     MakeClass { dst: Reg, spec: u32 } => sem::make_class;
     MakeTrait { dst: Reg, spec: u32 } => sem::make_trait;
-    /// `impl globals[tr] for globals[class]`: a program's trait for a native
-    /// class (or every instantiation of a generic one).
-    ImplNative { tr: u32, class: u32 } => sem::impl_native;
+    /// Registers the impl `impls[spec]` (see `ImplSpec`).
+    MakeImpl { spec: u32 } => sem::make_impl;
     CheckType { reg: Reg, ty: u32, what: u32 } => sem::check_type;
     /// dst = the runtime type `types[ty]` (immortal).
     MakeType { dst: Reg, ty: u32 } => sem::make_type;
@@ -147,6 +146,9 @@ opcodes! {
     LoadTypeArg { dst: Reg, obj: Reg, k: u32 } => sem::load_type_arg;
     /// dst = the runtime type of `obj` (`Self` in a trait default method).
     LoadTypeOf { dst: Reg, obj: Reg } => sem::load_type_of;
+    /// dst = type parameter `k` of an impl whose target is `types[ty]`, as
+    /// matched by the type of `obj` (methods of registered impls).
+    LoadImplArg { dst: Reg, obj: Reg, ty: u32, k: u32 } => sem::load_impl_arg;
     /// dst = type argument `k` of trait `globals[tr]` as `obj` implements it.
     LoadTraitArg { dst: Reg, obj: Reg, tr: u32, k: u32 } => sem::load_trait_arg;
     /// dst = generic function `func` with the type arguments in `targs`.

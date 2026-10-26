@@ -11,7 +11,7 @@ use std::sync::Arc;
 use slim_syntax::ast::*;
 use slim_syntax::{Error, Span};
 use slim_vm::code::{
-    Arg, ArgList, ClassSpec, Code, Ctor, ExcEntry, FieldSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
+    Arg, ArgList, ClassSpec, Code, Ctor, ExcEntry, FieldSpec, ImplSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
     TypeParamInfo,
 };
 use slim_vm::native::{FnSpec, ModuleSpec, NType};
@@ -42,7 +42,7 @@ fn syn_err(msg: impl Into<String>, span: Span) -> Error {
 
 // ---------------------------------------------------------------- module info
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ParamSig {
     pub name: String,
     pub keep: bool,
@@ -50,13 +50,13 @@ pub struct ParamSig {
 }
 
 /// A type parameter with its bounds (`Ty::Trait`s).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TParamSig {
     pub name: String,
     pub bounds: Vec<Ty>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sig {
     /// The function's own type parameters (hidden leading arguments).
     pub tparams: Vec<TParamSig>,
@@ -140,6 +140,99 @@ pub struct ImplMethod {
     pub tparams: Vec<String>,
 }
 
+/// An impl that does not cover a whole struct of the program (see
+/// `code::ImplSpec`): for a builtin type (`impl Describe for int`), a native
+/// class, a specialized struct (`impl Describe for Box<int>`) or with extra
+/// bounds (`impl<T: Ord> Ord for Box<T>`). It applies to the types its
+/// target matches whose type arguments satisfy its bounds.
+pub struct ImplInfo {
+    /// The impl's type parameters with their bounds.
+    pub tparams: Vec<TParamSig>,
+    /// The trait and its arguments (`None` for an inherent impl).
+    pub tr: Option<(String, Vec<Ty>)>,
+    pub target: Ty,
+    /// The target with `Param(k)` for the impl's `k`th type parameter.
+    pub target_desc: TypeDesc,
+    pub bound_descs: Vec<(u16, TypeDesc)>,
+    pub trait_descs: Vec<TypeDesc>,
+    /// Methods defined by the impl and, for a trait impl, the defaults it
+    /// inherits.
+    pub methods: HashMap<String, Sig>,
+    pub defs: Vec<FuncDef>,
+    /// `impl Describe for int`, for messages.
+    pub shown: String,
+    pub span: Span,
+}
+
+/// Matches type `t` against impl target `pat`, binding the target's type
+/// parameters in `binds`. Unknown parts of `t` may match anything.
+fn match_ty(pat: &Ty, t: &Ty, binds: &mut HashMap<String, Ty>) -> bool {
+    let t = t.peel();
+    match (pat.peel(), t) {
+        (Ty::Param(n), _) => match binds.get(n) {
+            Some(b) => b == t || *b == Ty::Unknown || *t == Ty::Unknown,
+            None => {
+                binds.insert(n.clone(), t.clone());
+                true
+            }
+        },
+        (_, Ty::Unknown) => true,
+        (Ty::List(a), Ty::List(b)) | (Ty::Iter(a), Ty::Iter(b)) | (Ty::Chan(a), Ty::Chan(b)) | (Ty::Option(a), Ty::Option(b)) => match_ty(a, b, binds),
+        (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => match_ty(k1, k2, binds) && match_ty(v1, v2, binds),
+        (Ty::Tuple(Some(a)), Ty::Tuple(Some(b))) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| match_ty(x, y, binds)),
+        (Ty::Tuple(Some(_)), Ty::Tuple(None)) => true,
+        (Ty::Array(a), Ty::Array(b)) => a == b || b.is_none(),
+        (Ty::Instance(c1, a1), Ty::Instance(c2, a2)) => {
+            c1 == c2 && (a2.is_empty() || (a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| match_ty(x, y, binds))))
+        }
+        (a, b) => a == b,
+    }
+}
+
+/// Whether two impl targets can describe the same type (type parameters
+/// match anything; bounds are ignored, as in Rust).
+fn overlaps(a: &Ty, b: &Ty) -> bool {
+    match (a.peel(), b.peel()) {
+        (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
+        (Ty::List(x), Ty::List(y)) | (Ty::Iter(x), Ty::Iter(y)) | (Ty::Chan(x), Ty::Chan(y)) | (Ty::Option(x), Ty::Option(y)) => overlaps(x, y),
+        (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => overlaps(k1, k2) && overlaps(v1, v2),
+        (Ty::Tuple(Some(x)), Ty::Tuple(Some(y))) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| overlaps(p, q)),
+        (Ty::Instance(c1, x), Ty::Instance(c2, y)) => {
+            c1 == c2 && (x.is_empty() || y.is_empty() || (x.len() == y.len() && x.iter().zip(y).all(|(p, q)| overlaps(p, q))))
+        }
+        (p, q) => p == q,
+    }
+}
+
+/// Whether `t` mentions type parameter `n`.
+fn mentions(t: &Ty, n: &str) -> bool {
+    let found = std::cell::Cell::new(false);
+    t.subst(&|x| {
+        if x == n {
+            found.set(true);
+        }
+        None
+    });
+    found.get()
+}
+
+/// The builtin method table of values of static type `t` (see
+/// `builtins::has_type_method`), if `t` is a builtin type.
+fn builtin_table(t: &Ty) -> Option<&'static str> {
+    Some(match t {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt => "",
+        Ty::Str => "str",
+        Ty::List(_) => "list",
+        Ty::Tuple(_) => "tuple",
+        Ty::Dict(..) => "dict",
+        Ty::Array(_) => "array",
+        Ty::Chan(_) => "channel",
+        Ty::Opaque(n) if n == "Lock" => "lock",
+        Ty::Opaque(n) if n == "Thread" => "thread",
+        _ => return None,
+    })
+}
+
 pub struct TraitInfo {
     pub tparams: Vec<TParamSig>,
     pub methods: HashMap<String, Sig>,
@@ -195,6 +288,8 @@ pub struct ModInfo {
     /// Associated functions as module functions named `Type::name`, with
     /// the impl's type parameters first.
     pub assoc_fns: Vec<FuncDef>,
+    /// Impls matched against types (see `ImplInfo`).
+    pub impls: Vec<ImplInfo>,
     pub gindex: HashMap<String, u32>,
     pub module_vars: HashSet<String>,
     pub funcs: HashMap<String, Sig>,
@@ -296,14 +391,77 @@ impl ModInfo {
         self.traits.get(t).map(|t| t.tparams.clone()).unwrap_or_default()
     }
 
-    /// The traits a class instance implements, with arguments substituted.
-    fn impls_of(&self, c: &str, args: &[Ty]) -> Vec<(String, Vec<Ty>)> {
+    /// The traits a class instance implements, with arguments substituted
+    /// (including those of registered impls that may apply).
+    fn impls_of(&self, c: &str, args: &[Ty], pb: &dyn Fn(&str) -> Vec<Ty>) -> Vec<(String, Vec<Ty>)> {
         if self.builtin_classes.contains(c) {
             return vec![("Exception".into(), Vec::new())];
         }
         let Some(ci) = self.class_info(c, args).or_else(|| self.classes.get(c)) else { return Vec::new() };
         let map = class_map(ci, args);
-        ci.impls.iter().map(|(t, a)| (t.clone(), a.iter().map(|x| x.subst(&map)).collect())).collect()
+        let mut out: Vec<(String, Vec<Ty>)> = ci.impls.iter().map(|(t, a)| (t.clone(), a.iter().map(|x| x.subst(&map)).collect())).collect();
+        out.extend(self.registry_traits(&Ty::Instance(c.into(), args.to_vec()), pb));
+        out
+    }
+
+    /// The registered impls that may apply to values of type `t` (target
+    /// matched, bounds not violated), with their type parameters bound
+    /// (`Unknown` where `t` does not tell).
+    fn applicable(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>) -> Vec<(&ImplInfo, HashMap<String, Ty>)> {
+        let mut out = Vec::new();
+        for im in &self.impls {
+            let mut b = HashMap::new();
+            if !match_ty(&im.target, t, &mut b) {
+                continue;
+            }
+            let ok = {
+                let map = impl_map(im, &b);
+                im.tparams.iter().all(|tp| {
+                    let a = b.get(&tp.name).cloned().unwrap_or(Ty::Unknown);
+                    tp.bounds.iter().all(|bd| self.satisfies(&a, &bd.subst(&map), pb))
+                })
+            };
+            if ok {
+                out.push((im, b));
+            }
+        }
+        out
+    }
+
+    /// Methods named `name` of registered impls that may apply to `t`:
+    /// (trait, signature), the trait `None` for an inherent impl.
+    fn registry_methods(&self, t: &Ty, name: &str, pb: &dyn Fn(&str) -> Vec<Ty>) -> Vec<(Option<String>, Sig)> {
+        self.applicable(t, pb)
+            .into_iter()
+            .filter_map(|(im, b)| {
+                let s = im.methods.get(name)?;
+                Some((im.tr.as_ref().map(|t| t.0.clone()), s.subst(&impl_map(im, &b))))
+            })
+            .collect()
+    }
+
+    /// The traits registered impls provide for `t`, with the traits they
+    /// imply.
+    fn registry_traits(&self, t: &Ty, pb: &dyn Fn(&str) -> Vec<Ty>) -> Vec<(String, Vec<Ty>)> {
+        let mut out = Vec::new();
+        for (im, b) in self.applicable(t, pb) {
+            let Some((tr, args)) = &im.tr else { continue };
+            let args: Vec<Ty> = args.iter().map(|a| a.subst(&impl_map(im, &b))).collect();
+            if let Some((_, _, implies, _)) = builtin_trait(tr) {
+                for i in implies.iter() {
+                    let a = if builtin_trait(i).is_some_and(|x| x.1 == args.len()) { args.clone() } else { Vec::new() };
+                    out.push((i.to_string(), a));
+                }
+            }
+            out.push((tr.clone(), args));
+        }
+        out
+    }
+
+    /// Whether a registered impl of struct (or native class) `head` defines
+    /// method `n`.
+    fn has_registry_method(&self, head: &str, n: &str) -> bool {
+        self.impls.iter().any(|im| matches!(&im.target, Ty::Instance(c, _) if c == head) && im.methods.contains_key(n))
     }
 
     /// Whether `t` implements trait `bound` (`Ty::Trait`). `pb` gives the
@@ -322,8 +480,9 @@ impl ModInfo {
         match t {
             Ty::Unknown | Ty::Any => true,
             Ty::Param(n) => pb(n).iter().any(|pbound| self.trait_implies(pbound, b, bargs)),
-            Ty::Instance(c, cargs) => self.impls_of(c, cargs).iter().any(|(tn, ta)| tn == b && args_match(ta)),
+            Ty::Instance(c, cargs) => self.impls_of(c, cargs, pb).iter().any(|(tn, ta)| tn == b && args_match(ta)),
             Ty::Trait(tn, ta) => self.trait_implies(&Ty::Trait(tn.clone(), ta.clone()), b, bargs),
+            _ if self.registry_traits(t, pb).iter().any(|(tn, ta)| tn == b && args_match(ta)) => true,
             _ => match b.as_str() {
                 "Ord" => match t {
                     Ty::Int | Ty::Float | Ty::BigInt | Ty::Bool | Ty::Str | Ty::Tuple(None) => true,
@@ -479,6 +638,11 @@ impl ModInfo {
     }
 }
 
+/// Substitution of an impl's type parameters by their bindings `b`.
+fn impl_map<'a>(im: &'a ImplInfo, b: &'a HashMap<String, Ty>) -> impl Fn(&str) -> Option<Ty> + 'a {
+    move |n| im.tparams.iter().any(|t| t.name == n).then(|| b.get(n).cloned().unwrap_or(Ty::Unknown))
+}
+
 /// Substitution of a class's type parameters by `args` (`Unknown` when the
 /// instance's arguments are not known).
 fn class_map<'a>(ci: &'a ClassInfo, args: &'a [Ty]) -> impl Fn(&str) -> Option<Ty> + 'a {
@@ -601,6 +765,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
     let mut info = ModInfo {
         impl_methods: HashMap::new(),
         assoc_fns: Vec::new(),
+        impls: Vec::new(),
         gindex,
         module_vars: module_vars.iter().cloned().collect(),
         funcs: HashMap::new(),
@@ -720,6 +885,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             collect_impl(&mut info, module, i)?;
         }
     }
+    check_coherence(&info)?;
     // `Send`, as in Rust: a struct is not `Send` (it is local) when a field
     // type is not (to a fixpoint: fields may name later structs). Native
     // classes over non-`Send` Rust types are the roots. Within the struct, its
@@ -781,35 +947,32 @@ fn rename_texpr(t: &TypeExpr, map: &dyn Fn(&str) -> Option<String>) -> TypeExpr 
     }
 }
 
-/// Records an `impl` block: inherent methods and associated functions of a
-/// struct, or a trait implementation (checked against the trait). Native
-/// targets take only bodiless trait impls (see `impl_for`).
+/// Records an `impl` block. An impl of a whole struct of the program
+/// (`impl<A, B> S<A, B>` with the struct's own bounds) adds inherent methods
+/// and associated functions, or implements a trait, for the struct itself;
+/// any other impl is matched against types (`collect_registry_impl`).
 fn collect_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
-    let TypeExpr::Named(tn, targs, tspan) = &i.target else {
-        return Err(type_err("`impl` needs a struct (or, for traits, a native class) as its target", i.target.span()));
-    };
-    let Some(ci) = info.classes.get(tn) else {
+    if let TypeExpr::Named(tn, _, tspan) = &i.target {
         if info.builtin_classes.contains(tn) {
             return Err(type_err(format!("cannot implement methods or traits for builtin class `{tn}`"), *tspan));
         }
         if info.traits.contains_key(tn) || builtin_trait(tn).is_some() {
             return Err(type_err(format!("`{tn}` is a trait; write `impl {tn} for Type:`"), *tspan));
         }
-        return Err(type_err(format!("impls for `{tn}` are not supported: the target must be a struct of this program or a native class"), *tspan));
-    };
-    if ci.native {
-        let Some((tr, trargs, trspan)) = &i.tr else {
-            return Err(type_err(format!("`{tn}` is a native class: its methods are defined in Rust; add yours through a trait (`impl MyTrait for {tn}`)"), *tspan));
-        };
-        if !i.methods.is_empty() || !i.tparams.is_empty() || !targs.is_empty() {
-            return Err(type_err(format!("`impl {tr} for {tn}` cannot have a body or type parameters yet; the trait's default methods are used"), i.span));
+        if let Some(pnames) = merged_params(info, i)? {
+            return collect_struct_impl(info, module, i, tn, pnames);
         }
-        return impl_for(info, module, tr, trargs, tn, *trspan, i.span);
     }
-    // A struct's impl applies to all its instantiations: `impl<A, B> S<A, B>`
-    // with the struct's own bounds.
-    let ctps = ci.tparams.clone();
-    let arity_ok = targs.len() == ctps.len() && i.tparams.len() == ctps.len();
+    collect_registry_impl(info, module, i)
+}
+
+/// For an impl of a whole struct of the program (`impl<A, B> S<A, B>`,
+/// distinct parameters, no bounds beyond the struct's): the impl's names for
+/// the struct's type parameters.
+fn merged_params(info: &ModInfo, i: &ImplDef) -> R<Option<Vec<String>>> {
+    let TypeExpr::Named(tn, targs, _) = &i.target else { return Ok(None) };
+    let Some(ci) = info.classes.get(tn).filter(|c| !c.native) else { return Ok(None) };
+    let ctps = &ci.tparams;
     let pnames: Vec<String> = targs
         .iter()
         .filter_map(|a| match a {
@@ -818,33 +981,26 @@ fn collect_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
         })
         .collect();
     let distinct = pnames.iter().collect::<HashSet<_>>().len() == pnames.len();
-    if !arity_ok || pnames.len() != ctps.len() || !distinct {
-        let want = if ctps.is_empty() {
-            tn.clone()
-        } else {
-            let ps: Vec<&str> = ctps.iter().map(|t| t.name.as_str()).collect();
-            format!("impl<{}> {tn}<{}>", ps.join(", "), ps.join(", "))
-        };
-        return Err(type_err(
-            format!("an impl of struct `{tn}` must cover all its instantiations: `{want}` (specialized and conditional impls are not supported yet)"),
-            *tspan,
-        ));
+    if targs.len() != ctps.len() || i.tparams.len() != ctps.len() || pnames.len() != ctps.len() || !distinct {
+        return Ok(None);
     }
+    let to_class = |n: &str| pnames.iter().position(|p| p == n).map(|k| Ty::Param(ctps[k].name.clone()));
+    let scope: Vec<(String, u16)> = pnames.iter().enumerate().map(|(k, n)| (n.clone(), k as u16)).collect();
+    for tp in info.tparam_sigs(&i.tparams, &scope)? {
+        let k = pnames.iter().position(|p| *p == tp.name).unwrap();
+        if tp.bounds.iter().any(|b| !ctps[k].bounds.contains(&b.subst(&to_class))) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(pnames))
+}
+
+fn collect_struct_impl(info: &mut ModInfo, module: &Module, i: &ImplDef, tn: &String, pnames: Vec<String>) -> R<()> {
+    let ci = &info.classes[tn];
+    let ctps = ci.tparams.clone();
     // Impl names -> struct names, and the impl's scope (struct positions).
     let to_class = |n: &str| pnames.iter().position(|p| p == n).map(|k| Ty::Param(ctps[k].name.clone()));
     let scope: Vec<(String, u16)> = pnames.iter().enumerate().map(|(k, n)| (n.clone(), k as u16)).collect();
-    let itps = info.tparam_sigs(&i.tparams, &scope)?;
-    for tp in &itps {
-        let k = pnames.iter().position(|p| *p == tp.name).unwrap();
-        for b in &tp.bounds {
-            if !ctps[k].bounds.contains(&b.subst(&to_class)) {
-                return Err(type_err(
-                    format!("bound `{}: {}` is not one of struct `{tn}`'s bounds (conditional impls are not supported yet)", tp.name, b.name()),
-                    *tspan,
-                ));
-            }
-        }
-    }
     // The impl's parameters with the struct's bounds, in impl names.
     let to_impl = |n: &str| ctps.iter().position(|t| t.name == n).map(|k| pnames[k].clone());
     let sdef = module.body.stmts.iter().find_map(|s| match &s.kind {
@@ -937,6 +1093,36 @@ fn check_trait_impl(
     sigs: &[(String, Sig, Span)],
     span: Span,
 ) -> R<()> {
+    let (args, descs) = trait_header(info, tn, tr, trargs, trspan, scope, to_class)?;
+    if info.classes[tn].impls.iter().any(|(t, _)| t == tr) {
+        return Err(type_err(format!("`{tn}` implements `{tr}` twice"), trspan));
+    }
+    check_trait_methods(info, module, tn, self_ty, tr, &args, sigs, span, &|_| None)?;
+    let ci = info.classes.get_mut(tn).unwrap();
+    ci.impls.push((tr.to_string(), args.clone()));
+    ci.trait_descs.push((tr.to_string(), descs));
+    if let Some((_, _, implies, _)) = builtin_trait(tr) {
+        for i in implies.iter() {
+            if !ci.impls.iter().any(|(t, _)| t == i) {
+                let a = if builtin_trait(i).is_some_and(|b| b.1 == args.len()) { args.clone() } else { Vec::new() };
+                ci.impls.push((i.to_string(), a));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The trait of `impl tr<trargs> for tn`: checks that it is one that can be
+/// implemented and resolves its arguments (static and runtime forms).
+fn trait_header(
+    info: &ModInfo,
+    tn: &str,
+    tr: &str,
+    trargs: &[TypeExpr],
+    trspan: Span,
+    scope: &[(String, u16)],
+    to_class: &dyn Fn(&str) -> Option<Ty>,
+) -> R<(Vec<Ty>, Vec<TypeDesc>)> {
     if tr == "Send" {
         return Err(type_err(format!("`Send` is automatic: `{tn}` is `Send` when all of its fields are"), trspan));
     }
@@ -962,9 +1148,6 @@ fn check_trait_impl(
             trspan,
         ));
     }
-    if info.classes[tn].impls.iter().any(|(t, _)| t == tr) {
-        return Err(type_err(format!("`{tn}` implements `{tr}` twice"), trspan));
-    }
     let mut args = Vec::new();
     let mut descs = Vec::new();
     for a in trargs {
@@ -972,12 +1155,31 @@ fn check_trait_impl(
         args.push(t.subst(to_class));
         descs.push(d);
     }
-    // Required, allowed and expected methods.
+    Ok((args, descs))
+}
+
+/// Checks the methods `sigs` of `impl tr<args> for tn` against the trait:
+/// every required one defined (or `provided` by a native target's Rust
+/// class), with the trait's signature, and nothing the trait lacks.
+#[allow(clippy::too_many_arguments)]
+fn check_trait_methods(
+    info: &ModInfo,
+    module: &Module,
+    tn: &str,
+    self_ty: &Ty,
+    tr: &str,
+    args: &[Ty],
+    sigs: &[(String, Sig, Span)],
+    span: Span,
+    provided: &dyn Fn(&str) -> Option<Sig>,
+) -> R<()> {
     let shown = if args.is_empty() { tr.to_string() } else { format!("{tr}<{}>", args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")) };
     let what = format!("`impl {shown} for {tn}`");
+    let show = |s: &Sig| format!("({}) -> {}", s.params.iter().map(|p| p.ty.name()).collect::<Vec<_>>().join(", "), s.ret.name());
+    let same = |have: &Sig, w: &Sig| have.params.len() == w.params.len() && have.params.iter().zip(&w.params).all(|(h, x)| h.ty == x.ty) && ty_compatible(&w.ret, &have.ret);
     match (info.traits.get(tr), builtin_trait(tr)) {
         (Some(ti), _) => {
-            let want = info.trait_methods_for(tr, &args, self_ty.clone()).unwrap_or_default();
+            let want = info.trait_methods_for(tr, args, self_ty.clone()).unwrap_or_default();
             let tdef = module.body.stmts.iter().find_map(|s| match &s.kind {
                 StmtKind::Trait(t) if t.name == tr => Some(t),
                 _ => None,
@@ -988,17 +1190,21 @@ fn check_trait_impl(
             };
             required.sort();
             for n in required {
-                if !sigs.iter().any(|(m, _, _)| m == n) {
+                if sigs.iter().any(|(m, _, _)| m == n) {
+                    continue;
+                }
+                let Some(have) = provided(n) else {
                     return Err(type_err(format!("{what}: `{tn}` does not define required method `{n}`"), span));
+                };
+                if !same(&have, &want[n]) {
+                    return Err(type_err(format!("{what}: `{tn}.{n}` is `{}`, but `{tr}` needs `{}`", show(&have), show(&want[n])), span));
                 }
             }
             for (n, have, mspan) in sigs {
                 let Some(w) = want.get(n) else {
                     return Err(type_err(format!("{what}: `{n}` is not a method of trait `{tr}`"), *mspan));
                 };
-                let params_ok = have.params.len() == w.params.len() && have.params.iter().zip(&w.params).all(|(h, x)| h.ty == x.ty);
-                if !params_ok || !ty_compatible(&w.ret, &have.ret) {
-                    let show = |s: &Sig| format!("({}) -> {}", s.params.iter().map(|p| p.ty.name()).collect::<Vec<_>>().join(", "), s.ret.name());
+                if !same(have, w) {
                     return Err(type_err(format!("{what}: `{n}` is `{}`, but `{tr}` needs `{}`", show(have), show(w)), *mspan));
                 }
             }
@@ -1008,7 +1214,7 @@ fn check_trait_impl(
             // implies (`Num` implies `Ord`) may be defined here too.
             let allowed: Vec<&str> = methods.iter().chain(implies.iter().filter_map(|i| builtin_trait(i)).flat_map(|t| t.3.iter())).copied().collect();
             for m in methods.iter() {
-                if !sigs.iter().any(|(n, _, _)| n == m) {
+                if !sigs.iter().any(|(n, _, _)| n == m) && provided(m).is_none() {
                     return Err(type_err(format!("{what}: `{tn}` does not define required method `{m}`"), span));
                 }
             }
@@ -1018,99 +1224,167 @@ fn check_trait_impl(
         }
         (None, None) => unreachable!(),
     }
-    let ci = info.classes.get_mut(tn).unwrap();
-    ci.impls.push((tr.to_string(), args.clone()));
-    ci.trait_descs.push((tr.to_string(), descs));
-    if let Some((_, _, implies, _)) = builtin_trait(tr) {
-        for i in implies.iter() {
-            if !ci.impls.iter().any(|(t, _)| t == i) {
-                let a = if builtin_trait(i).is_some_and(|b| b.1 == args.len()) { args.clone() } else { Vec::new() };
-                ci.impls.push((i.to_string(), a));
-            }
-        }
-    }
     Ok(())
 }
 
-/// Checks `impl tr for target` (a program's trait for a native class) and
-/// records it: the class (each instantiation of a generic one) implements
-/// the trait and gets its default methods.
-fn impl_for(info: &mut ModInfo, module: &Module, tr: &str, targs: &[TypeExpr], target: &str, tspan: Span, span: Span) -> R<()> {
-    if !targs.is_empty() {
-        return Err(type_err(format!("generic traits cannot be implemented for native classes (`impl {tr}<...> for {target}`)"), tspan));
-    }
-    let user = info.traits.get(tr);
-    if user.is_some_and(|t| t.native) {
-        return Err(type_err(format!("`{tr}` is a native trait: its implementations for native classes are declared in Rust (`c.implements(..)`)"), tspan));
-    }
-    if user.is_some_and(|t| !t.tparams.is_empty()) {
-        return Err(type_err(format!("generic traits cannot be implemented for native classes (`{tr}`)"), tspan));
-    }
-    let required: Vec<(String, Option<Sig>)> = match (user, builtin_trait(tr)) {
-        (Some(t), _) => {
-            let tdef = module.body.stmts.iter().find_map(|s| match &s.kind {
-                StmtKind::Trait(t) if t.name == tr => Some(t),
-                _ => None,
-            });
-            let mut req: Vec<(String, Option<Sig>)> = tdef
-                .map(|d| d.methods.iter().filter(|m| m.body.is_none()).map(|m| (m.name.clone(), t.methods.get(&m.name).cloned())).collect())
-                .unwrap_or_default();
-            req.sort_by(|a, b| a.0.cmp(&b.0));
-            req
+/// Records an impl that is matched against types (see `ImplInfo`), after
+/// the orphan rule: a trait impl needs the trait or the target to be the
+/// program's, and an inherent impl a struct of the program.
+fn collect_registry_impl(info: &mut ModInfo, module: &Module, i: &ImplDef) -> R<()> {
+    let tspan = i.target.span();
+    let scope: Vec<(String, u16)> = i.tparams.iter().enumerate().map(|(k, t)| (t.name.clone(), k as u16)).collect();
+    let tparams = info.tparam_sigs(&i.tparams, &scope)?;
+    let (target, target_desc) = info.resolve_scoped(&i.target, &scope)?;
+    let tn = target.name();
+    match &target {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Tuple(Some(_)) | Ty::Array(_) | Ty::Chan(_) | Ty::Opaque(_) | Ty::Instance(..) => {}
+        Ty::Param(_) => return Err(type_err(format!("blanket impls (`impl<{tn}> Trait for {tn}`) are not supported; implement the trait for each type"), tspan)),
+        Ty::Option(_) => return Err(type_err(format!("`{tn}` cannot be an impl target: an `Option` value is its inner value or `None`"), tspan)),
+        _ => {
+            return Err(type_err(
+                format!("`{tn}` cannot be an impl target: implement traits for concrete types, not erased ones (`any`, `function`, `Iterator`, traits)"),
+                tspan,
+            ))
         }
-        (None, Some((_, 0, implies, methods))) => {
-            let implied = implies.iter().filter_map(|i| builtin_trait(i)).flat_map(|t| t.3.iter());
-            methods.iter().chain(implied).map(|m| (m.to_string(), None)).collect()
-        }
-        (None, Some(_)) => return Err(type_err(format!("generic traits cannot be implemented for native classes (`{tr}`)"), tspan)),
-        (None, None) if tr == "Send" => {
-            return Err(type_err("`Send` is automatic: a native class is `Send` when its Rust type is (`class`/`class_send`)", tspan))
-        }
-        (None, None) => return Err(name_err(format!("unknown trait `{tr}`"), tspan)),
+    }
+    if let Some(tp) = tparams.iter().find(|tp| !mentions(&target, &tp.name)) {
+        return Err(type_err(format!("type parameter `{}` is not used by the impl's target `{tn}`", tp.name), tspan));
+    }
+    let pb = |n: &str| tparams.iter().find(|t| t.name == n).map(|t| t.bounds.clone()).unwrap_or_default();
+    info.check_wf(&target, &pb, tspan)?;
+    let class = match &target {
+        Ty::Instance(c, _) => info.classes.get(c),
+        _ => None,
     };
-    let defaults = info.trait_methods(tr, &[]).unwrap_or_default();
-    let ci = &info.classes[target];
-    let classes: Vec<(Vec<Ty>, &ClassInfo)> =
-        if ci.instances.is_empty() { vec![(Vec::new(), ci)] } else { ci.instances.iter().map(|(a, i)| (a.clone(), i)).collect() };
-    for (args, k) in &classes {
-        let what = if args.is_empty() { target.to_string() } else { Ty::Instance(target.into(), args.clone()).name() };
-        if k.impls.iter().any(|(t, _)| t == tr) {
-            return Err(type_err(format!("`{what}` already implements `{tr}`"), span));
+    let own_struct = class.is_some_and(|c| !c.native);
+    let native = class.is_some_and(|c| c.native);
+    let tr: Option<(String, Vec<Ty>, Vec<TypeDesc>)> = match &i.tr {
+        None if native => {
+            return Err(type_err(format!("`{tn}` is a native class: its methods are defined in Rust; add yours through a trait (`impl MyTrait for {tn}`)"), tspan))
         }
-        for (m, want) in &required {
-            let Some(have) = k.methods.get(m) else {
-                return Err(type_err(format!("`impl {tr} for {target}`: `{what}` does not define required method `{m}`"), span));
+        None if !own_struct => {
+            return Err(type_err(
+                format!("inherent impls are only allowed for this program's structs; for `{tn}`, define a trait and implement it (`impl MyTrait for {tn}:`)"),
+                tspan,
+            ))
+        }
+        None => None,
+        Some((tr, trargs, trspan)) => {
+            let (args, descs) = trait_header(info, &tn, tr, trargs, *trspan, &scope, &|_| None)?;
+            let own_trait = info.traits.get(tr).is_some_and(|t| !t.native);
+            if !own_trait && !own_struct {
+                let msg = if native && info.traits.get(tr).is_some_and(|t| t.native) {
+                    format!("`{tr}` is a native trait: its implementations for native classes are declared in Rust (`c.implements(..)`)")
+                } else if native {
+                    format!("`impl {tr} for {tn}`: both are foreign (orphan rule: the trait or the type must be defined in this program); declare it in Rust (`c.implements(\"{tr}\")`)")
+                } else {
+                    format!("`impl {tr} for {tn}`: both are foreign (orphan rule: the trait or the type must be defined in this program)")
+                };
+                return Err(type_err(msg, *trspan));
+            }
+            let exception = tr == "Exception" || builtin_trait(tr).is_some_and(|b| b.2.contains(&"Exception"));
+            if tr == "Drop" || exception {
+                return Err(type_err(format!("`{tr}` can only be implemented for a whole struct (`impl<..> {tr} for S<..>`)"), *trspan));
+            }
+            Some((tr.clone(), args, descs))
+        }
+    };
+    let fields: Vec<String> = class.map(|c| c.fields.iter().map(|f| f.0.clone()).collect()).unwrap_or_default();
+    let mut sigs: Vec<(String, Sig, Span)> = Vec::new();
+    for m in &i.methods {
+        if m.params.first().is_none_or(|p| p.name != "self") {
+            let msg = match &tr {
+                Some((t, _, _)) => format!("`{}` in `impl {t} for {tn}` must take `self`: traits have no associated functions", m.name),
+                None => format!("`{}`: associated functions need an impl of the whole struct (`impl<..> S<..>:`), not `impl {tn}`", m.name),
             };
-            let Some(want) = want else { continue };
-            let params_ok = have.params.len() == want.params.len() && have.params.iter().zip(&want.params).all(|(h, w)| h.ty == w.ty);
-            if !params_ok || !ty_compatible(&want.ret, &have.ret) {
-                let show = |s: &Sig| format!("({}) -> {}", s.params.iter().map(|p| p.ty.name()).collect::<Vec<_>>().join(", "), s.ret.name());
-                return Err(type_err(
-                    format!("`impl {tr} for {target}`: `{what}.{m}` is `{}`, but `{tr}` needs `{}`", show(have), show(want)),
-                    span,
-                ));
+            return Err(type_err(msg, m.span));
+        }
+        check_method_typing(m)?;
+        if fields.contains(&m.name) {
+            return Err(syn_err(format!("`{}` is both a field and a method of `{tn}`", m.name), m.span));
+        }
+        if m.name == "__drop__" {
+            return Err(type_err("a destructor is defined by implementing `Drop` for the whole struct", m.span));
+        }
+        if sigs.iter().any(|(n, _, _)| *n == m.name) {
+            return Err(type_err(format!("method `{}` of `{tn}` is defined twice", m.name), m.span));
+        }
+        sigs.push((m.name.clone(), info.sig_of(m, true, &tparams)?, m.span));
+    }
+    // A native target's Rust methods implement the trait's methods (each
+    // instantiation of a generic class must have them).
+    let rust_sig = |n: &str| -> Option<Sig> {
+        let Ty::Instance(c, args) = &target else { return None };
+        let ci = info.classes.get(c).filter(|c| c.native)?;
+        if let Some(k) = info.class_info(c, args) {
+            return k.methods.get(n).cloned();
+        }
+        let all: Vec<&ClassInfo> = ci.instances.iter().map(|(_, k)| k).collect();
+        if all.is_empty() || !all.iter().all(|k| k.methods.contains_key(n)) {
+            return None;
+        }
+        all[0].methods.get(n).cloned()
+    };
+    let mut methods: HashMap<String, Sig> = sigs.iter().map(|(n, s, _)| (n.clone(), s.clone())).collect();
+    if let Some((t, args, _)) = &tr {
+        check_trait_methods(info, module, &tn, &target, t, args, &sigs, i.span, &rust_sig)?;
+        for (n, s) in info.trait_methods_for(t, args, target.clone()).unwrap_or_default() {
+            if !methods.contains_key(&n) && rust_sig(&n).is_none() {
+                methods.insert(n, s);
             }
         }
     }
-    let add = |k: &mut ClassInfo| {
-        k.impls.push((tr.to_string(), Vec::new()));
-        if let Some((_, _, implies, _)) = builtin_trait(tr) {
-            for i in implies.iter() {
-                if !k.impls.iter().any(|(t, _)| t == i) {
-                    k.impls.push((i.to_string(), Vec::new()));
+    let mut bound_descs = Vec::new();
+    for (k, tp) in i.tparams.iter().enumerate() {
+        for b in &tp.bounds {
+            let d = match info.resolve_scoped(b, &scope)?.1 {
+                TypeDesc::Local(d) => *d,
+                d => d,
+            };
+            bound_descs.push((k as u16, d));
+        }
+    }
+    let shown = match &tr {
+        Some((t, args, _)) => format!("impl {} for {tn}", Ty::Trait(t.clone(), args.clone()).name()),
+        None => format!("impl {tn}"),
+    };
+    let (tr, trait_descs) = match tr {
+        Some((t, a, d)) => (Some((t, a)), d),
+        None => (None, Vec::new()),
+    };
+    info.impls.push(ImplInfo { tparams, tr, target, target_desc, bound_descs, trait_descs, methods, defs: i.methods.clone(), shown, span: i.span });
+    Ok(())
+}
+
+/// Coherence, as in Rust: no two impls of a trait for overlapping types
+/// (bounds are ignored), and no method defined twice for overlapping types.
+fn check_coherence(info: &ModInfo) -> R<()> {
+    for (k, im) in info.impls.iter().enumerate() {
+        let head = match &im.target {
+            Ty::Instance(c, _) => info.classes.get(c).map(|ci| (c, ci)),
+            _ => None,
+        };
+        match &im.tr {
+            Some((tr, _)) => {
+                if let Some(o) = info.impls[..k].iter().find(|o| o.tr.as_ref().is_some_and(|(t, _)| t == tr) && overlaps(&im.target, &o.target)) {
+                    return Err(type_err(format!("conflicting implementations of `{tr}`: `{}` overlaps `{}`", im.shown, o.shown), im.span));
+                }
+                if let Some((c, _)) = head.filter(|(_, ci)| ci.impls.iter().any(|(t, _)| t == tr)) {
+                    return Err(type_err(format!("conflicting implementations of `{tr}`: `{}` overlaps the implementation for every `{c}`", im.shown), im.span));
+                }
+            }
+            None => {
+                for n in im.defs.iter().map(|d| &d.name) {
+                    if let Some((c, _)) = head.filter(|(_, ci)| ci.methods.contains_key(n)) {
+                        return Err(type_err(format!("method `{n}` is defined twice: in `{}` and in the impl for every `{c}`", im.shown), im.span));
+                    }
+                    let twice = info.impls[..k].iter().find(|o| o.tr.is_none() && overlaps(&im.target, &o.target) && o.defs.iter().any(|d| d.name == *n));
+                    if let Some(o) = twice {
+                        return Err(type_err(format!("method `{n}` is defined twice, in `{}` and `{}` (their targets overlap)", im.shown, o.shown), im.span));
+                    }
                 }
             }
         }
-        for (n, sig) in &defaults {
-            if !k.methods.contains_key(n) {
-                k.trait_methods.entry(n.clone()).or_default().push((tr.to_string(), sig.clone()));
-            }
-        }
-    };
-    let ci = info.classes.get_mut(target).unwrap();
-    add(ci);
-    for (_, i) in &mut ci.instances {
-        add(i);
     }
     Ok(())
 }
@@ -1272,6 +1546,7 @@ struct FnCtx<'m> {
     codes: Vec<Arc<Code>>,
     classes: Vec<ClassSpec>,
     traits: Vec<TraitSpec>,
+    impls: Vec<ImplSpec>,
     exc_table: Vec<ExcEntry>,
     owned: Vec<bool>,
     reg_names: Vec<Option<String>>,
@@ -1343,6 +1618,7 @@ impl<'m> FnCtx<'m> {
             codes: Vec::new(),
             classes: Vec::new(),
             traits: Vec::new(),
+            impls: Vec::new(),
             exc_table: Vec::new(),
             owned: Vec::new(),
             reg_names: Vec::new(),
@@ -1421,6 +1697,7 @@ impl<'m> FnCtx<'m> {
             codes: self.codes,
             classes: self.classes,
             traits: self.traits,
+            impls: self.impls,
             exc_table: self.exc_table,
             ncaptures: self.captures.len() as u16,
             is_generator,
@@ -1600,7 +1877,7 @@ impl<'m> FnCtx<'m> {
     fn trait_args_of(&self, t: &Ty, b: &str) -> Option<Vec<Ty>> {
         let iter_like = b == "Iterable" || b == "Iterator";
         match t {
-            Ty::Instance(c, args) => self.m.impls_of(c, args).into_iter().find(|(n, _)| n == b).map(|(_, a)| a),
+            Ty::Instance(c, args) => self.m.impls_of(c, args, &|n| self.pbounds(n)).into_iter().find(|(n, _)| n == b).map(|(_, a)| a),
             Ty::Trait(n, args) if n == b || (n == "Iterator" && b == "Iterable") => Some(args.clone()),
             Ty::Param(n) => self.pbounds(n).into_iter().find_map(|x| match x {
                 Ty::Trait(bn, args) if bn == b || (bn == "Iterator" && b == "Iterable") => Some(args),
@@ -1610,7 +1887,7 @@ impl<'m> FnCtx<'m> {
             Ty::List(x) | Ty::Dict(x, _) | Ty::Chan(x) if b == "Iterable" => Some(vec![(**x).clone()]),
             Ty::Str if b == "Iterable" => Some(vec![Ty::Str]),
             Ty::Array(Some(e)) if b == "Iterable" => Some(vec![elem_ty(*e)]),
-            _ => None,
+            _ => self.m.registry_traits(t, &|n| self.pbounds(n)).into_iter().find(|(n, _)| n == b).map(|(_, a)| a),
         }
     }
 
@@ -2642,7 +2919,7 @@ impl<'m> FnCtx<'m> {
             if let Some(ci) = self.m.class_info(c, args) {
                 if let Some((_, fty, _)) = ci.fields.iter().find(|(n, _, _)| n == name) {
                     ty = fty.subst(&class_map(ci, args)).as_value();
-                } else if ci.lookup(name).is_some() {
+                } else if ci.lookup(name).is_some() || !self.m.registry_methods(&o.ty, name, &|n| self.pbounds(n)).is_empty() {
                     ty = self.func_ty(self.may_be_local(&o.ty));
                 } else {
                     return Err(Error::new("AttributeError", format!("`{c}` has no field or method `{name}`"), span));
@@ -3748,7 +4025,7 @@ impl<'m> FnCtx<'m> {
             return Ok(g);
         }
         match self.m.classes.get(tn) {
-            Some(ci) if ci.lookup(n).is_some() => {
+            Some(ci) if ci.lookup(n).is_some() || self.m.has_registry_method(tn, n) => {
                 Err(type_err(format!("`{n}` is a method of `{tn}`, not an associated function: call it on a value (`x.{n}(...)`)"), span))
             }
             Some(_) => Err(Error::new("AttributeError", format!("`{tn}` has no associated function `{n}`"), span)),
@@ -3862,7 +4139,7 @@ impl<'m> FnCtx<'m> {
                 let is_trait = self.m.traits.contains_key(tn);
                 let is_method = !is_trait
                     && !self.m.funcs.contains_key(&format!("{tn}::{n}"))
-                    && self.m.classes.get(tn).is_some_and(|ci| ci.lookup(n).is_some());
+                    && self.m.classes.get(tn).is_some_and(|ci| ci.lookup(n).is_some() || self.m.has_registry_method(tn, n));
                 if is_trait || is_method {
                     let Some((recv, rest)) = args.split_first() else {
                         return Err(type_err(format!("`{tn}::{n}` needs the receiver as its first argument: `{tn}::{n}(x, ..)`"), span));
@@ -4359,26 +4636,64 @@ impl<'m> FnCtx<'m> {
             let names: Vec<String> = ts.iter().map(|t| format!("`{t}::{mname}`")).collect();
             type_err(format!("`{mname}` is ambiguous for `{c}`: {}; call it as `{}::{mname}(x)`", names.join(" or "), ts[0]), span)
         };
-        match r.ty.peel() {
+        // Trait methods of registered impls that may apply, one entry per
+        // trait (`None` when those impls' signatures differ).
+        let by_trait = |reg: &[(Option<String>, Sig)], mut ts: Vec<(String, Option<Sig>)>| {
+            for (t, s) in reg {
+                let Some(t) = t else { continue };
+                match ts.iter_mut().find(|(x, _)| x == t) {
+                    Some((_, have)) if have.as_ref() != Some(s) => *have = None,
+                    Some(_) => {}
+                    None => ts.push((t.clone(), Some(s.clone()))),
+                }
+            }
+            ts
+        };
+        let recv_ty = r.ty.peel().clone();
+        match &recv_ty {
             Ty::Instance(c, cargs) => {
                 if let Some(ci) = self.m.class_info(c, cargs) {
                     let map = class_map(ci, cargs);
+                    let reg = self.m.registry_methods(&recv_ty, mname, &|n| self.pbounds(n));
                     match (force, ci.lookup(mname)) {
-                        (Some(t), _) => match ci.trait_method(t, mname) {
-                            Some(s) => sig = Some(s.subst(&map)),
+                        (Some(t), _) => match ci.trait_method(t, mname).map(|s| s.subst(&map)) {
+                            Some(s) => sig = Some(s),
+                            None if reg.iter().any(|(x, _)| x.as_deref() == Some(t)) => {
+                                sig = by_trait(&reg, Vec::new()).into_iter().find(|(x, _)| x == t).and_then(|(_, s)| s)
+                            }
                             // A native class's Rust method implements its traits.
                             None if ci.native && ci.methods.contains_key(mname) => sig = ci.methods.get(mname).map(|s| s.subst(&map)),
                             None => return Err(type_err(format!("`{c}` has no method `{t}::{mname}`"), span)),
                         },
                         (None, Some(MethodRef::Inherent(s))) => sig = Some(s.subst(&map)),
-                        (None, Some(MethodRef::Trait(t, s))) => {
-                            sig = Some(s.subst(&map));
-                            qual = Some(t);
-                        }
-                        (None, Some(MethodRef::Ambiguous(ts))) => return Err(ambiguous(c, &ts)),
-                        (None, None) => {
-                            if !ci.fields.iter().any(|(n, _, _)| n == mname) {
-                                return Err(Error::new("AttributeError", format!("`{c}` has no method `{mname}`"), span));
+                        (None, found) => {
+                            if let Some((_, s)) = reg.iter().find(|(t, _)| t.is_none()) {
+                                // A conditional inherent impl (`impl<T: Ord> Stack<T>`).
+                                sig = Some(s.clone());
+                            } else {
+                                let own: Vec<(String, Option<Sig>)> = match found {
+                                    Some(MethodRef::Trait(t, s)) => vec![(t, Some(s.subst(&map)))],
+                                    Some(MethodRef::Ambiguous(ts)) => ts.into_iter().map(|t| (t, None)).collect(),
+                                    _ => Vec::new(),
+                                };
+                                let mut ts = by_trait(&reg, own);
+                                match ts.len() {
+                                    0 => {
+                                        if !ci.fields.iter().any(|(n, _, _)| n == mname) {
+                                            return Err(Error::new("AttributeError", format!("`{}` has no method `{mname}`", recv_ty.name()), span));
+                                        }
+                                    }
+                                    1 => {
+                                        let (t, s) = ts.pop().unwrap();
+                                        sig = s;
+                                        qual = Some(t);
+                                    }
+                                    _ => {
+                                        let mut names: Vec<String> = ts.into_iter().map(|(t, _)| t).collect();
+                                        names.sort();
+                                        return Err(ambiguous(c, &names));
+                                    }
+                                }
                             }
                         }
                     }
@@ -4420,7 +4735,33 @@ impl<'m> FnCtx<'m> {
                     }
                 }
             }
-            _ => {}
+            // Builtin types: their own methods, else trait methods of
+            // registered impls (`impl Describe for int`).
+            t => {
+                if builtin_table(t).is_some_and(|tb| !slim_vm::builtins::has_type_method(tb, mname)) {
+                    let reg = self.m.registry_methods(t, mname, &|n| self.pbounds(n));
+                    let mut ts = by_trait(&reg, Vec::new());
+                    if let Some(f) = force {
+                        ts.retain(|(x, _)| x == f);
+                        if ts.is_empty() && t.is_concrete() {
+                            return Err(type_err(format!("`{}` has no method `{f}::{mname}`", t.name()), span));
+                        }
+                    }
+                    match ts.len() {
+                        0 => {}
+                        1 => {
+                            let (tr, s) = ts.pop().unwrap();
+                            sig = s;
+                            qual = Some(tr);
+                        }
+                        _ => {
+                            let mut names: Vec<String> = ts.into_iter().map(|(t, _)| t).collect();
+                            names.sort();
+                            return Err(ambiguous(&t.name(), &names));
+                        }
+                    }
+                }
+            }
         }
         if qual.as_ref().is_some_and(|t| !self.m.gindex.contains_key(t)) {
             qual = None;
@@ -4874,7 +5215,7 @@ impl<'m> FnCtx<'m> {
 
     /// Items are order-independent, as in Rust: traits, then structs (with
     /// the methods of their `impl` blocks), then associated functions and
-    /// native trait impls are defined before the module's statements run.
+    /// registered impls are defined before the module's statements run.
     fn hoist_items(&mut self, module: &Module) -> R<()> {
         for s in &module.body.stmts {
             if let StmtKind::Trait(t) = &s.kind {
@@ -4889,14 +5230,24 @@ impl<'m> FnCtx<'m> {
         for f in &self.m.assoc_fns {
             self.def_stmt(f)?;
         }
-        for s in &module.body.stmts {
-            if let StmtKind::Impl(i) = &s.kind {
-                if let (Some((tr, _, _)), TypeExpr::Named(tn, _, _)) = (&i.tr, &i.target) {
-                    if self.m.classes.get(tn).is_some_and(|c| c.native) {
-                        self.emit(Instr::ImplNative { tr: self.m.gindex[tr], class: self.m.gindex[tn] });
-                    }
-                }
+        let m = self.m;
+        for im in &m.impls {
+            let mut methods = Vec::new();
+            for d in &im.defs {
+                let code = compile_function(m, d, Owner::Impl(im), &[], &[])?;
+                self.codes.push(Arc::new(code));
+                methods.push((d.name.clone(), (self.codes.len() - 1) as u32));
             }
+            self.impls.push(ImplSpec {
+                name: im.shown.clone(),
+                target: im.target_desc.clone(),
+                nparams: im.tparams.len(),
+                bounds: im.bound_descs.clone(),
+                tr: im.tr.as_ref().map(|(t, _)| m.gindex[t]),
+                trait_args: im.trait_descs.clone(),
+                methods,
+            });
+            self.emit(Instr::MakeImpl { spec: (self.impls.len() - 1) as u32 });
         }
         Ok(())
     }
@@ -5058,6 +5409,8 @@ pub enum Owner<'a> {
     Class(&'a str, &'a [String]),
     /// A default method of a trait.
     Trait(&'a str),
+    /// A method of a registered impl (`impl Describe for int`).
+    Impl(&'a ImplInfo),
 }
 
 /// Compiles a function, method or closure (`captures`). `outer`: the
@@ -5069,8 +5422,10 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     };
     let name = match owner {
         Owner::Class(c, _) | Owner::Trait(c) => format!("{c}.{}", f.name),
+        Owner::Impl(im) => format!("{}.{}", im.target.name(), f.name),
         Owner::None => f.name.clone(),
     };
+    let in_impl = matches!(owner, Owner::Impl(_));
     let mut ctx = FnCtx::new(m, name, false);
     ctx.line = f.span.line;
     ctx.class_name = class_name.map(String::from);
@@ -5081,7 +5436,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     let mut state = State::new();
     let mut params = Vec::new();
     let mut checks = Vec::new();
-    let has_self = f.params.first().is_some_and(|p| p.name == "self") && (class_name.is_some() || ctx_is_trait_method(f));
+    let has_self = f.params.first().is_some_and(|p| p.name == "self") && (class_name.is_some() || in_impl || ctx_is_trait_method(f));
     // Registers: `self`, the hidden type parameters, then the parameters.
     let mut preg = Vec::new();
     if has_self {
@@ -5092,28 +5447,30 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         preg.push(ctx.new_reg(p.keep, Some(p.name.clone())));
     }
     // Type parameters of the enclosing class/trait or closure scope.
-    let (owner_tps, owner_load): (Vec<TParamSig>, Option<(&str, bool)>) = match owner {
-        Owner::Class(c, names) => {
-            let tps = m.classes[c].tparams.iter().zip(names).map(|(t, n)| TParamSig { name: n.clone(), bounds: t.bounds.clone() }).collect();
-            (tps, Some((c, true)))
-        }
-        Owner::Trait(t) => (m.trait_tparams(t), Some((t, false))),
-        Owner::None => (outer.to_vec(), None),
+    let owner_tps: Vec<TParamSig> = match owner {
+        Owner::Class(c, names) => m.classes[c].tparams.iter().zip(names).map(|(t, n)| TParamSig { name: n.clone(), bounds: t.bounds.clone() }).collect(),
+        Owner::Trait(t) => m.trait_tparams(t),
+        Owner::Impl(im) => im.tparams.clone(),
+        Owner::None => outer.to_vec(),
     };
     for (k, tp) in owner_tps.iter().enumerate() {
         if f.tparams.iter().any(|t| t.name == tp.name) {
             return Err(type_err(format!("type parameter `{}` shadows the enclosing one", tp.name), f.span));
         }
         let reg = ctx.new_reg(false, Some(format!("<{}>", tp.name)));
-        match owner_load {
-            Some((_, true)) => {
+        match owner {
+            Owner::Class(..) => {
                 ctx.emit(Instr::LoadTypeArg { dst: reg, obj: 0, k: k as u32 });
             }
-            Some((t, false)) => {
+            Owner::Trait(t) => {
                 let tr = m.gindex[t];
                 ctx.emit(Instr::LoadTraitArg { dst: reg, obj: 0, tr, k: k as u32 });
             }
-            None => {
+            Owner::Impl(im) => {
+                let ty = ctx.type_idx(im.target_desc.clone());
+                ctx.emit(Instr::LoadImplArg { dst: reg, obj: 0, ty, k: k as u32 });
+            }
+            Owner::None => {
                 let idx = captures.iter().position(|(n, _)| *n == format!("<{}>", tp.name)).expect("captured type parameter") as u32;
                 ctx.emit(Instr::LoadCapture { dst: reg, idx });
             }
@@ -5151,6 +5508,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
                 Owner::Class(c, _) => (Ty::Instance(c.to_string(), self_ty(&owner_tps)), None),
                 // Any implementing class, `Send` or not.
                 Owner::Trait(t) => (Ty::Local(Box::new(Ty::Trait(t.to_string(), self_ty(&owner_tps)))), None),
+                Owner::Impl(im) => (im.target.clone(), None),
                 Owner::None => (Ty::Unknown, None),
             },
             (Some(t), _) => {
@@ -5243,7 +5601,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
             ctx.emit_return(dst);
         }
     }
-    let is_method = class_name.is_some();
+    let is_method = class_name.is_some() || in_impl;
     Ok(ctx.finish(params, ret, ctx_is_gen(body), is_method))
 }
 

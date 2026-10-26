@@ -1,0 +1,11 @@
+the int 5 a list of 3 THE INT 7!
+the int 8 the int 9 a list of 1
+a box of 4 A BOX OF 4! 8 3.0
+[1, 2, 3]
+True False
+True False True False
+True False True
+TypeError: '<' not supported between instances of 'Box<Plain>' and 'Box<Plain>'
+TypeError: `Box<float>` does not implement `Describe` (required by `T` of `show()`)
+rc-audit: ok
+[exit 0]
