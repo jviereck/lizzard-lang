@@ -39,6 +39,8 @@ pub struct LockObj {
 }
 
 pub struct ChannelObj {
+    /// `Channel<T>`, `T` being the element type.
+    pub ty: Value,
     q: Mutex<(VecDeque<Value>, bool)>,
     cv: Condvar,
 }
@@ -231,8 +233,9 @@ fn m_locked(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     Ok(Value::bool(*lock_of(a[0]).locked.lock().unwrap()))
 }
 
-pub fn new_channel() -> Value {
-    Obj::alloc(Body::Channel(ChannelObj { q: Mutex::new((VecDeque::new(), false)), cv: Condvar::new() }))
+/// A new channel of type `ty` (`Channel<T>`).
+pub fn new_channel(ty: Value) -> Value {
+    Obj::alloc(Body::Channel(ChannelObj { ty, q: Mutex::new((VecDeque::new(), false)), cv: Condvar::new() }))
 }
 
 fn chan_of(v: Value) -> &'static ChannelObj {
@@ -245,12 +248,20 @@ fn chan_of(v: Value) -> &'static ChannelObj {
 /// `ch.send(v)`: moves `v` into the channel.
 fn m_send(th: &mut Thread, a: &[Value]) -> VResult<Value> {
     let c = chan_of(a[0]);
+    let t = crate::rtype::as_type(c.ty).unwrap();
+    let v = match crate::types::admit(th, a[1], crate::rtype::as_type(crate::rtype::elem_of(t)).unwrap(), t) {
+        Ok(v) => v,
+        Err(e) => {
+            a[1].decref();
+            return Err(e);
+        }
+    };
     let mut g = c.q.lock().unwrap();
     if g.1 {
-        a[1].decref();
+        v.decref();
         return Err(th.raise("RuntimeError", "send on a closed channel"));
     }
-    g.0.push_back(a[1]);
+    g.0.push_back(v);
     c.cv.notify_one();
     Ok(Value::UNIT)
 }

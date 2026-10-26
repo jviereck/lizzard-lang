@@ -369,6 +369,10 @@ pub fn check_type<B: Backend>(b: &mut B, reg: Reg, ty: u32, what: u32) -> Flow<(
     b.frame_op(h::f_check_type, reg as u32, ty, what, 0)
 }
 
+pub fn make_type<B: Backend>(b: &mut B, dst: Reg, ty: u32) -> Flow<()> {
+    b.frame_op(h::f_make_type, dst as u32, ty, 0, 0)
+}
+
 // ---------------------------------------------------------------- fields, elements
 
 pub fn load_field<B: Backend>(b: &mut B, dst: Reg, obj: Reg, name: u32) -> Flow<()> {
@@ -392,8 +396,9 @@ pub fn load_elem<B: Backend>(b: &mut B, dst: Reg, obj: Reg, idx: Reg) -> Flow<()
     b.frame_op(h::f_load_elem, dst as u32, obj as u32, idx as u32, 0)
 }
 
-pub fn store_index<B: Backend>(b: &mut B, obj: Reg, idx: Reg, src: Reg, mode: StoreMode) -> Flow<()> {
-    b.frame_op(h::f_store_index, obj as u32, idx as u32, src as u32, mode as u32)
+pub fn store_index<B: Backend>(b: &mut B, obj: Reg, idx: Reg, src: Reg, mode: StoreMode, proven: bool) -> Flow<()> {
+    let m = mode as u32 | if proven { h::STORE_PROVEN } else { 0 };
+    b.frame_op(h::f_store_index, obj as u32, idx as u32, src as u32, m)
 }
 
 pub fn swap_index<B: Backend>(b: &mut B, dst: Reg, obj: Reg, idx: Reg, src: Reg) -> Flow<()> {
@@ -404,12 +409,12 @@ pub fn build_tuple<B: Backend>(b: &mut B, dst: Reg, args: u32) -> Flow<()> {
     b.frame_op(h::f_build_tuple, dst as u32, args, 0, 0)
 }
 
-pub fn build_list<B: Backend>(b: &mut B, dst: Reg, args: u32) -> Flow<()> {
-    b.frame_op(h::f_build_list, dst as u32, args, 0, 0)
+pub fn build_list<B: Backend>(b: &mut B, dst: Reg, args: u32, ty: u32) -> Flow<()> {
+    b.frame_op(h::f_build_list, dst as u32, args, ty, 0)
 }
 
-pub fn build_dict<B: Backend>(b: &mut B, dst: Reg, args: u32) -> Flow<()> {
-    b.frame_op(h::f_build_dict, dst as u32, args, 0, 0)
+pub fn build_dict<B: Backend>(b: &mut B, dst: Reg, args: u32, ty: u32) -> Flow<()> {
+    b.frame_op(h::f_build_dict, dst as u32, args, ty, 0)
 }
 
 pub fn unpack<B: Backend>(b: &mut B, src: Reg, dsts: u32) -> Flow<()> {

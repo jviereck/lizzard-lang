@@ -1,55 +1,76 @@
 //! Compiled code objects.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::ops::Instr;
+pub use crate::rtype::Ctor;
 use crate::value::Value;
 
 pub type Reg = u16;
 
-/// Runtime type descriptor used by annotation checks.
+/// A type as written in the program, resolved to a runtime type value the
+/// first time it is used (`types::code_type`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeDesc {
-    Any,
-    Int,
-    Float,
-    Bool,
-    BigInt,
-    Str,
-    Unit,
-    Tuple,
-    List,
-    Dict,
-    Function,
-    /// A builtin object type checked by name (`Lock`, `Channel`, `Thread`).
-    Builtin(String),
-    /// A class or trait bound to a module-level name (resolved at check time).
+    /// A builtin type constructor and its arguments (none for scalars and
+    /// for a bare container type, which accepts any container of its kind).
+    Builtin(Ctor, Vec<TypeDesc>),
+    /// A class or trait bound to a module-level name.
     Global(u32, String),
-    Option(Box<TypeDesc>),
-    /// `array` (any element type) or `array<T>`.
-    Array(Option<crate::array::Elem>),
+}
+
+impl TypeDesc {
+    pub fn prim(c: Ctor) -> TypeDesc {
+        TypeDesc::Builtin(c, Vec::new())
+    }
+
+    pub fn any() -> TypeDesc {
+        TypeDesc::prim(Ctor::Any)
+    }
+
+    pub fn option(t: TypeDesc) -> TypeDesc {
+        TypeDesc::Builtin(Ctor::Option, vec![t])
+    }
+
+    pub fn is(&self, c: Ctor) -> bool {
+        matches!(self, TypeDesc::Builtin(x, a) if *x == c && a.is_empty())
+    }
 }
 
 impl fmt::Display for TypeDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TypeDesc::Any => f.write_str("any"),
-            TypeDesc::Int => f.write_str("int"),
-            TypeDesc::Float => f.write_str("float"),
-            TypeDesc::Bool => f.write_str("bool"),
-            TypeDesc::BigInt => f.write_str("bigint"),
-            TypeDesc::Str => f.write_str("str"),
-            TypeDesc::Unit => f.write_str("()"),
-            TypeDesc::Tuple => f.write_str("tuple"),
-            TypeDesc::List => f.write_str("list"),
-            TypeDesc::Dict => f.write_str("dict"),
-            TypeDesc::Function => f.write_str("function"),
-            TypeDesc::Builtin(n) => f.write_str(n),
             TypeDesc::Global(_, n) => f.write_str(n),
-            TypeDesc::Option(t) => write!(f, "Option<{t}>"),
-            TypeDesc::Array(None) => f.write_str("array"),
-            TypeDesc::Array(Some(e)) => write!(f, "array<{}>", e.name()),
+            TypeDesc::Builtin(c, args) => {
+                let base = match c {
+                    Ctor::Any => "any",
+                    Ctor::Int => "int",
+                    Ctor::Float => "float",
+                    Ctor::Bool => "bool",
+                    Ctor::BigInt => "bigint",
+                    Ctor::Str => "str",
+                    Ctor::Unit => "()",
+                    Ctor::Tuple => "tuple",
+                    Ctor::List => "list",
+                    Ctor::Dict => "dict",
+                    Ctor::Option => "Option",
+                    Ctor::Array(None) => "array",
+                    Ctor::Array(Some(e)) => return write!(f, "array<{}>", e.name()),
+                    Ctor::Function => "function",
+                    Ctor::Iterator => "Iterator",
+                    Ctor::Channel => "Channel",
+                    Ctor::Lock => "Lock",
+                    Ctor::Thread => "Thread",
+                    Ctor::Class(_) | Ctor::Trait(_) => "?",
+                };
+                f.write_str(base)?;
+                if !args.is_empty() {
+                    let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                    write!(f, "<{}>", parts.join(", "))?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -143,6 +164,10 @@ pub struct Code {
     pub names: Vec<String>,
     pub arglists: Vec<ArgList>,
     pub types: Vec<TypeDesc>,
+    /// Runtime type values of `types`, filled in on first use.
+    pub type_cache: Box<[OnceLock<Value>]>,
+    /// Item type of a generator function (`-> Iterator<T>`).
+    pub yield_ty: Option<u32>,
     pub codes: Vec<Arc<Code>>,
     pub classes: Vec<ClassSpec>,
     pub traits: Vec<TraitSpec>,

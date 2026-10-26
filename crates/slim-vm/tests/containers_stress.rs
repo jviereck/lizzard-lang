@@ -5,8 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use slim_vm::dict::Dict;
 use slim_vm::object::{Body, Obj};
-use slim_vm::{rc, Thread, Value};
+use slim_vm::{rc, rtype, Thread, Value};
 
 struct Shared(Value, Value);
 // SAFETY: values are tagged words; the objects are shared via atomic counts.
@@ -31,10 +32,13 @@ fn dict_of(v: Value) -> &'static slim_vm::dict::Dict {
 fn readers_never_see_freed_values() {
     std::env::set_var("SLIM_POISON", "1");
     let vm = slim_vm::new_vm(Vec::new());
-    let shared = Arc::new(Shared(Obj::list(Vec::new()), Obj::alloc(Body::Dict(Default::default()))));
+    let shared = Arc::new(Shared(
+        Obj::list(rtype::list_of(rtype::any()), Vec::new()),
+        Obj::alloc(Body::Dict(Dict::new(rtype::dict_of(rtype::any(), rtype::any())))),
+    ));
     let stop = Arc::new(AtomicBool::new(false));
     let keys: Vec<Value> = (0..32).map(|i| Value::str(format!("k{i}"))).collect();
-    let keys = Arc::new(Shared(Obj::list(keys), Value::UNIT));
+    let keys = Arc::new(Shared(Obj::list(rtype::list_of(rtype::any()), keys), Value::UNIT));
     let mut handles = Vec::new();
     for t in 0..8 {
         let (sh, stop, keys, vm) = (shared.clone(), stop.clone(), keys.clone(), vm.clone());

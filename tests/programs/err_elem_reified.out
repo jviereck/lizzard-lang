@@ -1,0 +1,6 @@
+[1, 2, 3]
+rc-audit: ok
+Traceback (most recent call last):
+  File "err_elem_reified.slim", line 9, in <module>
+TypeError: cannot store `str` in `list<int>`
+[exit 1]

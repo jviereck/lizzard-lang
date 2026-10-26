@@ -394,6 +394,7 @@ impl Lexer {
             ('{', ..) => (Tok::LBrace, 1),
             ('}', ..) => (Tok::RBrace, 1),
             (',', ..) => (Tok::Comma, 1),
+            (':', Some(':'), _) => (Tok::ColonColon, 2),
             (':', ..) => (Tok::Colon, 1),
             ('.', ..) => (Tok::Dot, 1),
             (';', ..) => (Tok::Semi, 1),

@@ -56,6 +56,8 @@ pub enum Tok {
     RBrace,
     Comma,
     Colon,
+    /// `::` (turbofish: `list::<int>()`)
+    ColonColon,
     Dot,
     Semi,
     Ellipsis,
@@ -182,6 +184,7 @@ impl fmt::Display for Tok {
             Tok::RBrace => "`}`",
             Tok::Comma => "`,`",
             Tok::Colon => "`:`",
+            Tok::ColonColon => "`::`",
             Tok::Dot => "`.`",
             Tok::Semi => "`;`",
             Tok::Ellipsis => "`...`",

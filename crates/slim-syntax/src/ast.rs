@@ -68,6 +68,8 @@ pub enum ExprKind {
     Attr(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
+    /// `f::<T, U>`: explicit type arguments.
+    TypeApp(Box<Expr>, Vec<TypeExpr>),
     /// `expr++`: a new counted reference.
     Dup(Box<Expr>),
     Unary(UnOp, Box<Expr>),

@@ -11,6 +11,8 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::code::TypeDesc;
+use crate::rtype::{self, Ctor, RtType};
+use crate::types;
 use crate::dict::Dict;
 use crate::display;
 use crate::generator;
@@ -36,6 +38,13 @@ pub enum IterKind {
     Object { obj: Value },
 }
 
+/// A builtin iterator object.
+pub struct IterObj {
+    /// `Iterator<T>`, `T` being the item type.
+    pub ty: Value,
+    pub k: Mutex<IterKind>,
+}
+
 impl IterKind {
     pub(crate) fn release(&mut self) {
         match self {
@@ -47,12 +56,12 @@ impl IterKind {
     }
 }
 
-fn new_iter(k: IterKind) -> Value {
-    Obj::alloc(Body::Iter(Mutex::new(k)))
+fn new_iter(item: Value, k: IterKind) -> Value {
+    Obj::alloc(Body::Iter(IterObj { ty: rtype::iterator_of(item), k: Mutex::new(k) }))
 }
 
-fn items_iter(items: Vec<Value>) -> Value {
-    new_iter(IterKind::Items { items: items.into_iter() })
+fn items_iter(item: Value, items: Vec<Value>) -> Value {
+    new_iter(item, IterKind::Items { items: items.into_iter() })
 }
 
 /// `iter(v)`: an owned iterator over a borrowed iterable.
@@ -60,22 +69,22 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
     match v.body() {
         Some(Body::List(_)) => {
             v.incref();
-            Ok(new_iter(IterKind::List { list: v, idx: 0 }))
+            Ok(new_iter(rtype::item_type(v), IterKind::List { list: v, idx: 0 }))
         }
         Some(Body::Array(_)) => {
             v.incref();
-            Ok(new_iter(IterKind::Array { arr: v, idx: 0 }))
+            Ok(new_iter(rtype::item_type(v), IterKind::Array { arr: v, idx: 0 }))
         }
         Some(Body::Tuple(t)) => {
             let items: Vec<Value> = t.to_vec();
             items.iter().for_each(|x| x.incref());
-            Ok(items_iter(items))
+            Ok(items_iter(rtype::item_type(v), items))
         }
-        Some(Body::Str(s)) => Ok(items_iter(s.chars().map(|c| Value::str(c.to_string())).collect())),
+        Some(Body::Str(s)) => Ok(items_iter(rtype::str_(), s.chars().map(|c| Value::str(c.to_string())).collect())),
         Some(Body::Dict(d)) => {
             let keys: Vec<Value> = d.entries().into_iter().map(|(k, _)| k).collect();
             keys.iter().for_each(|x| x.incref());
-            Ok(items_iter(keys))
+            Ok(items_iter(rtype::item_type(v), keys))
         }
         Some(Body::Iter(_)) | Some(Body::Generator(_)) | Some(Body::Channel(_)) => {
             v.incref();
@@ -86,13 +95,13 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
             if let Some(&m) = class.methods.get("__iter__") {
                 let it = helpers::call_simple(th, m, Some(v), &[])?;
                 if it.as_instance().is_some() {
-                    return Ok(new_iter(IterKind::Object { obj: it }));
+                    return Ok(new_iter(rtype::any(), IterKind::Object { obj: it }));
                 }
                 return Ok(it);
             }
             if class.methods.contains_key("__next__") {
                 v.incref();
-                return Ok(new_iter(IterKind::Object { obj: v }));
+                return Ok(new_iter(rtype::any(), IterKind::Object { obj: v }));
             }
             Err(th.raise("TypeError", format!("'{}' object is not iterable", class.name)))
         }
@@ -121,7 +130,7 @@ fn clear_exception(th: &mut Thread) {
 pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
     match it.body() {
         Some(Body::Iter(m)) => {
-            let mut k = m.lock().unwrap();
+            let mut k = m.k.lock().unwrap();
             match &mut *k {
                 IterKind::List { list, idx } => {
                     let Some(Body::List(l)) = list.body() else { unreachable!() };
@@ -207,10 +216,31 @@ fn key_error(th: &mut Thread, k: Value) -> Raised {
     th.raise("KeyError", display::repr(k))
 }
 
-pub fn build_dict(th: &mut Thread, items: Vec<Value>) -> VResult<Value> {
-    let d = Dict::default();
+/// A dict of type `ty` from owned alternating keys and values.
+pub fn build_dict(th: &mut Thread, ty: Value, items: Vec<Value>) -> VResult<Value> {
+    let t = rtype::as_type(ty).unwrap();
+    let (kt, vt) = types::dict_kv(t);
+    let d = Dict::new(ty);
     let mut it = items.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        let checked = match (rtype::admit(k, kt), rtype::admit(v, vt)) {
+            (Some(k), Some(v)) => Ok((k, v)),
+            (None, _) => Err(types::key_type_error(th, k, &t.name)),
+            (Some(_), None) => Err(types::elem_error(th, v, &t.name)),
+        };
+        let (k, v) = match checked {
+            Ok(kv) => kv,
+            Err(e) => {
+                k.decref();
+                v.decref();
+                it.for_each(|x| x.decref());
+                for (k, v) in d.drain() {
+                    k.decref();
+                    v.decref();
+                }
+                return Err(e);
+            }
+        };
         match d.insert(k, v) {
             Ok(Some((k2, old))) => {
                 k2.decref();
@@ -254,9 +284,15 @@ pub fn index_other(th: &mut Thread, o: Value, k: Value) -> VResult<Value> {
 pub fn store_index_other(th: &mut Thread, o: Value, k: Value, v: Value) -> VResult<bool> {
     match o.body() {
         Some(Body::Dict(d)) => {
+            let t = rtype::as_type(d.ty).unwrap();
+            let (kt, vt) = types::dict_kv(t);
+            if !rtype::has_type(k, kt) {
+                return Err(types::key_type_error(th, k, &t.name));
+            }
             if dict_hash_check(k).is_none() {
                 return Err(unhashable(th, k));
             }
+            let v = types::admit(th, v, vt, t)?;
             k.incref();
             match d.insert(k, v) {
                 Ok(Some((dup, old))) => {
@@ -281,10 +317,19 @@ fn dict_hash_check(k: Value) -> Option<u64> {
 
 pub fn swap_index_other(th: &mut Thread, o: Value, k: Value, v: Value) -> VResult<Option<Value>> {
     match o.body() {
-        Some(Body::Dict(d)) => match d.swap(k, v) {
-            Some(old) => Ok(Some(old)),
-            None => Err(key_error(th, k)),
-        },
+        Some(Body::Dict(d)) => {
+            let t = rtype::as_type(d.ty).unwrap();
+            let v = types::admit(th, v, types::dict_kv(t).1, t)?;
+            match d.swap(k, v) {
+                Some(old) => Ok(Some(old)),
+                None => {
+                    // `v` was not stored: give it back to the caller's register.
+                    let e = key_error(th, k);
+                    v.decref();
+                    Err(e)
+                }
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -421,7 +466,7 @@ fn b_range(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     if step == 0 {
         return Err(th.raise("ValueError", "range() arg 3 must not be zero"));
     }
-    Ok(new_iter(IterKind::Range { cur: start, end, step }))
+    Ok(new_iter(rtype::int(), IterKind::Range { cur: start, end, step }))
 }
 
 fn b_abs(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -536,11 +581,14 @@ fn b_rc_live(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
 }
 
 fn b_list(th: &mut Thread, args: &[Value]) -> VResult<Value> {
-    let items = match args.first() {
-        Some(v) => collect(th, *v)?,
-        None => Vec::new(),
-    };
-    Ok(Obj::list(items))
+    match args.first() {
+        Some(v) => {
+            let ty = rtype::list_of(rtype::item_type(*v));
+            let items = collect(th, *v)?;
+            types::new_list(th, ty, items)
+        }
+        None => Ok(Obj::list(rtype::list_of(rtype::any()), Vec::new())),
+    }
 }
 
 /// `array(kind, n)`: `n` zeros; `array(kind, iterable)`: the items, converted.
@@ -596,7 +644,7 @@ fn b_tuple(th: &mut Thread, args: &[Value]) -> VResult<Value> {
 }
 
 fn b_dict(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
-    Ok(Obj::alloc(Body::Dict(Dict::default())))
+    Ok(Obj::alloc(Body::Dict(Dict::new(rtype::dict_of(rtype::any(), rtype::any())))))
 }
 
 fn b_isinstance(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -621,12 +669,13 @@ fn b_next(th: &mut Thread, args: &[Value]) -> VResult<Value> {
 }
 
 fn b_sorted(th: &mut Thread, args: &[Value]) -> VResult<Value> {
+    let ty = rtype::list_of(rtype::item_type(args[0]));
     let mut items = collect(th, args[0])?;
     if let Err(e) = sort_values(th, &mut items) {
         items.iter().for_each(|v| v.decref());
         return Err(e);
     }
-    Ok(Obj::list(items))
+    types::new_list(th, ty, items)
 }
 
 fn sort_values(th: &mut Thread, items: &mut [Value]) -> VResult<()> {
@@ -658,16 +707,18 @@ fn sort_values(th: &mut Thread, items: &mut [Value]) -> VResult<()> {
 }
 
 fn b_enumerate(th: &mut Thread, args: &[Value]) -> VResult<Value> {
+    let item = rtype::tuple_of(&[rtype::int(), rtype::item_type(args[0])]);
     let items = collect(th, args[0])?;
     let out = items
         .into_iter()
         .enumerate()
         .map(|(i, v)| Obj::alloc(Body::Tuple(vec![Value::from_i64(i as i64), v].into_boxed_slice())))
         .collect();
-    Ok(items_iter(out))
+    Ok(items_iter(item, out))
 }
 
 fn b_zip(th: &mut Thread, args: &[Value]) -> VResult<Value> {
+    let item = rtype::tuple_of(&[rtype::item_type(args[0]), rtype::item_type(args[1])]);
     let a = collect(th, args[0])?;
     let b = match collect(th, args[1]) {
         Ok(b) => b,
@@ -684,7 +735,7 @@ fn b_zip(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     }
     ai.for_each(|v| v.decref());
     bi.for_each(|v| v.decref());
-    Ok(items_iter(out))
+    Ok(items_iter(item, out))
 }
 
 fn b_ord(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -718,7 +769,65 @@ fn b_lock(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
 }
 
 fn b_channel(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
-    Ok(crate::threads::new_channel())
+    Ok(crate::threads::new_channel(rtype::intern(Ctor::Channel, &[rtype::any()])))
+}
+
+/// Calls a type value: `list<int>(xs)`, `dict<str, int>()`, `Channel<str>()`.
+pub fn construct_type(th: &mut Thread, t: &'static RtType, args: &[Value]) -> VResult<Value> {
+    let arity = |th: &mut Thread, max: usize| -> VResult<()> {
+        if args.len() > max {
+            return Err(th.raise("TypeError", format!("{}() takes at most {max} argument{} ({} given)", t.name, if max == 1 { "" } else { "s" }, args.len())));
+        }
+        Ok(())
+    };
+    match t.ctor {
+        Ctor::List if !t.is_bare() => {
+            arity(th, 1)?;
+            let items = match args.first() {
+                Some(v) => collect(th, *v)?,
+                None => Vec::new(),
+            };
+            types::new_list(th, t.value(), items)
+        }
+        Ctor::Dict if !t.is_bare() => {
+            arity(th, 1)?;
+            let mut flat = Vec::new();
+            if let Some(&src) = args.first() {
+                if let Some(Body::Dict(d)) = src.body() {
+                    for (k, v) in d.entries() {
+                        k.incref();
+                        v.incref();
+                        flat.push(k);
+                        flat.push(v);
+                    }
+                } else {
+                    for pair in collect(th, src)? {
+                        match pair.body() {
+                            Some(Body::Tuple(kv)) if kv.len() == 2 => {
+                                kv[0].incref();
+                                kv[1].incref();
+                                flat.push(kv[0]);
+                                flat.push(kv[1]);
+                                pair.decref();
+                            }
+                            _ => {
+                                let e = th.raise("TypeError", format!("{}() needs (key, value) pairs, got '{}'", t.name, pair.type_name()));
+                                pair.decref();
+                                flat.into_iter().for_each(|v| v.decref());
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+            build_dict(th, t.value(), flat)
+        }
+        Ctor::Channel if !t.is_bare() => {
+            arity(th, 0)?;
+            Ok(crate::threads::new_channel(t.value()))
+        }
+        _ => Err(th.raise("TypeError", format!("type `{}` cannot be called", t.name))),
+    }
 }
 
 pub(crate) type BuiltinDefPub = BuiltinDef;
@@ -854,7 +963,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
         let c = Obj::alloc_immortal(Body::Class(Class {
             name: name.to_string(),
             id: next_id.fetch_add(1, Ordering::Relaxed),
-            fields: vec![Field { name: "msg".into(), ty: TypeDesc::Str, kind: SlotKind::Value }],
+            fields: vec![Field::new("msg".into(), TypeDesc::prim(Ctor::Str), SlotKind::Value)],
             methods: HashMap::new(),
             traits: tr,
             is_exception: true,
@@ -913,7 +1022,7 @@ fn m_split(th: &mut Thread, a: &[Value]) -> VResult<Value> {
         }
         None => s.split_whitespace().map(Value::str).collect(),
     };
-    Ok(Obj::list(parts))
+    Ok(Obj::list(rtype::list_of(rtype::str_()), parts))
 }
 
 fn m_join(th: &mut Thread, a: &[Value]) -> VResult<Value> {
@@ -989,9 +1098,25 @@ fn list_of(v: Value) -> &'static ListObj {
     }
 }
 
-fn m_append(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    list_of(a[0]).push(a[1]);
-    Ok(Value::UNIT)
+/// The type and element type of a list.
+fn list_types(l: &ListObj) -> (&'static RtType, &'static RtType) {
+    let t = rtype::as_type(l.ty).unwrap();
+    (t, rtype::as_type(rtype::elem_of(t)).unwrap())
+}
+
+fn m_append(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let l = list_of(a[0]);
+    let (t, e) = list_types(l);
+    match types::admit(th, a[1], e, t) {
+        Ok(v) => {
+            l.push(v);
+            Ok(Value::UNIT)
+        }
+        Err(err) => {
+            a[1].decref();
+            Err(err)
+        }
+    }
 }
 
 /// `l.pop()` / `l.pop(i)`: `Some(item)` (owned), or `None` if the list is
@@ -1034,24 +1159,35 @@ fn m_insert(th: &mut Thread, a: &[Value]) -> VResult<Value> {
         }
     };
     let l = list_of(a[0]);
+    let (t, e) = list_types(l);
+    let v = match types::admit(th, a[2], e, t) {
+        Ok(v) => v,
+        Err(err) => {
+            a[2].decref();
+            return Err(err);
+        }
+    };
     let ok = l.write(|w| {
         if (i as u64) <= w.len() as u64 {
-            w.insert(i as usize, a[2]);
+            w.insert(i as usize, v);
             true
         } else {
             false
         }
     });
     if !ok {
-        a[2].decref();
+        v.decref();
         return Err(helpers::index_error(th, i, "list", l.len()));
     }
     Ok(Value::UNIT)
 }
 
 fn m_extend(th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let l = list_of(a[0]);
+    let (t, e) = list_types(l);
     let items = collect(th, a[1])?;
-    list_of(a[0]).write(|w| w.extend(items));
+    let items = types::admit_all(th, items, e, t)?;
+    l.write(|w| w.extend(items));
     Ok(Value::UNIT)
 }
 
@@ -1138,9 +1274,10 @@ fn m_sort(th: &mut Thread, a: &[Value]) -> VResult<Value> {
 }
 
 fn m_list_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let items = list_of(a[0]).snapshot();
+    let l = list_of(a[0]);
+    let items = l.snapshot();
     items.iter().for_each(|v| v.incref());
-    Ok(Obj::list(items))
+    Ok(Obj::list(l.ty, items))
 }
 
 fn dict_of(v: Value) -> &'static Dict {
@@ -1156,19 +1293,32 @@ fn m_dict_get(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     Ok(v)
 }
 
+/// The key and value type values of a dict.
+fn dict_types(d: &Dict) -> (Value, Value) {
+    let t = rtype::as_type(d.ty).unwrap();
+    if t.args.len() == 2 {
+        (t.args[0], t.args[1])
+    } else {
+        (rtype::any(), rtype::any())
+    }
+}
+
 fn m_keys(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let ks: Vec<Value> = dict_of(a[0]).entries().into_iter().map(|(k, _)| k).collect();
+    let d = dict_of(a[0]);
+    let ks: Vec<Value> = d.entries().into_iter().map(|(k, _)| k).collect();
     ks.iter().for_each(|v| v.incref());
-    Ok(Obj::list(ks))
+    Ok(Obj::list(rtype::list_of(dict_types(d).0), ks))
 }
 
 fn m_values(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let vs: Vec<Value> = dict_of(a[0]).entries().into_iter().map(|(_, v)| v).collect();
+    let d = dict_of(a[0]);
+    let vs: Vec<Value> = d.entries().into_iter().map(|(_, v)| v).collect();
     vs.iter().for_each(|v| v.incref());
-    Ok(Obj::list(vs))
+    Ok(Obj::list(rtype::list_of(dict_types(d).1), vs))
 }
 
 fn m_items(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let (kt, vt) = dict_types(dict_of(a[0]));
     let items = dict_of(a[0])
         .entries()
         .into_iter()
@@ -1178,7 +1328,7 @@ fn m_items(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
             Obj::alloc(Body::Tuple(vec![k, v].into_boxed_slice()))
         })
         .collect();
-    Ok(Obj::list(items))
+    Ok(Obj::list(rtype::list_of(rtype::tuple_of(&[kt, vt])), items))
 }
 
 fn m_dict_pop(th: &mut Thread, a: &[Value]) -> VResult<Value> {
@@ -1198,8 +1348,9 @@ fn m_dict_pop(th: &mut Thread, a: &[Value]) -> VResult<Value> {
 }
 
 fn m_dict_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let d = Dict::default();
-    for (k, v) in dict_of(a[0]).entries() {
+    let src = dict_of(a[0]);
+    let d = Dict::new(src.ty);
+    for (k, v) in src.entries() {
         k.incref();
         v.incref();
         let _ = d.insert(k, v);
@@ -1257,7 +1408,7 @@ fn m_arr_to_list(th: &mut Thread, a: &[Value]) -> VResult<Value> {
             }
         }
     }
-    Ok(Obj::list(items))
+    Ok(Obj::list(rtype::list_of(rtype::elem_scalar(arr.elem)), items))
 }
 
 /// `a.sum()`: an int for integer and bool arrays, a float for float arrays.

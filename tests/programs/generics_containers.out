@@ -1,0 +1,20 @@
+[1, 2, 3] ['ada'] {'ada': [90, 85]}
+error: cannot store `str` in `list<int>`
+error: cannot store `float` in `list<int>`
+[1, 2, 3]
+error: argument `xs` of `ints()` expected `list<int>`, got `list<float>`
+6
+[1.0, 2.5, 3.0]
+error: cannot store `int` in `list<str>`
+error: cannot store `tuple<str, str>` in `list<tuple<str, int>>`
+['a', 'b', 'c'] [('x', 1), ('y', 2), ('z', 3)]
+error: cannot store `None` in `list<int>`
+[1.0, 2.0] list<str> {}
+error: cannot store `str` in `Channel<int>`
+7
+[0, 2, 4, 6]
+2 A a
+error: cannot store `None` in `list<any>`
+[1, 'two', [3]] [1, None, None]
+rc-audit: ok
+[exit 0]

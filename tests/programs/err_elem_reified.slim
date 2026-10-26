@@ -1,0 +1,10 @@
+# The list checks stores itself: an untyped alias cannot break its type.
+def untyped(x: any) -> any:
+    x++
+
+counts = [1, 2, 3]
+alias = untyped(counts)
+alias[1] = 2
+print(counts)
+alias.append("four")
+print("unreachable")

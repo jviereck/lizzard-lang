@@ -23,7 +23,7 @@ for n, name in pairs:
     print(n, name)
 s = "hello"
 print(s[1], s.find("l"), s.replace("l", "L"), s.startswith("he"))
-items = []
+items: list<int> = []
 for i in range(4):
     items.append(i * i)
 print(items, sum(items), max(items), min(items))
@@ -32,7 +32,7 @@ print(big * bigint(2))
 print(sorted([5, 3, 9]), 9 in [5, 3, 9])
 
 # Rust-style access: no negative indexes; pop/first/last return Option.
-empty = []
+empty: list<int> = []
 print(empty.pop(), empty.first(), empty.last(), [7, 8].pop(), [7, 8].pop(5))
 words = ["a" + "b", "c" + "d"]
 w = words.pop()

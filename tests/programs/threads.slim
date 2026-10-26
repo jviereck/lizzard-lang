@@ -15,7 +15,7 @@ def work(c: Counter + keep, times: int) -> int:
 
 def main() -> ():
     c = Counter()
-    threads = []
+    threads: list<Thread> = []
     for i in range(4):
         threads.append(spawn(work, c++, 10000))
     total = 0
@@ -24,8 +24,8 @@ def main() -> ():
     print("joined total", total, "counter", c.n)
 
     # producer / consumer over a channel
-    ch = Channel()
-    def producer(out: Channel + keep, n: int) -> ():
+    ch: Channel<str> = Channel()
+    def producer(out: Channel<str> + keep, n: int) -> ():
         for i in range(n):
             out.send("item " + str(i))
         out.close()
@@ -44,9 +44,9 @@ def main() -> ():
         print("join raised:", e)
 
     # parallel sum of independent lists
-    def psum(data: list + keep) -> int:
+    def psum(data: list<int> + keep) -> int:
         sum(data)
-    parts = []
+    parts: list<Thread> = []
     for k in range(4):
         parts.append(spawn(psum, list(range(k * 1000, (k + 1) * 1000))))
     s = 0

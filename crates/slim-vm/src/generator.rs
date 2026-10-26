@@ -26,6 +26,8 @@ pub struct GenState {
 }
 
 pub struct Generator {
+    /// `Iterator<T>`, `T` being the yield type.
+    pub ty: Value,
     /// The generator function (owned reference: keeps code and captures alive).
     pub func: Value,
     pub state: Mutex<GenState>,
@@ -56,9 +58,22 @@ impl Generator {
     }
 }
 
-pub fn create(_th: &mut Thread, f: Value, regs: Vec<Value>) -> VResult<Value> {
+/// The yield type of a generator function's code.
+fn yield_type(th: &mut Thread, code: &crate::code::Code) -> VResult<&'static crate::rtype::RtType> {
+    match code.yield_ty {
+        Some(i) => crate::types::code_type(th, code, i),
+        None => Ok(crate::rtype::as_type(crate::rtype::any()).unwrap()),
+    }
+}
+
+pub fn create(th: &mut Thread, f: Value, regs: Vec<Value>) -> VResult<Value> {
+    let item = match f.body() {
+        Some(Body::Function(func)) => yield_type(th, &func.code)?,
+        _ => unreachable!("generator of a non-function"),
+    };
     f.incref();
     let g = Generator {
+        ty: crate::rtype::iterator_of(item.value()),
         func: f,
         state: Mutex::new(GenState { regs, pc: 0, yield_dst: None, status: Status::Created, retval: Value::UNIT }),
         running: AtomicBool::new(false),
@@ -189,8 +204,19 @@ fn resume_inner(th: &mut Thread, g: &Generator, sent: Value, throw: Option<Value
 }
 
 /// `yield` inside the generator frame: moves the value out and suspends.
-pub fn yield_op(_th: &mut Thread, frame: &mut Frame, dst: Reg, src: Reg) -> u32 {
+pub fn yield_op(th: &mut Thread, frame: &mut Frame, dst: Reg, src: Reg) -> u32 {
     let v = frame.reg(src);
+    let item = match yield_type(th, frame.code()) {
+        Ok(t) => t,
+        Err(_) => return 1,
+    };
+    let Some(v) = crate::rtype::admit(v, item) else {
+        th.raise(
+            "TypeError",
+            format!("`{}` yields `{}`, got `{}`", frame.code().name, item.name, crate::types::value_type_name(v)),
+        );
+        return 1;
+    };
     frame.set(src, Value::MOVED);
     frame.ret = v;
     frame.yield_dst = dst as u32;

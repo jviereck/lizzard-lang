@@ -1,0 +1,100 @@
+# Containers carry their full type at runtime; every store is checked
+# against it, and annotations compare whole types (generics are not erased).
+
+def show(e: Exception) -> ():
+    print("error:", e)
+
+def ints(xs: list<int>) -> int:
+    sum(xs)
+
+def untyped(x: any) -> any:
+    x++
+
+def main() -> ():
+    # Literal element types are inferred; the context types empty literals.
+    nums = [1, 2, 3]
+    names: list<str> = []
+    names.append("ada")
+    scores: dict<str, list<int>> = {}
+    scores["ada"] <- [90, 85]
+    print(nums, names, scores)
+
+    # A store through an untyped alias is still checked by the list itself.
+    alias = untyped(nums)
+    try:
+        alias.append("four")
+    except TypeError as e:
+        show(e)
+    try:
+        alias[0] = 2.5
+    except TypeError as e:
+        show(e)
+    print(nums)
+
+    # Annotations check the whole type at once (no element scan).
+    floats = [1.5, 2.5]
+    try:
+        ints(untyped(floats))
+    except TypeError as e:
+        show(e)
+    print(ints(untyped(nums)))
+
+    # int is coerced on store into a float container.
+    fs: list<float> = [1, 2.5]
+    fs.append(3)
+    print(fs)
+
+    # Builtins compute their result types from their inputs.
+    words = "b a c".split()
+    s = sorted(words)
+    try:
+        untyped(s).append(1)
+    except TypeError as e:
+        show(e)
+    pairs = {"x": 1, "y": 2}.items()
+    try:
+        untyped(pairs).append(("z", "3"))
+    except TypeError as e:
+        show(e)
+    pairs.append(("z", 3))
+    print(s, pairs)
+    copy = list(nums)
+    try:
+        untyped(copy).append(None)
+    except TypeError as e:
+        show(e)
+
+    # Types are values: `list::<int>` builds an empty list<int>.
+    built = list::<float>([1, 2])
+    print(built, list::<str>, dict::<str, int>())
+
+    # Typed channels and generators check what goes through them.
+    ch: Channel<int> = Channel()
+    ch.send(7)
+    try:
+        untyped(ch).send("x")
+    except TypeError as e:
+        show(e)
+    print(ch.recv())
+
+    def evens(n: int) -> Iterator<int>:
+        for i in range(n):
+            yield i * 2
+    print(list(evens(4)))
+
+    # Tuples are typed structurally.
+    point: tuple<int, str> = (1, "a")
+    n, label = point++
+    print(n + 1, label.upper(), point[1])
+
+    # Explicit `any` elements accept anything except None.
+    bag: list<any> = [1, "two", [3]]
+    try:
+        untyped(bag).append(None)
+    except TypeError as e:
+        show(e)
+    maybe: list<Option<int>> = [1, None]
+    maybe.append(None)
+    print(bag, maybe)
+
+main()

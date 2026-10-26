@@ -2,7 +2,7 @@
 # borrowed reads, inserts and deletes, with rc_run on every thread. Races may
 # reorder or lose nothing here (every write is serialized), and no read may
 # see freed memory.
-def worker(l: list + keep, d: dict + keep, id: int, n: int) -> int:
+def worker(l: list<str> + keep, d: dict<str, str> + keep, id: int, n: int) -> int:
     popped = 0
     for i in range(n):
         l.append("w" + str(id) + "-" + str(i))
@@ -28,8 +28,8 @@ def worker(l: list + keep, d: dict + keep, id: int, n: int) -> int:
 
 def main() -> ():
     l = ["seed" + "0", "seed" + "1", "seed" + "2"]
-    d = {}
-    ts = []
+    d: dict<str, str> = {}
+    ts: list<Thread> = []
     for id in range(8):
         ts.append(spawn(worker, l++, d++, id, 2000))
     total = 0

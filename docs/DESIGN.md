@@ -97,7 +97,7 @@ report = |n: int| {
   - Annotations stay optional on free functions and locals.
 - **Runtime checks.** Annotations are checked on parameters at call entry, on return values, on annotated locals, and on field stores; a mismatch raises `TypeError`.
   - `x: T` matches if `type(x) is T`, if T is a trait in `type(x)`'s `impl` list, or if T is `Option<U>` and x is `None` or matches U.
-  - Generics are erased: `list<int>` checks only `list`.
+  - Generics are reified (see "Runtime types" below): `list<int>` checks the list's own type, `list` accepts any list.
 - **Classes and traits.** Classes are sealed once defined (no monkeypatching, fixed slots). The parentheses after a class name may contain only `impl` trait lists.
   - A trait method whose body is `...` is required; one with a real body is a default that gets copied into the class.
   - A class missing a required method raises `TypeError` when it is defined.
@@ -310,13 +310,20 @@ pub trait Backend {
 
 **Checkpoint:** use the language and revise the syntax and semantics before starting on the JIT.
 
+### Phase A+: interop groundwork (built after the checkpoint)
+7. **Epoch soundness:** rc flag bits, `rc::retire`, poison mode.
+8. **Lock-free-read `list` and `dict`;** no negative indexes.
+9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
+9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (`+local`).
+10. **Rust bindings** (static embedding).
+
 ### Phase B: the derived JIT (later)
-7. **Spike, then the JIT backend.**
+11. **Spike, then the JIT backend.**
    - Spike `cranelift-jit` on aarch64-darwin: call an `extern "C"` helper, a `br_table` multi-entry function, and `sadd_overflow`.
    - The JIT `Backend` for the existing semantics, entering at pc 0 only.
    - `--jit=always` differential testing: every golden test runs in both modes, and outputs must match.
-8. **Transitions.** OSR loop-header entries, generator resume entries, `Raise`/`Deopt` exits, the background compiler thread, and `AtomicPtr` installation.
-9. **Speculation.** Feedback-driven `speculate` + deopt, typed unboxed float/int paths, and benchmarks (fib, nbody, a generator pipeline, a parallel sum).
+12. **Transitions.** OSR loop-header entries, generator resume entries, `Raise`/`Deopt` exits, the background compiler thread, and `AtomicPtr` installation.
+13. **Speculation.** Feedback-driven `speculate` + deopt, typed unboxed float/int paths, and benchmarks (fib, nbody, a generator pipeline, a parallel sum). A guard on a container's runtime type makes its element loads typed; `array`'s length and data pointer never change, so bounds checks hoist out of loops.
 
 ## Biggest risks / mitigations
 | risk | mitigation |
@@ -359,3 +366,21 @@ Refinements made while building milestones 1–6. Where they conflict with the s
 - **New statements:** `with ctx [as name]:` (`__enter__` / `__exit__`) and `assert cond[, msg]`.
 - **Loop heads.** A local assigned in a loop body counts as "maybe initialized" at the loop head, so reassigning it drops the previous iteration's value.
 - **Module-level `def`s** are static functions (a copy type), so `f = g` is allowed.
+
+## Implementation notes (milestones 7–9c)
+- **Refcount word flags.** Bit 63 is `IMMORTAL`. Bit 62 is `REVIVED`, set by an increment from zero: a borrow of shared memory took a new reference to an object already queued for freeing. Bit 61 is `QUEUED`: the object has a pending-free entry. When an entry's grace period has passed, `rc_run` frees it only if the count is still zero and it was not revived. A revived object waits a new grace period; a live one is dropped from the queue and is queued again when it next reaches zero.
+- **`rc::retire(ptr, free)`** frees raw memory (an old list buffer, an old dict table) after the same grace period as objects.
+- **Poison mode** (`SLIM_POISON=1`, debug builds): freed objects are overwritten and leaked, and any later refcount operation on them panics. The golden tests run in this mode.
+- **Containers without read locks.** `list` and `dict` reads (`l[i]`, `len`, `in`, iteration, lookups) take no lock. Writers serialize on a one-bit spin lock and never run user code while holding it. Values and buffers leave through the epoch system, so a racing reader may see an old, new or duplicated element, or get an `IndexError`, but never freed memory or memory out of bounds. `sort` compares outside the lock and raises `RuntimeError` if the list changed meanwhile. Dict iteration works on a snapshot.
+- **No negative indexes** on any sequence: `0 <= i < len` or `IndexError`. `pop()` returns `Option<T>` (`None` when empty); `first()` / `last()` return `Option<T>` holding a new reference.
+- **`array<T>`** (`i8`…`u64`, `f32`, `f64`, `bool`): fixed length, packed memory accessed with relaxed atomics, bounds-checked. Out-of-range integers raise `OverflowError`. `a.view(start, n)` shares memory and keeps its base alive.
+- **Runtime types (9c).** Types are interned, immortal values (`rtype.rs`); equal types are the same pointer.
+  - Every list, dict, iterator, generator and channel carries its full type (`list<int>`, `dict<str, list<int>>`, `Iterator<int>`, `Channel<str>`).
+  - The VM checks every store into a container against its element type: index stores and swaps, `append`, `insert`, `extend`, dict stores, generator yields and channel sends. An `int` stored where a `float` is expected is converted. A store the compiler proves correct skips the check (`StoreIndex ... proven=true` in `--dis`). The check never depends on the compiler, so a compiler bug can only cost speed.
+  - Annotation checks compare whole types and never scan elements.
+  - **Invariance:** a `list<int>` is not a `list<float>` or a `list<any>`. A bare `list` (or `dict`, `tuple`, `Iterator`, `Channel`) accepts any of its kind. `any` accepts every value except `None`.
+  - **Where types come from.** List and dict literals infer their element type from their items. An empty literal, `list()`, `dict()` and `Channel()` take it from the context: an annotation, a parameter, a field, a return type or an enclosing element type. Without context they are a compile error. Mixed literals need an annotation (`list<any>`).
+  - **Types are values.** `list::<int>`, `dict::<str, int>` and `Channel::<str>` are type values; calling one builds an empty container or converts an iterable, checking each item. Builtins compute their result types from their inputs: `split` gives `list<str>`, `d.items()` gives `list<tuple<K, V>>`, and `sorted(xs)` and `list(xs)` take the item type of `xs`.
+  - **Tuples** are typed structurally (`tuple<int, str>`); indexing with a literal and unpacking keep the item types.
+  - **Generators** declare their item type with `-> Iterator<T>`; otherwise it is inferred from the `yield`s (`any` if unknown).
+  - **Static argument checks.** Arguments are checked against the parameter types of statically known callees.

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use slim_syntax::ast::*;
 use slim_syntax::{Error, Span};
 use slim_vm::code::{
-    Arg, ArgList, ClassSpec, Code, ExcEntry, FieldSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
+    Arg, ArgList, ClassSpec, Code, Ctor, ExcEntry, FieldSpec, ParamInfo, Reg, RetKind, TraitSpec, TypeDesc,
 };
 use slim_vm::object::{Body, Obj};
 use slim_vm::ops::{BinKind, Instr, StoreMode, UnKind};
@@ -443,6 +443,13 @@ struct FnCtx<'m> {
     module_decl_table: HashMap<String, (Ty, TypeDesc)>,
     /// Static types of call argument registers (for `Some(x)` typing).
     reg_ty: HashMap<Reg, Ty>,
+    /// The type the context expects of the expression being compiled next
+    /// (types empty literals and `list()`/`dict()`/`Channel()` calls).
+    expect: Option<Ty>,
+    /// Static types of the values this generator yields.
+    yield_tys: Vec<Ty>,
+    /// The declared item type of this generator (`-> Iterator<T>`).
+    yield_decl: Option<Ty>,
 }
 
 impl<'m> FnCtx<'m> {
@@ -485,10 +492,32 @@ impl<'m> FnCtx<'m> {
             handler_exc: Vec::new(),
             module_decl_table: HashMap::new(),
             reg_ty: HashMap::new(),
+            expect: None,
+            yield_tys: Vec::new(),
+            yield_decl: None,
         }
     }
 
-    fn finish(self, params: Vec<ParamInfo>, ret: RetKind, is_generator: bool, is_method: bool) -> Code {
+    fn finish(mut self, params: Vec<ParamInfo>, ret: RetKind, is_generator: bool, is_method: bool) -> Code {
+        let yield_ty = is_generator.then(|| {
+            let t = match self.yield_decl.clone() {
+                Some(t) => t,
+                None => {
+                    let tys = std::mem::take(&mut self.yield_tys);
+                    if tys.contains(&Ty::Unknown) {
+                        Ty::Any
+                    } else {
+                        match join_all(tys) {
+                            Ty::NoneT => Ty::Option(Box::new(Ty::Any)),
+                            t => t,
+                        }
+                    }
+                }
+            };
+            let d = self.elem_desc(&t);
+            self.type_idx(d)
+        });
+        let type_cache = (0..self.types.len()).map(|_| std::sync::OnceLock::new()).collect();
         Code {
             name: self.name,
             filename: self.m.filename.clone(),
@@ -503,6 +532,8 @@ impl<'m> FnCtx<'m> {
             names: self.names,
             arglists: self.arglists,
             types: self.types,
+            type_cache,
+            yield_ty,
             codes: self.codes,
             classes: self.classes,
             traits: self.traits,
@@ -677,6 +708,11 @@ impl<'m> FnCtx<'m> {
 
     /// Compiles a block whose last line is its value, moved into `dst`.
     fn block_value(&mut self, b: &Block, dst: Reg) -> R<Ty> {
+        self.block_value_expect(b, dst, None)
+    }
+
+    /// `block_value` where the context expects the value to have type `expect`.
+    fn block_value_expect(&mut self, b: &Block, dst: Reg, expect: Option<Ty>) -> R<Ty> {
         let n = b.stmts.len();
         if n == 0 {
             self.load_imm(dst, Value::UNIT);
@@ -690,6 +726,7 @@ impl<'m> FnCtx<'m> {
             StmtKind::Expr(e) => {
                 self.line = last.span.line;
                 let mark = self.mark();
+                self.expect = expect;
                 let r = self.value_into(e, dst)?;
                 self.end_stmt(mark);
                 Ok(r)
@@ -881,8 +918,14 @@ impl<'m> FnCtx<'m> {
     /// Evaluates `e` and moves its (owned) value into `dst`.
     fn value_into(&mut self, e: &Expr, dst: Reg) -> R<Ty> {
         match &e.kind {
-            ExprKind::If { branches, else_ } => self.if_expr(branches, else_.as_ref(), Some(dst)),
-            ExprKind::Try(t) => self.try_expr(t, Some(dst)),
+            ExprKind::If { branches, else_ } => {
+                self.expect = None;
+                self.if_expr(branches, else_.as_ref(), Some(dst))
+            }
+            ExprKind::Try(t) => {
+                self.expect = None;
+                self.try_expr(t, Some(dst))
+            }
             _ => {
                 let r = self.expr_owned(e, "value")?;
                 self.emit(Instr::Mov { dst, src: r.reg });
@@ -895,6 +938,7 @@ impl<'m> FnCtx<'m> {
     /// of copy types are copied; borrows of move types are an error.
     fn expr_owned(&mut self, e: &Expr, what: &str) -> R<Res> {
         if let ExprKind::If { branches, else_ } = &e.kind {
+            self.expect = None;
             let dst = self.tmp_owned();
             let ty = self.if_expr(branches, else_.as_ref(), Some(dst))?;
             return Ok(Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() });
@@ -1033,8 +1077,18 @@ impl<'m> FnCtx<'m> {
         Ty::Unknown
     }
 
+    /// Compiles `e` where the context expects a value of type `expect`.
+    fn expr_expect(&mut self, e: &Expr, expect: Option<Ty>) -> R<Res> {
+        self.expect = expect;
+        let r = self.expr(e);
+        self.expect = None;
+        r
+    }
+
     fn expr(&mut self, e: &Expr) -> R<Res> {
         let owned = |reg, ty| Res { reg, own: Own::Owned, ty, root: None, desc: "value".into() };
+        // The expected type applies to this expression only, not to its parts.
+        let expect = self.expect.take();
         match &e.kind {
             ExprKind::Name(n) => self.name_expr(n, e.span),
             ExprKind::Int(v) => {
@@ -1071,39 +1125,85 @@ impl<'m> FnCtx<'m> {
                 Ok(owned(dst, Ty::Unit))
             }
             ExprKind::Ellipsis => Err(syn_err("`...` is only allowed as the body of a trait method", e.span)),
-            ExprKind::Tuple(items) | ExprKind::List(items) => {
+            ExprKind::Tuple(items) => {
+                let ctx: Option<Vec<Ty>> = match &expect {
+                    Some(Ty::Tuple(Some(ts))) if ts.len() == items.len() => Some(ts.clone()),
+                    _ => None,
+                };
                 let mut args = Vec::new();
                 let mut item_tys = Vec::new();
-                for it in items {
-                    let r = self.expr_owned(it, "a collection")?;
+                for (i, it) in items.iter().enumerate() {
+                    self.expect = ctx.as_ref().map(|ts| ts[i].clone());
+                    let r = self.expr_owned(it, "a tuple")?;
                     item_tys.push(r.ty.clone());
                     args.push(Arg::new(r.reg, true, false, None));
                 }
                 let al = self.arglist(ArgList { args, pins: false });
                 let dst = self.tmp_owned();
-                if matches!(e.kind, ExprKind::Tuple(_)) {
-                    self.emit(Instr::BuildTuple { dst, args: al });
-                    Ok(owned(dst, Ty::Tuple))
-                } else {
-                    self.emit(Instr::BuildList { dst, args: al });
-                    Ok(owned(dst, Ty::list(join_all(item_tys))))
+                self.emit(Instr::BuildTuple { dst, args: al });
+                Ok(owned(dst, Ty::Tuple(Some(item_tys))))
+            }
+            ExprKind::List(items) => {
+                let ctx = match &expect {
+                    Some(Ty::List(t)) if **t != Ty::Unknown => Some((**t).clone()),
+                    _ => None,
+                };
+                let mut args = Vec::new();
+                let mut tys = Vec::new();
+                for it in items {
+                    self.expect = ctx.clone();
+                    let r = self.expr_owned(it, "a list")?;
+                    tys.push((r.ty.clone(), it.span));
+                    args.push(Arg::new(r.reg, true, false, None));
                 }
+                let elem = self.literal_elem(ctx, &tys, "list element", e.span)?;
+                let ti = self.type_idx(TypeDesc::Builtin(Ctor::List, vec![self.elem_desc(&elem)]));
+                let al = self.arglist(ArgList { args, pins: false });
+                let dst = self.tmp_owned();
+                self.emit(Instr::BuildList { dst, args: al, ty: ti });
+                Ok(owned(dst, Ty::list(elem)))
             }
             ExprKind::Dict(items) => {
+                let (kctx, vctx) = match &expect {
+                    Some(Ty::Dict(k, v)) => (
+                        (**k != Ty::Unknown).then(|| (**k).clone()),
+                        (**v != Ty::Unknown).then(|| (**v).clone()),
+                    ),
+                    _ => (None, None),
+                };
                 let mut args = Vec::new();
                 let (mut ktys, mut vtys) = (Vec::new(), Vec::new());
                 for (k, v) in items {
+                    self.expect = kctx.clone();
                     let kr = self.expr_owned(k, "a dict key")?;
-                    ktys.push(kr.ty.clone());
+                    ktys.push((kr.ty.clone(), k.span));
                     args.push(Arg::new(kr.reg, true, false, None));
+                    self.expect = vctx.clone();
                     let vr = self.expr_owned(v, "a dict")?;
-                    vtys.push(vr.ty.clone());
+                    vtys.push((vr.ty.clone(), v.span));
                     args.push(Arg::new(vr.reg, true, false, None));
                 }
+                let kt = self.literal_elem(kctx, &ktys, "dict key", e.span)?;
+                let vt = self.literal_elem(vctx, &vtys, "dict value", e.span)?;
+                let ti = self.type_idx(TypeDesc::Builtin(Ctor::Dict, vec![self.elem_desc(&kt), self.elem_desc(&vt)]));
                 let al = self.arglist(ArgList { args, pins: false });
                 let dst = self.tmp_owned();
-                self.emit(Instr::BuildDict { dst, args: al });
-                Ok(owned(dst, Ty::dict(join_all(ktys), join_all(vtys))))
+                self.emit(Instr::BuildDict { dst, args: al, ty: ti });
+                Ok(owned(dst, Ty::dict(kt, vt)))
+            }
+            ExprKind::TypeApp(base, targs) => {
+                let ExprKind::Name(n) = &base.kind else {
+                    return Err(syn_err("type arguments (`::<...>`) follow a type name", e.span));
+                };
+                if !matches!(n.as_str(), "list" | "dict" | "Channel") || !self.is_global_name(n) || self.m.module_vars.contains(n) {
+                    return Err(type_err(format!("`{n}` does not take type arguments"), e.span));
+                }
+                let te = TypeExpr::Named(n.clone(), targs.clone(), e.span);
+                let (ty, d) = self.m.resolve_type(&te)?;
+                let dst = self.tmp_owned();
+                let ti = self.type_idx(d);
+                self.emit(Instr::MakeType { dst, ty: ti });
+                Ok(owned(dst, Ty::TypeVal(Box::new(ty))))
             }
             ExprKind::Attr(obj, name) => self.attr_expr(obj, name, e.span),
             ExprKind::Index(obj, idx) => {
@@ -1124,10 +1224,13 @@ impl<'m> FnCtx<'m> {
                     self.stmt_drops.push(o.reg);
                 }
                 self.heap_borrows += 1;
-                let ty = o.ty.elem().unwrap_or(Ty::Unknown);
+                let ty = match (&o.ty, &idx.kind) {
+                    (Ty::Tuple(Some(ts)), ExprKind::Int(k)) if (*k as usize) < ts.len() => ts[*k as usize].clone(),
+                    _ => o.ty.elem().unwrap_or(Ty::Unknown),
+                };
                 Ok(Res { reg: dst, own: Own::Borrowed, ty, root: o.root, desc: "an element".into() })
             }
-            ExprKind::Call(f, args) => self.call_expr(f, args, e.span),
+            ExprKind::Call(f, args) => self.call_expr(f, args, expect, e.span),
             ExprKind::Dup(inner) => {
                 let r = self.expr(inner)?;
                 if r.own == Own::Owned {
@@ -1248,14 +1351,24 @@ impl<'m> FnCtx<'m> {
                 if self.heap_borrows > 0 {
                     return Err(own_err("`yield` cannot appear in an expression that borrows a field, element or global", e.span));
                 }
-                let src = match v {
-                    Some(v) => self.expr_owned(v, "`yield`")?.reg,
+                let (src, ty) = match v {
+                    Some(v) => {
+                        self.expect = self.yield_decl.clone();
+                        let r = self.expr_owned(v, "`yield`")?;
+                        (r.reg, r.ty)
+                    }
                     None => {
                         let r = self.tmp_owned();
                         self.load_imm(r, Value::UNIT);
-                        r
+                        (r, Ty::Unit)
                     }
                 };
+                if let Some(d) = &self.yield_decl {
+                    if !ty_compatible(d, &ty) {
+                        return Err(type_err(format!("`{}` yields `{}`, not `{}`", self.name, d.name(), ty.name()), e.span));
+                    }
+                }
+                self.yield_tys.push(ty);
                 let dst = self.tmp_owned();
                 self.emit(Instr::Yield { dst, src });
                 Ok(owned(dst, Ty::Unknown))
@@ -1265,6 +1378,13 @@ impl<'m> FnCtx<'m> {
                     return Err(syn_err("`yield from` outside of a function", e.span));
                 }
                 let s = self.expr(sub)?;
+                let item = s.ty.item();
+                if let Some(d) = &self.yield_decl {
+                    if !ty_compatible(d, &item) {
+                        return Err(type_err(format!("`{}` yields `{}`, not `{}`", self.name, d.name(), item.name()), e.span));
+                    }
+                }
+                self.yield_tys.push(item);
                 let it = self.new_reg(true, Some("<yield from>".into()));
                 self.emit(Instr::GetIter { dst: it, src: s.reg });
                 self.discard(&s);
@@ -1282,6 +1402,37 @@ impl<'m> FnCtx<'m> {
                 self.load_imm(dst, Value::UNIT);
                 Ok(owned(dst, Ty::Unit))
             }
+        }
+    }
+
+    /// The element type of a list or dict literal: the context's, else
+    /// inferred from the items (`any` if some item's type is unknown).
+    /// `what` names the part ("list element", "dict key", "dict value").
+    fn literal_elem(&self, ctx: Option<Ty>, items: &[(Ty, Span)], what: &str, span: Span) -> R<Ty> {
+        let (lit, example) = if what.starts_with("list") { ("[]", "xs: list<int> = []") } else { ("{}", "d: dict<str, int> = {}") };
+        if let Some(t) = ctx {
+            for (it, sp) in items {
+                if !ty_compatible(&t, it) {
+                    return Err(type_err(format!("cannot use a `{}` as a {what} of type `{}`", it.name(), t.name()), *sp));
+                }
+            }
+            return Ok(t);
+        }
+        if items.is_empty() {
+            return Err(type_err(format!("cannot infer the type of `{lit}`; annotate it (e.g. `{example}`)"), span));
+        }
+        if items.iter().any(|(t, _)| *t == Ty::Unknown) {
+            return Ok(Ty::Any);
+        }
+        match join_all(items.iter().map(|(t, _)| t.clone()).collect()) {
+            Ty::Unknown => {
+                let mut names: Vec<String> = items.iter().map(|(t, _)| format!("`{}`", t.name())).collect();
+                names.dedup();
+                let hint = if lit == "[]" { "xs: list<any> = [...]" } else { "d: dict<str, any> = {...}" };
+                Err(type_err(format!("mixed {what} types ({}); annotate it (e.g. `{hint}`)", names.join(", ")), span))
+            }
+            Ty::NoneT => Err(type_err(format!("cannot infer a {what} type from `None` alone; annotate it (e.g. `Option<int>`)"), span)),
+            t => Ok(t),
         }
     }
 
@@ -1796,7 +1947,7 @@ impl<'m> FnCtx<'m> {
             self.emit(Instr::Mov { dst: end, src: r.reg });
             self.load_int(step_reg, step);
             // Non-int bounds are rejected by the type check.
-            let ti = self.type_idx(TypeDesc::Int);
+            let ti = self.type_idx(TypeDesc::prim(Ctor::Int));
             let w = self.name_idx("range() argument");
             self.emit(Instr::CheckType { reg: counter, ty: ti, what: w });
             self.emit(Instr::CheckType { reg: end, ty: ti, what: w });
@@ -1879,6 +2030,7 @@ impl<'m> FnCtx<'m> {
     fn assign(&mut self, target: &Expr, value: &Expr, span: Span, _is_move: bool) -> R<()> {
         match &target.kind {
             ExprKind::Name(_) | ExprKind::Tuple(_) => {
+                let expect = self.target_ty(target);
                 let v = match &value.kind {
                     ExprKind::If { .. } | ExprKind::Try(_) => {
                         let dst = self.tmp_owned();
@@ -1886,7 +2038,7 @@ impl<'m> FnCtx<'m> {
                         Res { reg: dst, own: Own::Owned, ty, root: None, desc: "value".into() }
                     }
                     _ => {
-                        let r = self.expr(value)?;
+                        let r = self.expr_expect(value, expect)?;
                         self.to_owned(r, value.span, "a variable")?
                     }
                 };
@@ -1938,13 +2090,36 @@ impl<'m> FnCtx<'m> {
                     }
                 }
                 let v = self.to_owned(v, value.span, "an element")?;
-                self.check_elem_store(&o.ty, &i, &v, value.span)?;
-                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: v.reg, mode: StoreMode::Copy });
+                let proven = self.check_elem_store(&o.ty, &i, &v, value.span)?;
+                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: v.reg, mode: StoreMode::Copy, proven });
                 self.discard(&i);
                 self.discard(&o);
                 Ok(())
             }
             _ => Err(syn_err("invalid assignment target", target.span)),
+        }
+    }
+
+    /// The declared type of an assignment target, if known statically: a
+    /// declared variable, a field of a typed local, or an element of one.
+    fn target_ty(&self, t: &Expr) -> Option<Ty> {
+        match &t.kind {
+            ExprKind::Name(n) => match self.locals.get(n) {
+                Some(l) => l.decl.as_ref().map(|d| d.0.clone()),
+                None => self.module_decl_table.get(n).map(|d| d.0.clone()),
+            },
+            ExprKind::Attr(o, f) => match &o.kind {
+                ExprKind::Name(b) => self.field_ty(&self.local_ty(b), f, Span::default()).ok().filter(|t| *t != Ty::Unknown),
+                _ => None,
+            },
+            ExprKind::Index(o, _) => match &o.kind {
+                ExprKind::Name(b) => match self.local_ty(b) {
+                    Ty::List(t) | Ty::Dict(_, t) if *t != Ty::Unknown => Some(*t),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1972,8 +2147,12 @@ impl<'m> FnCtx<'m> {
                 }
                 let al = self.arglist(ArgList { args: dsts.clone(), pins: false });
                 self.emit(Instr::Unpack { src: v.reg, dsts: al });
-                for (item, d) in items.iter().zip(dsts) {
-                    let r = Res { reg: d.reg, own: Own::Owned, ty: Ty::Unknown, root: None, desc: "value".into() };
+                let tys: Vec<Ty> = match &v.ty {
+                    Ty::Tuple(Some(ts)) if ts.len() == items.len() => ts.clone(),
+                    _ => vec![Ty::Unknown; items.len()],
+                };
+                for ((item, d), ty) in items.iter().zip(dsts).zip(tys) {
+                    let r = Res { reg: d.reg, own: Own::Owned, ty, root: None, desc: "value".into() };
                     self.assign_owned(item, r, span)?;
                 }
                 Ok(())
@@ -2054,8 +2233,8 @@ impl<'m> FnCtx<'m> {
                 let o = self.expr(obj)?;
                 let i = self.expr(idx)?;
                 let r = self.expr(&bin)?;
-                self.check_elem_store(&o.ty, &i, &r, span)?;
-                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: r.reg, mode: StoreMode::Move });
+                let proven = self.check_elem_store(&o.ty, &i, &r, span)?;
+                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: r.reg, mode: StoreMode::Move, proven });
                 self.discard(&i);
                 Ok(())
             }
@@ -2065,6 +2244,7 @@ impl<'m> FnCtx<'m> {
 
     /// `t1 <- t2 <- ... <- value`
     fn move_chain(&mut self, targets: &[Expr], value: &Expr, span: Span) -> R<()> {
+        self.expect = targets.last().and_then(|t| self.target_ty(t));
         let mut cur = match &value.kind {
             ExprKind::If { .. } | ExprKind::Try(_) => {
                 let dst = self.tmp_owned();
@@ -2094,8 +2274,8 @@ impl<'m> FnCtx<'m> {
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
                 let i = self.expr(idx)?;
-                self.check_elem_store(&o.ty, &i, &cur, span)?;
-                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: cur.reg, mode: StoreMode::Move });
+                let proven = self.check_elem_store(&o.ty, &i, &cur, span)?;
+                self.emit(Instr::StoreIndex { obj: o.reg, idx: i.reg, src: cur.reg, mode: StoreMode::Move, proven });
                 self.discard(&i);
                 self.discard(&o);
                 Ok(())
@@ -2105,53 +2285,67 @@ impl<'m> FnCtx<'m> {
     }
 
     /// Checks a store of `v` at key/index `k` of a container of type
-    /// `container`: a statically wrong type is an error; a value of unknown
-    /// type gets a runtime check, so element types stay trustworthy.
-    fn check_elem_store(&mut self, container: &Ty, k: &Res, v: &Res, span: Span) -> R<()> {
+    /// `container`: a statically wrong type is an error. The VM checks every
+    /// store against the container's runtime element type; returns true if
+    /// the static types prove the check would pass, so it can be skipped.
+    fn check_elem_store(&mut self, container: &Ty, k: &Res, v: &Res, span: Span) -> R<bool> {
         let (key, elem) = match container {
             Ty::List(t) => (Ty::Unknown, (**t).clone()),
             Ty::Dict(k, v) => ((**k).clone(), (**v).clone()),
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
-        for (want, got, what) in [(key, k, "key"), (elem, v, "element")] {
-            if want == Ty::Unknown {
-                continue;
-            }
-            if got.ty == Ty::Unknown {
-                if let Some(d) = self.ty_desc(&want) {
-                    let ti = self.type_idx(d);
-                    let w = self.name_idx(&format!("{what} of `{}`", container.name()));
-                    self.emit(Instr::CheckType { reg: got.reg, ty: ti, what: w });
-                }
-            } else if !ty_compatible(&want, &got.ty) {
+        for (want, got, what) in [(&key, k, "key"), (&elem, v, "element")] {
+            if !ty_compatible(want, &got.ty) {
                 return Err(type_err(
                     format!("cannot store `{}` as {what} of `{}`", got.ty.name(), container.name()),
                     span,
                 ));
             }
         }
-        Ok(())
+        Ok(matches!(container, Ty::List(_)) && elem == v.ty && elem.is_precise())
     }
 
-    /// The runtime descriptor that checks values of static type `t`.
+    /// The runtime descriptor that checks values of static type `t`
+    /// (`None` when nothing is known about it).
     fn ty_desc(&self, t: &Ty) -> Option<TypeDesc> {
-        Some(match t {
-            Ty::Int => TypeDesc::Int,
-            Ty::Float => TypeDesc::Float,
-            Ty::Bool => TypeDesc::Bool,
-            Ty::BigInt => TypeDesc::BigInt,
-            Ty::Str => TypeDesc::Str,
-            Ty::Unit => TypeDesc::Unit,
-            Ty::Tuple => TypeDesc::Tuple,
-            Ty::List(_) => TypeDesc::List,
-            Ty::Dict(..) => TypeDesc::Dict,
-            Ty::Array(e) => TypeDesc::Array(*e),
-            Ty::Func | Ty::StaticFn => TypeDesc::Function,
-            Ty::Opaque(n) => TypeDesc::Builtin(n.clone()),
-            Ty::Instance(c) | Ty::Trait(c) => TypeDesc::Global(*self.m.gindex.get(c)?, c.clone()),
-            Ty::Option(inner) => TypeDesc::Option(Box::new(self.ty_desc(inner)?)),
-            _ => return None,
-        })
+        let prim = |c| Some(TypeDesc::prim(c));
+        match t {
+            Ty::Unknown | Ty::NoneT | Ty::Class(_) | Ty::TypeVal(_) => None,
+            Ty::Any => prim(Ctor::Any),
+            Ty::Int => prim(Ctor::Int),
+            Ty::Float => prim(Ctor::Float),
+            Ty::Bool => prim(Ctor::Bool),
+            Ty::BigInt => prim(Ctor::BigInt),
+            Ty::Str => prim(Ctor::Str),
+            Ty::Unit => prim(Ctor::Unit),
+            Ty::Tuple(None) => prim(Ctor::Tuple),
+            Ty::Tuple(Some(ts)) => Some(self.app(Ctor::Tuple, ts.iter())),
+            Ty::List(e) => Some(self.app(Ctor::List, [&**e])),
+            Ty::Dict(k, v) => Some(self.app(Ctor::Dict, [&**k, &**v])),
+            Ty::Iter(e) => Some(self.app(Ctor::Iterator, [&**e])),
+            Ty::Chan(e) => Some(self.app(Ctor::Channel, [&**e])),
+            Ty::Array(e) => prim(Ctor::Array(*e)),
+            Ty::Func | Ty::StaticFn => prim(Ctor::Function),
+            Ty::Opaque(n) => prim(if n == "Lock" { Ctor::Lock } else { Ctor::Thread }),
+            Ty::Instance(c) | Ty::Trait(c) => Some(TypeDesc::Global(*self.m.gindex.get(c)?, c.clone())),
+            Ty::Option(inner) => Some(TypeDesc::option(self.ty_desc(inner)?)),
+        }
+    }
+
+    /// `c<args>` if every argument is known, else the bare `c`.
+    fn app<'a>(&self, c: Ctor, args: impl IntoIterator<Item = &'a Ty>) -> TypeDesc {
+        let ds: Option<Vec<TypeDesc>> =
+            args.into_iter().map(|a| if *a == Ty::Unknown { None } else { self.ty_desc(a) }).collect();
+        match ds {
+            Some(ds) => TypeDesc::Builtin(c, ds),
+            None => TypeDesc::prim(c),
+        }
+    }
+
+    /// The runtime element type for a container created with static element
+    /// type `t` (`any` when unknown).
+    fn elem_desc(&self, t: &Ty) -> TypeDesc {
+        self.ty_desc(t).unwrap_or_else(TypeDesc::any)
     }
 
     /// Stores owned `v` into `t`, returning the previous value (owned).
@@ -2257,13 +2451,43 @@ impl<'m> FnCtx<'m> {
         None
     }
 
-    fn call_expr(&mut self, f: &Expr, args: &[Expr], span: Span) -> R<Res> {
+    fn call_expr(&mut self, f: &Expr, args: &[Expr], expect: Option<Ty>, span: Span) -> R<Res> {
         if let ExprKind::Attr(recv, mname) = &f.kind {
             return self.method_call(recv, mname, args, span);
         }
         let sig = self.static_sig(f);
-        let builtin = self.builtin_call_info(f);
-        let callee = self.expr(f)?;
+        let mut builtin = self.builtin_call_info(f);
+        // `list()`, `dict()`, `Channel()` build the type the context expects.
+        let ctor_ty = match (&builtin, &expect) {
+            (Some((_, n)), Some(t @ Ty::List(e))) if n == "list" && **e != Ty::Unknown => Some(t.clone()),
+            (Some((_, n)), Some(t @ Ty::Dict(k, v))) if n == "dict" && (**k != Ty::Unknown && **v != Ty::Unknown) => Some(t.clone()),
+            (Some((_, n)), Some(t @ Ty::Chan(e))) if n == "Channel" && **e != Ty::Unknown => Some(t.clone()),
+            _ => None,
+        };
+        if ctor_ty.is_none() {
+            if let Some((_, n)) = &builtin {
+                let what = match (n.as_str(), args.len()) {
+                    ("list", 0) => Some(("list()", "xs: list<int> = list()` or `list::<int>()")),
+                    ("dict", 0) => Some(("dict()", "d: dict<str, int> = dict()` or `dict::<str, int>()")),
+                    ("Channel", 0) => Some(("Channel()", "ch: Channel<int> = Channel()` or `Channel::<int>()")),
+                    _ => None,
+                };
+                if let Some((call, hint)) = what {
+                    return Err(type_err(format!("cannot infer the element type of `{call}`; write `{hint}`"), span));
+                }
+            }
+        }
+        let callee = match &ctor_ty {
+            Some(t) => {
+                builtin = None;
+                let d = self.ty_desc(t).expect("container type");
+                let dst = self.tmp_owned();
+                let ti = self.type_idx(d);
+                self.emit(Instr::MakeType { dst, ty: ti });
+                Res { reg: dst, own: Own::Owned, ty: Ty::TypeVal(Box::new(t.clone())), root: None, desc: "value".into() }
+            }
+            None => self.expr(f)?,
+        };
         if let Some((s, _)) = &sig {
             if s.params.len() != args.len() && !matches!(&f.kind, ExprKind::Name(n) if self.m.builtin_classes.contains(n)) {
                 return Err(type_err(
@@ -2281,25 +2505,37 @@ impl<'m> FnCtx<'m> {
             }
             None
         };
-        let al = self.call_args(args, &keep_of, None, span)?;
+        let arg_ty = |i: usize| -> Option<(String, Ty)> {
+            sig.as_ref().and_then(|(s, _)| s.params.get(i)).map(|p| (p.name.clone(), p.ty.clone()))
+        };
+        let al = self.call_args(args, &keep_of, &arg_ty, None, span)?;
         let dst = self.tmp_owned();
         let a = self.arglist(al.clone());
         self.emit(Instr::Call { dst, func: callee.reg, args: a });
         self.after_call(&al);
         self.discard(&callee);
-        let mut ty = sig.map(|s| s.1).unwrap_or(Ty::Unknown);
+        let mut ty = match &callee.ty {
+            Ty::TypeVal(t) => (**t).clone(),
+            _ => sig.map(|s| s.1).unwrap_or(Ty::Unknown),
+        };
         if let Some((_, n)) = &builtin {
+            let arg_item = |i: usize| al.args.get(i).and_then(|a| self.reg_ty.get(&a.reg)).map(|t| t.item()).unwrap_or(Ty::Unknown);
             ty = match n.as_str() {
                 "str" | "repr" | "chr" => Ty::Str,
                 "int" | "len" | "ord" | "hash" | "rc_run" | "rc_pending" | "rc_live" => Ty::Int,
                 "float" => Ty::Float,
                 "bool" | "isinstance" => Ty::Bool,
                 "bigint" => Ty::BigInt,
-                "list" | "sorted" => Ty::list(
-                    al.args.first().and_then(|a| self.reg_ty.get(&a.reg)).map(|t| t.item()).unwrap_or(Ty::Unknown),
-                ),
-                "tuple" => Ty::Tuple,
+                "list" | "sorted" => Ty::list(arg_item(0)),
+                "tuple" => Ty::Tuple(None),
                 "dict" => Ty::dict(Ty::Unknown, Ty::Unknown),
+                "range" => Ty::iter(Ty::Int),
+                "iter" => Ty::iter(arg_item(0)),
+                "enumerate" => Ty::iter(Ty::Tuple(Some(vec![Ty::Int, arg_item(0)]))),
+                "zip" => Ty::iter(Ty::Tuple(Some(vec![arg_item(0), arg_item(1)]))),
+                "Channel" => Ty::Chan(Box::new(Ty::Unknown)),
+                "Lock" => Ty::Opaque("Lock".into()),
+                "spawn" => Ty::Opaque("Thread".into()),
                 "array" => Ty::Array(match args.first().map(|a| &a.kind) {
                     Some(ExprKind::Name(n)) if !self.locals.contains_key(n) && !self.m.module_vars.contains(n) => {
                         slim_vm::array::Elem::from_name(n)
@@ -2320,13 +2556,30 @@ impl<'m> FnCtx<'m> {
 
     /// Evaluates call arguments. `keep_of(i)` is the static keep flag of
     /// parameter i, if known. `recv_root` is the receiver's root local.
-    fn call_args(&mut self, args: &[Expr], keep_of: &dyn Fn(usize) -> Option<bool>, recv_root: Option<Reg>, span: Span) -> R<ArgList> {
+    fn call_args(
+        &mut self,
+        args: &[Expr],
+        keep_of: &dyn Fn(usize) -> Option<bool>,
+        ty_of: &dyn Fn(usize) -> Option<(String, Ty)>,
+        recv_root: Option<Reg>,
+        span: Span,
+    ) -> R<ArgList> {
         let mut out = Vec::new();
         let mut moved_locals: Vec<(String, Reg, Span)> = Vec::new();
         let mut borrowed_roots: Vec<Reg> = recv_root.into_iter().collect();
         for (i, a) in args.iter().enumerate() {
             let keep = keep_of(i);
-            let r = self.expr(a)?;
+            let param = ty_of(i);
+            let r = self.expr_expect(a, param.as_ref().map(|p| p.1.clone()))?;
+            // An unnamed parameter only gives context (its store is checked later).
+            if let Some((pname, pty)) = param.as_ref().filter(|p| !p.0.is_empty()) {
+                if !ty_compatible(pty, &r.ty) {
+                    return Err(type_err(
+                        format!("argument `{pname}` expects `{}`, got `{}`", pty.name(), r.ty.name()),
+                        a.span,
+                    ));
+                }
+            }
             self.reg_ty.insert(r.reg, r.ty.clone());
             match &r.own {
                 Own::Owned => out.push(Arg::new(r.reg, true, false, None)),
@@ -2436,7 +2689,9 @@ impl<'m> FnCtx<'m> {
             }
         }
         let builtin_mask = match &r.ty {
-            Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Tuple | Ty::Generator | Ty::Array(_) => slim_vm::builtins::method_keep_mask(mname),
+            Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Tuple(_) | Ty::Iter(_) | Ty::Chan(_) | Ty::Array(_) => {
+                slim_vm::builtins::method_keep_mask(mname)
+            }
             _ => None,
         };
         let any_mask = if mname == "some_or" { Some(1u64 << 1) } else { None };
@@ -2449,7 +2704,19 @@ impl<'m> FnCtx<'m> {
             }
             None
         };
-        let al = self.call_args(args, &keep_of, r.root, span)?;
+        let elem_arg = match (mname, &r.ty) {
+            ("append", Ty::List(t)) => Some((0, (**t).clone())),
+            ("insert", Ty::List(t)) => Some((1, (**t).clone())),
+            ("send", Ty::Chan(t)) => Some((0, (**t).clone())),
+            _ => None,
+        };
+        let arg_ty = |i: usize| -> Option<(String, Ty)> {
+            if let Some(s) = &sig {
+                return s.params.get(i).map(|p| (p.name.clone(), p.ty.clone()));
+            }
+            elem_arg.as_ref().filter(|(k, _)| *k == i).map(|(_, t)| (String::new(), t.clone()))
+        };
+        let al = self.call_args(args, &keep_of, &arg_ty, r.root, span)?;
         if let ("append" | "insert", Ty::List(_)) = (mname, &r.ty) {
             if let Some(arg) = al.args.last() {
                 let ty = self.reg_ty.get(&arg.reg).cloned().unwrap_or(Ty::Unknown);
@@ -2472,7 +2739,7 @@ impl<'m> FnCtx<'m> {
             (None, "split", Ty::Str) => Ty::list(Ty::Str),
             (None, "keys", Ty::Dict(k, _)) => Ty::List(k.clone()),
             (None, "values", Ty::Dict(_, v)) => Ty::List(v.clone()),
-            (None, "items", Ty::Dict(..)) => Ty::list(Ty::Tuple),
+            (None, "items", Ty::Dict(k, v)) => Ty::list(Ty::Tuple(Some(vec![(**k).clone(), (**v).clone()]))),
             (None, "pop" | "first" | "last", Ty::List(t)) if **t != Ty::Unknown && !matches!(**t, Ty::Option(_)) => {
                 Ty::Option(t.clone())
             }
@@ -2499,6 +2766,7 @@ impl<'m> FnCtx<'m> {
             }
             Some(e) => {
                 let dst = self.tmp_owned();
+                self.expect = (self.ret_ty != Ty::Unknown).then(|| self.ret_ty.clone());
                 self.value_into(e, dst)?;
                 dst
             }
@@ -2526,7 +2794,7 @@ impl<'m> FnCtx<'m> {
                     self.emit(Instr::CheckType { reg: r, ty: ti, what: self.ret_desc });
                 }
                 RetKind::Unit => {
-                    let ti = self.type_idx(TypeDesc::Unit);
+                    let ti = self.type_idx(TypeDesc::prim(Ctor::Unit));
                     self.emit(Instr::CheckType { reg: r, ty: ti, what: self.ret_desc });
                 }
                 RetKind::Any => {}
@@ -2570,6 +2838,9 @@ impl<'m> FnCtx<'m> {
             self.finally_stack.push(f.clone());
         }
         let start = self.here();
+        // Temporaries from here on are only live inside the body; one that
+        // owns a value when the body raises is dropped by the handler.
+        let pool_from = self.owned_used;
         let mut ty = self.block_value(&t.body, dst)?;
         let body_end = self.here();
         let mut end_jumps = Vec::new();
@@ -2595,6 +2866,7 @@ impl<'m> FnCtx<'m> {
             self.state = hstate.clone();
             let e = self.new_reg(true, Some("<exception>".into()));
             self.emit(Instr::TakeException { dst: e });
+            self.drop_temps_from(pool_from);
             let mut matches = Vec::new();
             let mut catch_all = None;
             for (i, h) in t.handlers.iter().enumerate() {
@@ -2696,6 +2968,7 @@ impl<'m> FnCtx<'m> {
             self.state = st;
             let e2 = self.new_reg(true, Some("<exception>".into()));
             self.emit(Instr::TakeException { dst: e2 });
+            self.drop_temps_from(pool_from);
             self.block(f)?;
             self.emit(Instr::Reraise { exc: e2 });
             let h = self.here();
@@ -2704,6 +2977,15 @@ impl<'m> FnCtx<'m> {
         }
         let _ = fin_start;
         Ok(ty)
+    }
+
+    /// Drops the owned temporaries `pool[from..]` at an exception handler.
+    /// A temporary that is not live holds `UNINIT` or `MOVED`, so this only
+    /// releases values that were in flight when the exception was raised.
+    fn drop_temps_from(&mut self, from: usize) {
+        for r in self.owned_pool[from..].to_vec() {
+            self.emit(Instr::Drop { reg: r });
+        }
     }
 
     // ------------------------------------------------------------ definitions
@@ -2834,20 +3116,26 @@ fn join_all(tys: Vec<Ty>) -> Ty {
 }
 
 fn ty_compatible(d: &Ty, v: &Ty) -> bool {
+    // An `Unknown` element type is "some container" (or not inferred): the
+    // runtime check decides. Known element types must match exactly.
+    let inv = |a: &Ty, b: &Ty| a == b || *a == Ty::Unknown || *b == Ty::Unknown;
     match (d, v) {
-        (Ty::List(a), Ty::List(b)) => ty_compatible(a, b),
-        (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => ty_compatible(k1, k2) && ty_compatible(v1, v2),
+        (_, Ty::NoneT) => matches!(d, Ty::Option(_) | Ty::Unknown),
+        (Ty::Unknown | Ty::Any, _) | (_, Ty::Unknown | Ty::Any) => true,
+        (Ty::List(a), Ty::List(b)) | (Ty::Iter(a), Ty::Iter(b)) | (Ty::Chan(a), Ty::Chan(b)) => inv(a, b),
+        (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => inv(k1, k2) && inv(v1, v2),
+        (Ty::Tuple(None), Ty::Tuple(_)) | (Ty::Tuple(_), Ty::Tuple(None)) => true,
+        (Ty::Tuple(Some(a)), Ty::Tuple(Some(b))) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| ty_compatible(x, y)),
         (Ty::Array(None), Ty::Array(_)) | (Ty::Array(_), Ty::Array(None)) => true,
-        (Ty::Unknown, _) | (_, Ty::Unknown) => true,
-        (Ty::Option(inner), Ty::NoneT) => { let _ = inner; true }
         (Ty::Option(a), Ty::Option(b)) => ty_compatible(a, b),
         (Ty::Option(a), b) => ty_compatible(a, b),
-        (_, Ty::NoneT) => false,
         (Ty::Float, Ty::Int) => true,
         (Ty::BigInt, Ty::Int) => true,
         (Ty::Trait(_), Ty::Instance(_)) | (Ty::Trait(_), Ty::Trait(_)) => true,
-        (Ty::Iter, Ty::Generator | Ty::Iter) => true,
-        (Ty::Func, Ty::StaticFn) | (Ty::StaticFn, Ty::Func) => true,
+        (Ty::Trait(t), Ty::Iter(_)) => t == "Iterator",
+        // A user class implementing `Iterator` (checked at runtime).
+        (Ty::Iter(_), Ty::Instance(_) | Ty::Trait(_)) => true,
+        (Ty::Func, Ty::StaticFn | Ty::Class(_) | Ty::TypeVal(_)) | (Ty::StaticFn, Ty::Func) => true,
         (a, b) => a == b,
     }
 }
@@ -2878,9 +3166,11 @@ fn binop_ty(op: BinOp, a: &Ty, b: &Ty) -> Ty {
         (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr, Int, Int) => Int,
         (_, BigInt, Int | BigInt) | (_, Int, BigInt) => BigInt,
         (BinOp::Add, Str, Str) | (BinOp::Mul, Str, Int) => Str,
-        (BinOp::Add, List(x), List(y)) => Ty::list(x.join(y)),
-        (BinOp::Mul, List(x), Int) => List(x.clone()),
-        (BinOp::Add, Tuple, Tuple) => Tuple,
+        // The result has the left operand's type.
+        (BinOp::Add, List(x), List(_)) => List(x.clone()),
+        (BinOp::Mul, List(x), Int) | (BinOp::Mul, Int, List(x)) => List(x.clone()),
+        (BinOp::Add, Tuple(Some(x)), Tuple(Some(y))) => Tuple(Some(x.iter().chain(y).cloned().collect())),
+        (BinOp::Add, Tuple(_), Tuple(_)) => Tuple(None),
         _ => Unknown,
     }
 }
@@ -3008,6 +3298,19 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
         }
         None => (RetKind::Any, Ty::Unknown),
     };
+    if ctx.is_generator {
+        match &ret_ty {
+            Ty::Iter(t) => ctx.yield_decl = (**t != Ty::Unknown).then(|| (**t).clone()),
+            Ty::Unknown => {}
+            Ty::Trait(t) if t == "Iterator" => {}
+            other => {
+                return Err(type_err(
+                    format!("generator `{}` returns an `Iterator<T>`, not `{}`", f.name, other.name()),
+                    f.span,
+                ))
+            }
+        }
+    }
     ctx.ret = if ctx.is_generator { RetKind::Any } else { ret.clone() };
     ctx.ret_ty = ret_ty;
     ctx.ret_desc = ctx.name_idx(&format!("return value of {fname}"));
@@ -3027,7 +3330,8 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, class_name: Option<&str>, capt
             ctx.emit(Instr::Return { src: dst });
         }
     } else {
-        ctx.block_value(body, dst)?;
+        let expect = (ctx.ret_ty != Ty::Unknown).then(|| ctx.ret_ty.clone());
+        ctx.block_value_expect(body, dst, expect)?;
         if ctx.state.is_some() {
             ctx.emit_return(dst);
         }

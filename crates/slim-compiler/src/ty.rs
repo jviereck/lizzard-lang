@@ -2,15 +2,20 @@
 //!
 //! The compiler only needs to know whether a value is a copy type or a move
 //! type; when it cannot tell (`Unknown`) it emits dynamically checked
-//! instructions instead.
+//! instructions instead. Container types mirror the runtime types exactly:
+//! a static `list<int>` is a `list<int>` at runtime (containers are
+//! invariant), while `list<?>` (element `Unknown`) is "some list".
 
-use slim_vm::array::Elem;
 use slim_syntax::ast::TypeExpr;
-use slim_vm::code::TypeDesc;
+use slim_vm::array::Elem;
+use slim_vm::code::{Ctor, TypeDesc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ty {
     Unknown,
+    /// An explicit `any` type argument (`list<any>`). A value read from such
+    /// a container is untyped (`Unknown`).
+    Any,
     Int,
     Float,
     Bool,
@@ -19,25 +24,30 @@ pub enum Ty {
     Unit,
     /// The type of the literal `None` (only valid as an `Option`).
     NoneT,
-    Tuple,
-    /// `list<T>`; `Unknown` when the element type is not known.
+    /// `tuple<A, B>`, or `None` for an untyped tuple.
+    Tuple(Option<Vec<Ty>>),
+    /// `list<T>`; `Unknown` for some list (a bare `list`).
     List(Box<Ty>),
     /// `dict<K, V>`.
     Dict(Box<Ty>, Box<Ty>),
     Func,
     /// A module-level `def` (immortal, copied freely).
     StaticFn,
-    Generator,
-    Iter,
+    /// `Iterator<T>`: generators and iterators.
+    Iter(Box<Ty>),
+    /// `Channel<T>`.
+    Chan(Box<Ty>),
     Instance(String),
     Trait(String),
-    /// A builtin object type (`Lock`, `Channel`, `Thread`): a move type.
+    /// A builtin object type (`Lock`, `Thread`): a move type.
     Opaque(String),
     /// A class object (immortal, copied freely).
     Class(String),
     Option(Box<Ty>),
     /// `array` (element type unknown) or `array<T>`.
     Array(Option<Elem>),
+    /// A type used as a value (`list::<int>`); calling it builds that type.
+    TypeVal(Box<Ty>),
 }
 
 /// The slim type of an array element read.
@@ -46,6 +56,14 @@ pub fn elem_ty(e: Elem) -> Ty {
         Elem::F32 | Elem::F64 => Ty::Float,
         Elem::Bool => Ty::Bool,
         _ => Ty::Int,
+    }
+}
+
+/// A type argument as the static type of a value read from a container.
+fn read_ty(t: &Ty) -> Ty {
+    match t {
+        Ty::Any => Ty::Unknown,
+        t => t.clone(),
     }
 }
 
@@ -58,11 +76,15 @@ impl Ty {
         Ty::Dict(Box::new(k), Box::new(v))
     }
 
+    pub fn iter(t: Ty) -> Ty {
+        Ty::Iter(Box::new(t))
+    }
+
     /// The element type produced by indexing (a borrow) or `None` if unknown.
     pub fn elem(&self) -> Option<Ty> {
         let t = match self {
-            Ty::List(t) => (**t).clone(),
-            Ty::Dict(_, v) => (**v).clone(),
+            Ty::List(t) => read_ty(t),
+            Ty::Dict(_, v) => read_ty(v),
             Ty::Array(Some(e)) => elem_ty(*e),
             Ty::Str => Ty::Str,
             _ => return None,
@@ -73,7 +95,12 @@ impl Ty {
     /// The type of the items a `for` loop over this type produces.
     pub fn item(&self) -> Ty {
         match self {
-            Ty::Dict(k, _) => (**k).clone(),
+            Ty::Dict(k, _) => read_ty(k),
+            Ty::Iter(t) | Ty::Chan(t) => read_ty(t),
+            Ty::Tuple(Some(ts)) => match ts.first() {
+                Some(f) if ts.iter().all(|t| t == f) => read_ty(f),
+                _ => Ty::Unknown,
+            },
             _ => self.elem().unwrap_or(Ty::Unknown),
         }
     }
@@ -81,8 +108,10 @@ impl Ty {
     /// `Some(true)` for copy types, `Some(false)` for move types.
     pub fn is_copy(&self) -> Option<bool> {
         match self {
-            Ty::Unknown => None,
-            Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Unit | Ty::NoneT | Ty::Class(_) | Ty::StaticFn => Some(true),
+            Ty::Unknown | Ty::Any => None,
+            Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Unit | Ty::NoneT | Ty::Class(_) | Ty::StaticFn | Ty::TypeVal(_) => {
+                Some(true)
+            }
             Ty::Option(t) => t.is_copy(),
             _ => Some(false),
         }
@@ -90,6 +119,18 @@ impl Ty {
 
     pub fn is_move(&self) -> bool {
         self.is_copy() == Some(false)
+    }
+
+    /// Fully known: no `Unknown` anywhere (so the runtime type is exactly this).
+    pub fn is_precise(&self) -> bool {
+        match self {
+            Ty::Unknown => false,
+            Ty::Tuple(None) => false,
+            Ty::Tuple(Some(ts)) => ts.iter().all(Ty::is_precise),
+            Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) => **t != Ty::Unknown && t.is_precise(),
+            Ty::Dict(k, v) => k.is_precise() && v.is_precise(),
+            _ => true,
+        }
     }
 
     pub fn join(&self, other: &Ty) -> Ty {
@@ -102,15 +143,30 @@ impl Ty {
             (Ty::NoneT, t) | (t, Ty::NoneT) if *t != Ty::Unknown => Ty::Option(Box::new(t.clone())),
             (Ty::Option(a), b) | (b, Ty::Option(a)) if **a == *b => Ty::Option(a.clone()),
             (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
-            (Ty::List(a), Ty::List(b)) => Ty::list(a.join(b)),
-            (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => Ty::dict(k1.join(k2), v1.join(v2)),
+            // Invariant containers: different element types join to "some list".
+            (Ty::List(_), Ty::List(_)) => Ty::list(Ty::Unknown),
+            (Ty::Dict(..), Ty::Dict(..)) => Ty::dict(Ty::Unknown, Ty::Unknown),
+            (Ty::Iter(_), Ty::Iter(_)) => Ty::iter(Ty::Unknown),
+            (Ty::Chan(_), Ty::Chan(_)) => Ty::Chan(Box::new(Ty::Unknown)),
+            (Ty::Tuple(Some(a)), Ty::Tuple(Some(b))) if a.len() == b.len() => {
+                Ty::Tuple(Some(a.iter().zip(b).map(|(x, y)| x.join(y)).collect()))
+            }
+            (Ty::Tuple(_), Ty::Tuple(_)) => Ty::Tuple(None),
             _ => Ty::Unknown,
         }
     }
 
     pub fn name(&self) -> String {
+        let args = |base: &str, ts: &[&Ty]| -> String {
+            if ts.iter().any(|t| **t == Ty::Unknown) {
+                base.to_string()
+            } else {
+                format!("{base}<{}>", ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "))
+            }
+        };
         match self {
             Ty::Unknown => "?".into(),
+            Ty::Any => "any".into(),
             Ty::Int => "int".into(),
             Ty::Float => "float".into(),
             Ty::Bool => "bool".into(),
@@ -118,19 +174,19 @@ impl Ty {
             Ty::Str => "str".into(),
             Ty::Unit => "()".into(),
             Ty::NoneT => "None".into(),
-            Ty::Tuple => "tuple".into(),
-            Ty::List(t) if **t == Ty::Unknown => "list".into(),
-            Ty::List(t) => format!("list<{}>", t.name()),
-            Ty::Dict(k, v) if **k == Ty::Unknown && **v == Ty::Unknown => "dict".into(),
-            Ty::Dict(k, v) => format!("dict<{}, {}>", k.name(), v.name()),
+            Ty::Tuple(None) => "tuple".into(),
+            Ty::Tuple(Some(ts)) => args("tuple", &ts.iter().collect::<Vec<_>>()),
+            Ty::List(t) => args("list", &[t]),
+            Ty::Dict(k, v) => args("dict", &[k, v]),
             Ty::Func | Ty::StaticFn => "function".into(),
-            Ty::Generator => "generator".into(),
-            Ty::Iter => "iterator".into(),
+            Ty::Iter(t) => args("Iterator", &[t]),
+            Ty::Chan(t) => args("Channel", &[t]),
             Ty::Instance(c) | Ty::Trait(c) | Ty::Opaque(c) => c.clone(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Option(t) => format!("Option<{}>", t.name()),
             Ty::Array(None) => "array".into(),
             Ty::Array(Some(e)) => format!("array<{}>", e.name()),
+            Ty::TypeVal(t) => format!("type {}", t.name()),
         }
     }
 }
@@ -147,39 +203,74 @@ pub fn resolve(
     t: &TypeExpr,
     lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
 ) -> Result<(Ty, TypeDesc), String> {
+    resolve_in(t, lookup, false)
+}
+
+/// `nested`: `t` is a type argument (where `any` is a type of its own).
+fn resolve_in(
+    t: &TypeExpr,
+    lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
+    nested: bool,
+) -> Result<(Ty, TypeDesc), String> {
     match t {
-        TypeExpr::Unit(_) => Ok((Ty::Unit, TypeDesc::Unit)),
+        TypeExpr::Unit(_) => Ok((Ty::Unit, TypeDesc::prim(Ctor::Unit))),
         TypeExpr::Named(n, args, _) => {
-            let no_args = |ty: Ty, d: TypeDesc| -> Result<(Ty, TypeDesc), String> {
-                Ok((ty, d))
+            let arg = |i: usize| resolve_in(&args[i], lookup, true);
+            let no_args = |ty: Ty, c: Ctor| -> Result<(Ty, TypeDesc), String> {
+                if !args.is_empty() {
+                    return Err(format!("`{n}` does not take type arguments"));
+                }
+                Ok((ty, TypeDesc::prim(c)))
             };
             match n.as_str() {
-                "int" => no_args(Ty::Int, TypeDesc::Int),
-                "float" => no_args(Ty::Float, TypeDesc::Float),
-                "bool" => no_args(Ty::Bool, TypeDesc::Bool),
-                "bigint" => no_args(Ty::BigInt, TypeDesc::BigInt),
-                "str" => no_args(Ty::Str, TypeDesc::Str),
-                "tuple" => no_args(Ty::Tuple, TypeDesc::Tuple),
-                // Element types are checked statically; at runtime only the
-                // container type is.
-                "list" => match args.as_slice() {
-                    [] => Ok((Ty::list(Ty::Unknown), TypeDesc::List)),
-                    [t] => Ok((Ty::list(resolve(t, lookup)?.0), TypeDesc::List)),
-                    _ => Err("`list` takes one element type: `list<T>`".into()),
-                },
-                "dict" => match args.as_slice() {
-                    [] => Ok((Ty::dict(Ty::Unknown, Ty::Unknown), TypeDesc::Dict)),
-                    [k, v] => Ok((Ty::dict(resolve(k, lookup)?.0, resolve(v, lookup)?.0), TypeDesc::Dict)),
+                "int" => no_args(Ty::Int, Ctor::Int),
+                "float" => no_args(Ty::Float, Ctor::Float),
+                "bool" => no_args(Ty::Bool, Ctor::Bool),
+                "bigint" => no_args(Ty::BigInt, Ctor::BigInt),
+                "str" => no_args(Ty::Str, Ctor::Str),
+                "tuple" => {
+                    if args.is_empty() {
+                        return Ok((Ty::Tuple(None), TypeDesc::prim(Ctor::Tuple)));
+                    }
+                    let (tys, ds): (Vec<Ty>, Vec<TypeDesc>) = (0..args.len()).map(arg).collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+                    Ok((Ty::Tuple(Some(tys)), TypeDesc::Builtin(Ctor::Tuple, ds)))
+                }
+                "list" | "Iterator" | "Generator" | "Channel" => {
+                    let (c, wrap): (Ctor, fn(Box<Ty>) -> Ty) = match n.as_str() {
+                        "list" => (Ctor::List, Ty::List),
+                        "Channel" => (Ctor::Channel, Ty::Chan),
+                        _ => (Ctor::Iterator, Ty::Iter),
+                    };
+                    let name = if c == Ctor::Iterator { "Iterator" } else { n.as_str() };
+                    match args.len() {
+                        0 => Ok((wrap(Box::new(Ty::Unknown)), TypeDesc::prim(c))),
+                        1 => {
+                            let (ty, d) = arg(0)?;
+                            Ok((wrap(Box::new(ty)), TypeDesc::Builtin(c, vec![d])))
+                        }
+                        _ => Err(format!("`{name}` takes one element type: `{name}<T>`")),
+                    }
+                }
+                "dict" => match args.len() {
+                    0 => Ok((Ty::dict(Ty::Unknown, Ty::Unknown), TypeDesc::prim(Ctor::Dict))),
+                    2 => {
+                        let ((k, kd), (v, vd)) = (arg(0)?, arg(1)?);
+                        Ok((Ty::dict(k, v), TypeDesc::Builtin(Ctor::Dict, vec![kd, vd])))
+                    }
                     _ => Err("`dict` takes a key and a value type: `dict<K, V>`".into()),
                 },
-                "function" | "Callable" | "Fn" => no_args(Ty::Func, TypeDesc::Function),
-                "any" | "Any" => no_args(Ty::Unknown, TypeDesc::Any),
-                "Lock" | "Channel" | "Thread" => no_args(Ty::Opaque(n.clone()), TypeDesc::Builtin(n.clone())),
+                "function" | "Callable" | "Fn" => no_args(Ty::Func, Ctor::Function),
+                "any" | "Any" => {
+                    let (ty, d) = no_args(Ty::Unknown, Ctor::Any)?;
+                    Ok((if nested { Ty::Any } else { ty }, d))
+                }
+                "Lock" => no_args(Ty::Opaque(n.clone()), Ctor::Lock),
+                "Thread" => no_args(Ty::Opaque(n.clone()), Ctor::Thread),
                 "array" => match args.as_slice() {
-                    [] => Ok((Ty::Array(None), TypeDesc::Array(None))),
+                    [] => Ok((Ty::Array(None), TypeDesc::prim(Ctor::Array(None)))),
                     [TypeExpr::Named(e, eargs, _)] if eargs.is_empty() && Elem::from_name(e).is_some() => {
                         let e = Elem::from_name(e);
-                        Ok((Ty::Array(e), TypeDesc::Array(e)))
+                        Ok((Ty::Array(e), TypeDesc::prim(Ctor::Array(e))))
                     }
                     _ => Err("`array` takes one element type: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 or bool".into()),
                 },
@@ -187,23 +278,28 @@ pub fn resolve(
                     if args.len() != 1 {
                         return Err("`Option` takes exactly one type argument: `Option<T>`".into());
                     }
-                    let (inner, d) = resolve(&args[0], lookup)?;
+                    let (inner, d) = arg(0)?;
                     if matches!(inner, Ty::Option(_)) {
                         return Err("nested `Option<Option<T>>` is not supported".into());
                     }
-                    Ok((Ty::Option(Box::new(inner)), TypeDesc::Option(Box::new(d))))
+                    Ok((Ty::Option(Box::new(inner)), TypeDesc::option(d)))
                 }
                 "None" | "NoneType" => Err("`None` is not a type; use `Option<T>`".into()),
                 "Optional" => Err("use `Option<T>` instead of `Optional`".into()),
-                "Iterator" | "Generator" => match lookup(n) {
-                    Some((idx, _)) => Ok((Ty::Iter, TypeDesc::Global(idx, n.clone()))),
-                    None => Ok((Ty::Iter, TypeDesc::Any)),
-                },
-                other => match lookup(other) {
-                    Some((idx, TypeName::Class)) => Ok((Ty::Instance(other.to_string()), TypeDesc::Global(idx, other.to_string()))),
-                    Some((idx, TypeName::Trait)) => Ok((Ty::Trait(other.to_string()), TypeDesc::Global(idx, other.to_string()))),
-                    None => Err(format!("unknown type `{other}`")),
-                },
+                other => {
+                    if !args.is_empty() {
+                        return Err(format!("`{other}` does not take type arguments"));
+                    }
+                    match lookup(other) {
+                        Some((idx, TypeName::Class)) => {
+                            Ok((Ty::Instance(other.to_string()), TypeDesc::Global(idx, other.to_string())))
+                        }
+                        Some((idx, TypeName::Trait)) => {
+                            Ok((Ty::Trait(other.to_string()), TypeDesc::Global(idx, other.to_string())))
+                        }
+                        None => Err(format!("unknown type `{other}`")),
+                    }
+                }
             }
         }
     }

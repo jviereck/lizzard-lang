@@ -125,10 +125,11 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             out.push_str("])");
         }
         Body::ElemType(e) => out.push_str(e.name()),
+        Body::Type(t) => out.push_str(&t.name),
         Body::Iter(_) => out.push_str("<iterator>"),
         Body::Thread(_) => out.push_str("<Thread>"),
         Body::Lock(_) => out.push_str("<Lock>"),
-        Body::Channel(_) => out.push_str("<Channel>"),
+        Body::Channel(c) => out.push_str(&format!("<{}>", crate::rtype::name(c.ty))),
         Body::Generator(g) => out.push_str(&format!("<generator {}>", g.name())),
         Body::Trait(t) => out.push_str(&format!("<trait {}>", t.name)),
         Body::Instance(inst) => {

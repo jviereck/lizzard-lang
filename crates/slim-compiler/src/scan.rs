@@ -245,7 +245,7 @@ fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr), deep: bool) {
             v(c, f);
             args.iter().for_each(|a| v(a, f))
         }
-        ExprKind::Dup(x) | ExprKind::Unary(_, x) | ExprKind::YieldFrom(x) => v(x, f),
+        ExprKind::Dup(x) | ExprKind::Unary(_, x) | ExprKind::YieldFrom(x) | ExprKind::TypeApp(x, _) => v(x, f),
         ExprKind::Yield(Some(x)) => v(x, f),
         ExprKind::Binary(_, a, b) | ExprKind::And(a, b) | ExprKind::Or(a, b) => {
             v(a, f);

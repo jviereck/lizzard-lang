@@ -11,12 +11,14 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 
-use crate::code::{Arg, ClassSpec, Code, Reg, TypeDesc};
+use crate::code::{Arg, ClassSpec, Code, Ctor, Reg, TypeDesc};
 use crate::display;
 use crate::interp::{run_code, Frame, Raised, Thread, VResult};
+use crate::list::ListObj;
 use crate::object::{Body, Class, Field, Function, Instance, Obj, SlotKind, Trait};
 use crate::ops::StoreMode;
 use crate::rc;
+use crate::rtype;
 use crate::types;
 use crate::value::Value;
 
@@ -130,10 +132,15 @@ pub extern "C" fn add(th: &mut Thread, a: Value, b: Value) -> Value {
     }
     match (a.body(), b.body()) {
         (Some(Body::List(x)), Some(Body::List(y))) => {
+            // The result has the left operand's type; the right operand's
+            // elements are checked against it unless the types are equal.
             let mut out: Vec<Value> = x.snapshot();
             out.extend(y.snapshot());
             out.iter().for_each(|v| v.incref());
-            return Obj::list(out);
+            if x.ty == y.ty {
+                return Obj::list(x.ty, out);
+            }
+            return vres(types::new_list(th, x.ty, out));
         }
         (Some(Body::Tuple(x)), Some(Body::Tuple(y))) => {
             let out: Vec<Value> = x.iter().chain(y.iter()).copied().collect();
@@ -163,7 +170,7 @@ pub extern "C" fn mul(th: &mut Thread, a: Value, b: Value) -> Value {
                 out.extend(items.iter().copied());
             }
             out.iter().for_each(|v| v.incref());
-            return Some(Obj::list(out));
+            return Some(Obj::list(l.ty, out));
         }
         None
     };
@@ -788,6 +795,13 @@ pub fn invoke(
             (b.f)(th, &vals)
         }
         Some(Body::Class(c)) => construct(th, caller, f, c, args),
+        Some(Body::Type(t)) => {
+            let vals: Vec<Value> = args.iter().map(|a| a.v).collect();
+            if let Some(v) = vals.iter().find(|v| v.is_dead()) {
+                return Err(dead_operand(th, *v).unwrap());
+            }
+            crate::builtins::construct_type(th, t, &vals)
+        }
         Some(Body::BoundMethod { recv, func }) => invoke(th, caller, *func, Some(*recv), None, args),
         _ => {
             if let Some(r) = dead_operand(th, f) {
@@ -999,10 +1013,12 @@ pub extern "C" fn f_make_trait(th: &mut Thread, frame: &mut Frame, dst: u32, spe
 }
 
 pub fn slot_kind(ty: &TypeDesc) -> SlotKind {
-    match ty {
-        TypeDesc::Int => SlotKind::RawInt,
-        TypeDesc::Float => SlotKind::RawFloat,
-        _ => SlotKind::Value,
+    if ty.is(Ctor::Int) {
+        SlotKind::RawInt
+    } else if ty.is(Ctor::Float) {
+        SlotKind::RawFloat
+    } else {
+        SlotKind::Value
     }
 }
 
@@ -1051,7 +1067,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
     let fields = s
         .fields
         .iter()
-        .map(|f| Field { name: f.name.clone(), ty: f.ty.clone(), kind: slot_kind(&f.ty) })
+        .map(|f| Field::new(f.name.clone(), f.ty.clone(), slot_kind(&f.ty)))
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
     Ok(Obj::alloc_immortal(Body::Class(Class { name: s.name.clone(), id, fields, methods, traits, is_exception })))
@@ -1068,19 +1084,33 @@ pub extern "C" fn f_make_class(th: &mut Thread, frame: &mut Frame, dst: u32, spe
     }
 }
 
+/// dst = the runtime type `code.types[ty]` (immortal).
+pub extern "C" fn f_make_type(th: &mut Thread, frame: &mut Frame, dst: u32, ty: u32, _: u32, _: u32) -> u32 {
+    match types::code_type(th, frame.code(), ty) {
+        Ok(t) => {
+            frame.set(dst as Reg, t.value());
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
 pub extern "C" fn f_check_type(th: &mut Thread, frame: &mut Frame, reg: u32, ty: u32, what: u32, _: u32) -> u32 {
     let code = frame.code();
     let v = frame.reg(reg as Reg);
-    let t = &code.types[ty as usize];
     if v.is_dead() {
         raise_dead(th, frame, reg as Reg);
         return RAISED;
     }
-    if types::check(th, v, t) {
+    let t = match types::code_type(th, code, ty) {
+        Ok(t) => t,
+        Err(Raised) => return RAISED,
+    };
+    if rtype::has_type(v, t) {
         return OK;
     }
     let what = &code.names[what as usize];
-    th.raise("TypeError", format!("{what} expected `{t}`, got `{}`", v.type_name()));
+    th.raise("TypeError", format!("{what} expected `{}`, got `{}`", t.name, types::value_type_name(v)));
     RAISED
 }
 
@@ -1148,10 +1178,11 @@ fn check_store(th: &mut Thread, inst: &Instance, i: usize, v: Value, mode: Store
     if v.is_dead() {
         return Err(dead_operand(th, v).unwrap());
     }
-    if !types::check(th, v, &f.ty) {
+    let t = types::field_type(th, f)?;
+    if !rtype::has_type(v, t) {
         return Err(th.raise(
             "TypeError",
-            format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, f.ty, v.type_name()),
+            format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, t.name, types::value_type_name(v)),
         ));
     }
     if mode == StoreMode::Copy && !v.is_copy() {
@@ -1325,7 +1356,22 @@ pub extern "C" fn f_load_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     }
 }
 
+/// Set in a store's mode operand when the compiler proved the stored value's
+/// type equals the container's element type.
+pub const STORE_PROVEN: u32 = 1 << 8;
+
+/// Checks (and coerces) an owned value for list `l`, unless `proven`.
+fn list_admit(th: &mut Thread, l: &ListObj, v: Value, proven: bool) -> VResult<Value> {
+    if proven {
+        return Ok(v);
+    }
+    let t = rtype::as_type(l.ty).unwrap();
+    types::admit(th, v, rtype::as_type(rtype::elem_of(t)).unwrap(), t)
+}
+
 pub extern "C" fn f_store_index(th: &mut Thread, frame: &mut Frame, obj: u32, idx: u32, src: u32, mode: u32) -> u32 {
+    let proven = mode & STORE_PROVEN != 0;
+    let mode = mode & 0xff;
     let o = frame.reg(obj as Reg);
     let k = frame.reg(idx as Reg);
     let v = frame.reg(src as Reg);
@@ -1346,14 +1392,18 @@ pub extern "C" fn f_store_index(th: &mut Thread, frame: &mut Frame, obj: u32, id
             }
             Some(Body::List(l)) => {
                 let i = int_index(th, k)?;
+                let v = list_admit(th, l, v, proven)?;
+                frame.set(src as Reg, Value::MOVED);
                 let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));
                 match old {
                     Some(old) => {
-                        frame.set(src as Reg, Value::MOVED);
                         rc::defer_decref(old);
                         Ok(())
                     }
-                    None => Err(index_error(th, i, "list", l.len())),
+                    None => {
+                        frame.set(src as Reg, v);
+                        Err(index_error(th, i, "list", l.len()))
+                    }
                 }
             }
             _ => {
@@ -1388,14 +1438,18 @@ pub extern "C" fn f_swap_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj
             }
             Some(Body::List(l)) => {
                 let i = int_index(th, k)?;
+                let v = list_admit(th, l, v, false)?;
+                frame.set(src as Reg, Value::MOVED);
                 let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));
                 match old {
                     Some(old) => {
-                        frame.set(src as Reg, Value::MOVED);
                         frame.set(dst as Reg, old);
                         Ok(())
                     }
-                    None => Err(index_error(th, i, "list", l.len())),
+                    None => {
+                        frame.set(src as Reg, v);
+                        Err(index_error(th, i, "list", l.len()))
+                    }
                 }
             }
             _ => match crate::builtins::swap_index_other(th, o, k, v)? {
@@ -1430,15 +1484,28 @@ pub extern "C" fn f_build_tuple(_th: &mut Thread, frame: &mut Frame, dst: u32, a
     OK
 }
 
-pub extern "C" fn f_build_list(_th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, _: u32, _: u32) -> u32 {
+pub extern "C" fn f_build_list(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {
+    let t = match types::code_type(th, frame.code(), ty) {
+        Ok(t) => t.value(),
+        Err(Raised) => return RAISED,
+    };
     let items = take_args(frame, args);
-    frame.set(dst as Reg, Obj::list(items));
-    OK
+    match types::new_list(th, t, items) {
+        Ok(l) => {
+            frame.set(dst as Reg, l);
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
 }
 
-pub extern "C" fn f_build_dict(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, _: u32, _: u32) -> u32 {
+pub extern "C" fn f_build_dict(th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, ty: u32, _: u32) -> u32 {
+    let t = match types::code_type(th, frame.code(), ty) {
+        Ok(t) => t.value(),
+        Err(Raised) => return RAISED,
+    };
     let items = take_args(frame, args);
-    match crate::builtins::build_dict(th, items) {
+    match crate::builtins::build_dict(th, t, items) {
         Ok(d) => {
             frame.set(dst as Reg, d);
             OK
@@ -1544,8 +1611,11 @@ pub extern "C" fn f_take_exception(_th: &mut Thread, frame: &mut Frame, dst: u32
 
 pub extern "C" fn f_match_exception(th: &mut Thread, frame: &mut Frame, exc: u32, ty: u32, target: u32, _: u32) -> u32 {
     let v = frame.reg(exc as Reg);
-    let t = &frame.code().types[ty as usize];
-    if types::check(th, v, t) {
+    let t = match types::code_type(th, frame.code(), ty) {
+        Ok(t) => t,
+        Err(Raised) => return RAISED,
+    };
+    if rtype::has_type(v, t) {
         frame.pc = target;
     }
     OK

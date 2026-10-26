@@ -845,6 +845,19 @@ impl Parser {
                     let span = self.advance().span;
                     e = Expr { kind: ExprKind::Dup(Box::new(e)), span };
                 }
+                Tok::ColonColon => {
+                    let span = self.advance().span;
+                    self.expect(&Tok::Lt, "`<` after `::` (type arguments: `f::<T>`)")?;
+                    let mut args = Vec::new();
+                    loop {
+                        args.push(self.type_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.close_angle()?;
+                    e = Expr { kind: ExprKind::TypeApp(Box::new(e), args), span };
+                }
                 _ => return Ok(e),
             }
         }

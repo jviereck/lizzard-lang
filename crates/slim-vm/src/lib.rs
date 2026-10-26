@@ -14,6 +14,7 @@ pub mod list;
 pub mod object;
 pub mod ops;
 pub mod rc;
+pub mod rtype;
 pub mod sem;
 pub mod threads;
 pub mod types;

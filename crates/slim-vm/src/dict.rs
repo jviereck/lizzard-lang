@@ -103,14 +103,17 @@ unsafe fn free_table(p: usize) {
 }
 
 pub struct Dict {
+    /// The dict's type (`dict<K, V>`), an immortal type value.
+    pub ty: Value,
     wlock: AtomicBool,
     table: AtomicPtr<Table>,
     len: AtomicUsize,
 }
 
-impl Default for Dict {
-    fn default() -> Dict {
-        Dict { wlock: AtomicBool::new(false), table: AtomicPtr::new(std::ptr::null_mut()), len: AtomicUsize::new(0) }
+impl Dict {
+    /// An empty dict of type `ty`.
+    pub fn new(ty: Value) -> Dict {
+        Dict { ty, wlock: AtomicBool::new(false), table: AtomicPtr::new(std::ptr::null_mut()), len: AtomicUsize::new(0) }
     }
 }
 

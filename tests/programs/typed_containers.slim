@@ -7,7 +7,7 @@ class Item:
         self.name.upper()
 
 def names(items: list<Item>) -> list<str>:
-    out = []
+    out: list<str> = []
     for it in items:
         out.append(it.shout())
     out

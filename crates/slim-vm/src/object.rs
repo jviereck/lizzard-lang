@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 
@@ -56,7 +56,9 @@ pub enum Body {
     Array(crate::array::ArrayObj),
     /// An array element type (`f64`, `u8`, ...), as passed to `array(...)`.
     ElemType(crate::array::Elem),
-    Iter(Mutex<crate::builtins::IterKind>),
+    /// A runtime type (immortal, interned).
+    Type(crate::rtype::RtType),
+    Iter(crate::builtins::IterObj),
     Generator(crate::generator::Generator),
     Thread(crate::threads::ThreadHandle),
     Lock(crate::threads::LockObj),
@@ -92,7 +94,15 @@ pub enum SlotKind {
 pub struct Field {
     pub name: String,
     pub ty: TypeDesc,
+    /// The runtime type of `ty`, resolved on first use.
+    pub rt: std::sync::OnceLock<Value>,
     pub kind: SlotKind,
+}
+
+impl Field {
+    pub fn new(name: String, ty: TypeDesc, kind: SlotKind) -> Field {
+        Field { name, ty, rt: std::sync::OnceLock::new(), kind }
+    }
 }
 
 pub struct Class {
@@ -182,9 +192,9 @@ fn check_poison(w: u64) {
 }
 
 impl Obj {
-    /// A new list owning `items`.
-    pub fn list(items: Vec<Value>) -> Value {
-        Obj::alloc(Body::List(crate::list::ListObj::new(items)))
+    /// A new list of type `ty` owning `items` (already of its element type).
+    pub fn list(ty: Value, items: Vec<Value>) -> Value {
+        Obj::alloc(Body::List(crate::list::ListObj::new(ty, items)))
     }
 
     pub fn alloc(body: Body) -> Value {
@@ -319,12 +329,12 @@ impl Obj {
                     v.decref();
                 }
             }
-            Body::Iter(it) => it.get_mut().unwrap_or_else(|e| e.into_inner()).release(),
+            Body::Iter(it) => it.k.get_mut().unwrap_or_else(|e| e.into_inner()).release(),
             Body::Generator(g) => g.release(),
             Body::Thread(t) => t.release(),
             Body::Channel(c) => c.release(),
             Body::Array(a) => a.release(),
-            Body::Lock(_) | Body::ElemType(_) => {}
+            Body::Lock(_) | Body::ElemType(_) | Body::Type(_) => {}
             Body::Int(_)
             | Body::Float(_)
             | Body::BigInt(_)
@@ -394,19 +404,19 @@ impl Value {
             Some(Body::BigInt(_)) => "bigint",
             Some(Body::Str(_)) => "str",
             Some(Body::Tuple(_)) => "tuple",
-            Some(Body::List(_)) => "list",
+            Some(Body::List(l)) => return crate::rtype::name(l.ty).to_string(),
             Some(Body::Function(_)) | Some(Body::Builtin(_)) | Some(Body::BoundMethod { .. }) => "function",
             Some(Body::Class(_)) => "class",
             Some(Body::Trait(_)) => "trait",
             Some(Body::Instance(i)) => return i.class().name.clone(),
-            Some(Body::Dict(_)) => "dict",
-            Some(Body::Array(_)) => "array",
-            Some(Body::ElemType(_)) => "type",
+            Some(Body::Dict(d)) => return crate::rtype::name(d.ty).to_string(),
+            Some(Body::Array(a)) => return format!("array<{}>", a.elem.name()),
+            Some(Body::ElemType(_)) | Some(Body::Type(_)) => "type",
             Some(Body::Iter(_)) => "iterator",
             Some(Body::Generator(_)) => "generator",
             Some(Body::Thread(_)) => "Thread",
             Some(Body::Lock(_)) => "Lock",
-            Some(Body::Channel(_)) => "Channel",
+            Some(Body::Channel(c)) => return crate::rtype::name(c.ty).to_string(),
             None => "<invalid>",
         }
         .into()

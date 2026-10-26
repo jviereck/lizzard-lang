@@ -64,6 +64,8 @@ fn slot<'a>(b: *mut Buf, i: usize) -> &'a AtomicU64 {
 }
 
 pub struct ListObj {
+    /// The list's type (`list<T>`), an immortal type value.
+    pub ty: Value,
     wlock: AtomicBool,
     len: AtomicUsize,
     buf: AtomicPtr<Buf>,
@@ -77,9 +79,10 @@ unsafe impl Send for ListObj {}
 unsafe impl Sync for ListObj {}
 
 impl ListObj {
-    /// A list owning `items`.
-    pub fn new(items: Vec<Value>) -> ListObj {
+    /// A list of type `ty` owning `items` (already of its element type).
+    pub fn new(ty: Value, items: Vec<Value>) -> ListObj {
         let l = ListObj {
+            ty,
             wlock: AtomicBool::new(false),
             len: AtomicUsize::new(0),
             buf: AtomicPtr::new(std::ptr::null_mut()),

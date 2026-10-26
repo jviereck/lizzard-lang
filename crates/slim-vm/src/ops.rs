@@ -136,6 +136,8 @@ opcodes! {
     MakeClass { dst: Reg, spec: u32 } => sem::make_class;
     MakeTrait { dst: Reg, spec: u32 } => sem::make_trait;
     CheckType { reg: Reg, ty: u32, what: u32 } => sem::check_type;
+    /// dst = the runtime type `types[ty]` (immortal).
+    MakeType { dst: Reg, ty: u32 } => sem::make_type;
 
     /// dst = borrow of obj.name
     LoadField { dst: Reg, obj: Reg, name: u32 } => sem::load_field;
@@ -145,12 +147,15 @@ opcodes! {
     /// dst = borrow of obj[idx]
     LoadIndex { dst: Reg, obj: Reg, idx: Reg } => sem::load_index;
     LoadElem { dst: Reg, obj: Reg, idx: Reg } => sem::load_elem;
-    StoreIndex { obj: Reg, idx: Reg, src: Reg, mode: StoreMode } => sem::store_index;
+    /// obj[idx] = src; `proven`: the compiler showed src has the element type.
+    StoreIndex { obj: Reg, idx: Reg, src: Reg, mode: StoreMode, proven: bool } => sem::store_index;
     SwapIndex { dst: Reg, obj: Reg, idx: Reg, src: Reg } => sem::swap_index;
 
     BuildTuple { dst: Reg, args: u32 } => sem::build_tuple;
-    BuildList { dst: Reg, args: u32 } => sem::build_list;
-    BuildDict { dst: Reg, args: u32 } => sem::build_dict;
+    /// dst = a new list of type `types[ty]` from the (owned) arguments.
+    BuildList { dst: Reg, args: u32, ty: u32 } => sem::build_list;
+    /// dst = a new dict of type `types[ty]` from alternating keys and values.
+    BuildDict { dst: Reg, args: u32, ty: u32 } => sem::build_dict;
     /// Unpacks the owned sequence in `src` into the registers of arglist `dsts`.
     Unpack { src: Reg, dsts: u32 } => sem::unpack;
 
@@ -199,11 +204,17 @@ impl Instr {
             Instr::LoadImm { bits, .. } => {
                 s.push_str(&format!("    ; {:?}", crate::value::Value(*bits as i64 as u64)))
             }
+            Instr::CheckType { ty, .. } | Instr::MakeType { ty, .. } | Instr::BuildDict { ty, .. } => {
+                s.push_str(&format!("    ; {}", code.types[*ty as usize]))
+            }
             Instr::LoadField { name, .. }
             | Instr::StoreField { name, .. }
             | Instr::SwapField { name, .. }
             | Instr::CallMethod { name, .. } => s.push_str(&format!("    ; .{}", code.names[*name as usize])),
             Instr::Call { args, .. } | Instr::BuildTuple { args, .. } | Instr::BuildList { args, .. } => {
+                if let Instr::BuildList { ty, .. } = self {
+                    s.push_str(&format!("    ; {}", code.types[*ty as usize]));
+                }
                 let al = &code.arglists[*args as usize];
                 let a: Vec<String> = al
                     .args
