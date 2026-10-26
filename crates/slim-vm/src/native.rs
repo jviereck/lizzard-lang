@@ -26,6 +26,12 @@
 //! (`Stack<i64>`, `Stack<String>`). Slim sees one generic class `Stack<T>`;
 //! constructing `Stack<int>` dispatches to the Rust class registered for
 //! `int`, and other type arguments raise `TypeError`.
+//!
+//! A module may define traits ([`Module::trait_def`]) that its classes
+//! implement ([`ClassBuilder::implements`]), as may slim classes. A class
+//! may also implement the builtin `Ord`, `Num` and `Len` through its dunder
+//! methods. Programs add their own traits to native classes with
+//! `impl Trait for Class`.
 
 use std::any::TypeId;
 use std::cell::UnsafeCell;
@@ -996,6 +1002,10 @@ pub struct NativeClass {
     /// arguments (its instances have type `family<args>`).
     pub family: OnceLock<Value>,
     pub type_args: Vec<NType>,
+    /// Implemented traits of the module (`geom.Shape`), and builtin traits by
+    /// name (`Ord`, `Num`, `Len`, with the traits they imply).
+    pub traits: Vec<Value>,
+    pub builtin_traits: Vec<&'static str>,
 }
 
 /// Marks generic families, which wrap no Rust type.
@@ -1477,6 +1487,16 @@ pub struct ClassSpec {
     /// arguments, class).
     pub tparams: Vec<String>,
     pub instances: Vec<(Vec<NType>, ClassSpec)>,
+    /// Implemented traits: the module's (`Shape`) and builtin ones (`Len`).
+    pub traits: Vec<String>,
+}
+
+/// A trait defined by a native module, for the compiler. Every method is
+/// required (`self` is not among the parameters).
+#[derive(Clone, Debug)]
+pub struct TraitSpec {
+    pub name: String,
+    pub methods: Vec<FnSpec>,
 }
 
 /// A native module's items, for the compiler.
@@ -1485,14 +1505,30 @@ pub struct ModuleSpec {
     pub name: String,
     pub functions: Vec<FnSpec>,
     pub classes: Vec<ClassSpec>,
+    pub traits: Vec<TraitSpec>,
 }
 
-/// A module of native functions and classes.
+/// A module of native functions, classes and traits.
 pub struct Module {
     pub name: String,
     functions: Vec<(String, Value)>,
     classes: Vec<(String, Value)>,
+    traits: Traits,
 }
+
+/// A module's traits: signature and trait object.
+type Traits = Vec<(TraitSpec, Value)>;
+
+/// Builtin traits a native class may implement: (name, implied traits,
+/// required methods).
+const BUILTIN_TRAITS: &[(&str, &[&str], &[&str])] = &[
+    ("Ord", &[], &["__lt__"]),
+    ("Num", &["Ord"], &["__lt__", "__add__", "__sub__", "__mul__", "__truediv__", "__floordiv__", "__mod__", "__pow__", "__neg__"]),
+    ("Len", &[], &["__len__"]),
+];
+
+/// Ids of trait objects defined by native modules (apart from the VM's).
+static NEXT_TRAIT_ID: AtomicU32 = AtomicU32::new(1 << 30);
 
 fn fn_spec(name: &str, v: Value) -> FnSpec {
     let Some(Body::NativeFn(f)) = v.body() else { unreachable!() };
@@ -1501,7 +1537,7 @@ fn fn_spec(name: &str, v: Value) -> FnSpec {
 
 impl Module {
     pub fn new(name: &str) -> Module {
-        Module { name: name.into(), functions: Vec::new(), classes: Vec::new() }
+        Module { name: name.into(), functions: Vec::new(), classes: Vec::new(), traits: Vec::new() }
     }
 
     /// Adds a function: a closure `Fn(A1, ..) -> R` or `Fn(&mut Ctx, A1, ..) -> R`.
@@ -1527,8 +1563,32 @@ impl Module {
         self.add_class(name, Mode::Local, build)
     }
 
+    /// Adds a trait whose methods are all required, for classes of this
+    /// module (defined after it) and slim classes to implement:
+    ///
+    /// ```ignore
+    /// m.trait_def("Shape", |t| {
+    ///     t.method::<(), f64>("area");
+    ///     t.method::<(f64,), ()>("scale");
+    /// });
+    /// ```
+    pub fn trait_def(&mut self, name: &str, build: impl FnOnce(&mut TraitBuilder)) -> &mut Self {
+        let mut t = TraitBuilder { methods: Vec::new() };
+        build(&mut t);
+        let tr = Obj::alloc_immortal(Body::Trait(crate::object::Trait {
+            name: name.into(),
+            id: NEXT_TRAIT_ID.fetch_add(1, Ordering::Relaxed),
+            nparams: 0,
+            methods: t.methods.iter().map(|m| (m.name.clone(), None)).collect(),
+            implies: Vec::new(),
+            native_impls: Default::default(),
+        }));
+        self.traits.push((TraitSpec { name: name.into(), methods: t.methods }, tr));
+        self
+    }
+
     fn add_class<T: 'static>(&mut self, name: &str, mode: Mode, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
-        let class = new_class(&self.name, name, mode, Vec::new(), build);
+        let class = new_class(&self.name, &self.traits, name, mode, Vec::new(), build);
         self.classes.push((name.into(), class));
         self
     }
@@ -1547,7 +1607,7 @@ impl Module {
     /// the type arguments are known statically, and a `TypeError` otherwise.
     pub fn generic_class(&mut self, name: &str, tparams: &[&str], build: impl FnOnce(&mut GenericBuilder)) -> &mut Self {
         assert!(!tparams.is_empty(), "generic class `{name}` needs type parameters");
-        let mut g = GenericBuilder { module: self.name.clone(), name: name.into(), arity: tparams.len(), instances: Vec::new() };
+        let mut g = GenericBuilder { module: self.name.clone(), traits: self.traits.clone(), name: name.into(), arity: tparams.len(), instances: Vec::new() };
         build(&mut g);
         let family = Obj::alloc_immortal(Body::NativeClass(NativeClass {
             name: name.into(),
@@ -1563,6 +1623,8 @@ impl Module {
             instances: g.instances.clone(),
             family: OnceLock::new(),
             type_args: Vec::new(),
+            traits: Vec::new(),
+            builtin_traits: Vec::new(),
         }));
         for c in &g.instances {
             let Some(Body::NativeClass(c)) = c.body() else { unreachable!() };
@@ -1582,12 +1644,14 @@ impl Module {
                 .iter()
                 .map(|(n, v)| class_spec(n, *v))
                 .collect(),
+            traits: self.traits.iter().map(|(t, _)| t.clone()).collect(),
         }
     }
 
     /// The module's globals: (`module.item`, value).
     pub fn globals(&self) -> Vec<(String, Value)> {
-        self.functions.iter().chain(&self.classes).map(|(n, v)| (format!("{}.{n}", self.name), *v)).collect()
+        let traits = self.traits.iter().map(|(t, v)| (t.name.clone(), *v));
+        self.functions.iter().chain(&self.classes).cloned().chain(traits).map(|(n, v)| (format!("{}.{n}", self.name), v)).collect()
     }
 }
 
@@ -1610,13 +1674,58 @@ fn class_spec(name: &str, v: Value) -> ClassSpec {
                 (ic.type_args.clone(), class_spec(name, *i))
             })
             .collect(),
+        traits: c
+            .traits
+            .iter()
+            .map(|t| t.as_trait().unwrap().name.clone())
+            .chain(c.builtin_traits.iter().map(|t| t.to_string()))
+            .collect(),
     }
 }
 
+/// The traits named by `c.implements(...)`: the module's trait objects and
+/// builtin trait names. Panics if one is unknown or a method is missing or
+/// has another signature.
+fn class_traits(class: &str, names: &[String], traits: &Traits, methods: &HashMap<String, NativeFn>) -> (Vec<Value>, Vec<&'static str>) {
+    let (mut objs, mut builtins) = (Vec::new(), Vec::new());
+    for n in names {
+        if let Some((spec, v)) = traits.iter().find(|(t, _)| t.name == *n) {
+            for m in &spec.methods {
+                let Some(f) = methods.get(&m.name) else { panic!("native class `{class}` implements `{n}` but does not define `{}`", m.name) };
+                assert!(
+                    f.params == m.params && f.ret == m.ret,
+                    "native class `{class}` implements `{n}`, but `{}` takes {:?} -> {:?} instead of {:?} -> {:?}",
+                    m.name,
+                    f.params,
+                    f.ret,
+                    m.params,
+                    m.ret
+                );
+            }
+            objs.push(*v);
+        } else if let Some((b, implies, required)) = BUILTIN_TRAITS.iter().find(|t| t.0 == n) {
+            for m in *required {
+                assert!(methods.contains_key(*m), "native class `{class}` implements `{n}` but does not define `{m}`");
+            }
+            for t in std::iter::once(b).chain(implies.iter()) {
+                if !builtins.contains(t) {
+                    builtins.push(*t);
+                }
+            }
+        } else if n == "Send" {
+            panic!("native class `{class}`: `Send` is not implemented explicitly; it follows the Rust type (`class` / `class_send` vs `class_not_send`)");
+        } else {
+            panic!("native class `{class}` implements unknown trait `{n}` (define it with `trait_def` before the class, or use `Ord`, `Num`, `Len`)");
+        }
+    }
+    (objs, builtins)
+}
+
 /// A new native class over `T` (registered as `T`'s class).
-fn new_class<T: 'static>(module: &str, name: &str, mode: Mode, type_args: Vec<NType>, build: impl FnOnce(&mut ClassBuilder<T>)) -> Value {
-    let mut b = ClassBuilder::<T> { name: name.into(), locked: false, init: None, methods: HashMap::new(), repr: None, _t: PhantomData };
+fn new_class<T: 'static>(module: &str, traits: &Traits, name: &str, mode: Mode, type_args: Vec<NType>, build: impl FnOnce(&mut ClassBuilder<T>)) -> Value {
+    let mut b = ClassBuilder::<T> { name: name.into(), locked: false, init: None, methods: HashMap::new(), repr: None, implements: Vec::new(), _t: PhantomData };
     build(&mut b);
+    let (traits, builtin_traits) = class_traits(name, &b.implements, traits, &b.methods);
     let class = Obj::alloc_immortal(Body::NativeClass(NativeClass {
         name: name.into(),
         module: module.into(),
@@ -1631,6 +1740,8 @@ fn new_class<T: 'static>(module: &str, name: &str, mode: Mode, type_args: Vec<NT
         instances: Vec::new(),
         family: OnceLock::new(),
         type_args,
+        traits,
+        builtin_traits,
     }));
     registry().write().unwrap().insert(TypeId::of::<T>(), class);
     class
@@ -1641,6 +1752,7 @@ fn new_class<T: 'static>(module: &str, name: &str, mode: Mode, type_args: Vec<NT
 /// the Rust type's auto traits choose the mode as for [`Module::class`].
 pub struct GenericBuilder {
     module: String,
+    traits: Traits,
     name: String,
     arity: usize,
     instances: Vec<Value>,
@@ -1668,7 +1780,7 @@ impl GenericBuilder {
         assert!(args.len() == self.arity, "`{}` takes {} type argument(s), got {} for `{}`", self.name, self.arity, args.len(), std::any::type_name::<T>());
         let dup = self.instances.iter().any(|c| matches!(c.body(), Some(Body::NativeClass(c)) if c.type_args == args));
         assert!(!dup, "`{}` instantiation {args:?} is registered twice", self.name);
-        let c = new_class(&self.module, &self.name, mode, args, build);
+        let c = new_class(&self.module, &self.traits, &self.name, mode, args, build);
         self.instances.push(c);
         self
     }
@@ -1681,8 +1793,43 @@ pub struct ClassBuilder<T> {
     init: Option<NativeFn>,
     methods: HashMap<String, NativeFn>,
     repr: Option<ReprFn>,
+    implements: Vec<String>,
     _t: PhantomData<fn() -> T>,
 }
+
+/// Builds a native trait (see [`Module::trait_def`]).
+pub struct TraitBuilder {
+    methods: Vec<FnSpec>,
+}
+
+impl TraitBuilder {
+    /// A required method taking arguments `A` (a tuple: `()`, `(f64,)`, ...)
+    /// and returning `R`.
+    pub fn method<A: ArgTypes, R: IntoSlim>(&mut self, name: &str) -> &mut Self {
+        self.methods.push(FnSpec { name: name.into(), params: A::ntypes(), ret: R::ntype() });
+        self
+    }
+}
+
+/// The parameter types of a native trait method: a tuple of [`SlimType`]s.
+pub trait ArgTypes {
+    fn ntypes() -> Vec<NType>;
+}
+
+macro_rules! impl_arg_types {
+    ($($A:ident),*) => {
+        impl<$($A: SlimType),*> ArgTypes for ($($A,)*) {
+            fn ntypes() -> Vec<NType> {
+                vec![$($A::ntype()),*]
+            }
+        }
+    };
+}
+impl_arg_types!();
+impl_arg_types!(A1);
+impl_arg_types!(A1, A2);
+impl_arg_types!(A1, A2, A3);
+impl_arg_types!(A1, A2, A3, A4);
 
 impl<T: 'static> ClassBuilder<T> {
     /// The constructor, called as `Name(args)`: `Fn(A1, ..) -> T` (or
@@ -1710,6 +1857,16 @@ impl<T: 'static> ClassBuilder<T> {
     /// How instances are shown by `print` and `str`.
     pub fn repr(&mut self, f: impl Fn(&T) -> String + Send + Sync + 'static) -> &mut Self {
         self.repr = Some(Box::new(move |d| f(d.downcast_ref::<T>().expect("native type"))));
+        self
+    }
+
+    /// Implements trait `name`: a trait of this module defined earlier
+    /// ([`Module::trait_def`]), or the builtin `Ord` (`__lt__`), `Num` (the
+    /// arithmetic dunders and `__lt__`) or `Len` (`__len__`). The methods are
+    /// checked when the class is added (a mismatch panics). `Send` is not
+    /// implemented this way: it follows the Rust type.
+    pub fn implements(&mut self, name: &str) -> &mut Self {
+        self.implements.push(name.into());
         self
     }
 

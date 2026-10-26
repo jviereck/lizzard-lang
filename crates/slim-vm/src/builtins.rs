@@ -444,9 +444,8 @@ fn b_len(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(Body::Dict(d)) => d.len(),
         Some(Body::Array(a)) => a.len(),
         Some(Body::Channel(_)) => return crate::helpers::call_simple(th, type_method(v, "__len__").unwrap(), Some(v), &[]),
-        Some(Body::Instance(inst)) if inst.class().methods.contains_key("__len__") => {
-            let m = inst.class().methods["__len__"];
-            return helpers::call_simple(th, m, Some(v), &[]);
+        Some(Body::Instance(_) | Body::Native(_)) if helpers::dunder(v, "__len__").is_some() => {
+            return helpers::call_simple(th, helpers::dunder(v, "__len__").unwrap(), Some(v), &[]);
         }
         _ => return Err(th.raise("TypeError", format!("object of type '{}' has no len()", v.type_name()))),
     };
@@ -652,7 +651,11 @@ fn b_isinstance(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     let r = match t.body() {
         Some(Body::Class(_)) => v.as_instance().is_some_and(|i| i.class == t),
         Some(Body::NativeClass(c)) => matches!(v.body(), Some(Body::Native(n)) if c.covers(t, n.class)),
-        Some(Body::Trait(_)) => v.as_instance().is_some_and(|i| i.class().implements(t)),
+        Some(Body::Trait(_)) => match v.body() {
+            Some(Body::Instance(i)) => i.class().implements(t),
+            Some(Body::Native(n)) => rtype::satisfies(rtype::as_type(n.ty).unwrap(), rtype::as_type(rtype::prim(Ctor::Trait(t))).unwrap()),
+            _ => false,
+        },
         _ => return Err(th.raise("TypeError", "isinstance() arg 2 must be a class or trait")),
     };
     Ok(Value::bool(r))
@@ -975,6 +978,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
             nparams: *nparams,
             methods,
             implies,
+            native_impls: Default::default(),
         }));
         traits.push((name, t));
     }

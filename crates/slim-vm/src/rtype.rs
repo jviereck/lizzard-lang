@@ -263,7 +263,16 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
         Ctor::Class(c) => c.as_class(),
         _ => None,
     };
-    let implements = |name: &str| class.is_some_and(|c| c.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name)));
+    let native = native_class_of(t);
+    // A native class implements a trait of its module or a builtin one
+    // (`c.implements(..)`), or one of the program's (`impl T for C`).
+    let native_impl = |name: &str| {
+        native.is_some_and(|(_, nc)| nc.builtin_traits.contains(&name) || nc.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name)))
+    };
+    let script_impl = || native.is_some_and(|(v, _)| trait_.native_impls.read().unwrap().contains(&v));
+    let implements = |name: &str| {
+        class.is_some_and(|c| c.traits.iter().any(|x| x.as_trait().is_some_and(|x| x.name == name))) || native_impl(name) || script_impl()
+    };
     // Tuples (and `Option`s, for hashing) qualify when all their parts do.
     let parts = || !t.is_bare() && t.args.iter().all(|a| satisfies(as_type(*a).unwrap(), tr));
     match trait_.name.as_str() {
@@ -295,6 +304,7 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
             };
             item.is_some_and(|item| tr.is_bare() || tr.args[0] == item)
         }
+        _ if native.is_some() => native.is_some_and(|(_, nc)| nc.traits.contains(&trv)) || script_impl(),
         _ => match class {
             Some(c) => {
                 // A class implementing `Iterator<T>` also provides `Iterable<T>`.
@@ -310,6 +320,18 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
             }
             None => matches!(t.ctor, Ctor::Trait(x) if x == trv && (tr.is_bare() || t.args == tr.args)),
         },
+    }
+}
+
+/// The native class of instances of type `t`, if it is one: for a generic
+/// native class, the instantiation for `t`'s type arguments.
+fn native_class_of(t: &RtType) -> Option<(Value, &'static crate::native::NativeClass)> {
+    let Ctor::Class(c) = t.ctor else { return None };
+    let Some(Body::NativeClass(nc)) = c.body() else { return None };
+    let v = if nc.is_family() { nc.instance_for(t.value())? } else { c };
+    match v.body() {
+        Some(Body::NativeClass(k)) => Some((v, k)),
+        _ => None,
     }
 }
 

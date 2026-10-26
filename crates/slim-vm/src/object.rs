@@ -156,6 +156,9 @@ pub struct Trait {
     pub methods: Vec<(String, Option<Value>)>,
     /// Traits implied by this one (e.g. `KeyError`'s `LookupError` implies `Exception`).
     pub implies: Vec<Value>,
+    /// Native classes the program implements this trait for
+    /// (`impl Describe for Polygon`).
+    pub native_impls: std::sync::RwLock<Vec<Value>>,
 }
 
 pub struct Instance {

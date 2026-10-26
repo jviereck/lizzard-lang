@@ -135,6 +135,9 @@ opcodes! {
     MakeFunction { dst: Reg, code: u32, captures: u32 } => sem::make_function;
     MakeClass { dst: Reg, spec: u32 } => sem::make_class;
     MakeTrait { dst: Reg, spec: u32 } => sem::make_trait;
+    /// `impl globals[tr] for globals[class]`: a program's trait for a native
+    /// class (or every instantiation of a generic one).
+    ImplNative { tr: u32, class: u32 } => sem::impl_native;
     CheckType { reg: Reg, ty: u32, what: u32 } => sem::check_type;
     /// dst = the runtime type `types[ty]` (immortal).
     MakeType { dst: Reg, ty: u32 } => sem::make_type;

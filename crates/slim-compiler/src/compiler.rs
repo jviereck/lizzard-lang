@@ -93,6 +93,9 @@ pub struct ClassInfo {
 pub struct TraitInfo {
     pub tparams: Vec<TParamSig>,
     pub methods: HashMap<String, Sig>,
+    /// Defined by a native module: every method is required, and only Rust
+    /// classes (`c.implements`) or slim class headers implement it.
+    pub native: bool,
 }
 
 /// Type parameters in scope: name -> environment index (a class type
@@ -241,7 +244,7 @@ impl ModInfo {
         if self.builtin_classes.contains(c) {
             return vec![("Exception".into(), Vec::new())];
         }
-        let Some(ci) = self.classes.get(c) else { return Vec::new() };
+        let Some(ci) = self.class_info(c, args).or_else(|| self.classes.get(c)) else { return Vec::new() };
         let map = class_map(ci, args);
         ci.impls.iter().map(|(t, a)| (t.clone(), a.iter().map(|x| x.subst(&map)).collect())).collect()
     }
@@ -455,14 +458,25 @@ fn ntype_ty(t: &NType, classes: &NativeNames) -> Ty {
 /// type (`geom.Stack`, `[int]` for an instantiation of a generic class).
 type NativeNames = HashMap<std::any::TypeId, (String, Vec<NType>)>;
 
-fn native_class_info(c: &slim_vm::native::ClassSpec, names: &NativeNames) -> ClassInfo {
+fn native_class_info(c: &slim_vm::native::ClassSpec, m: &ModuleSpec, names: &NativeNames) -> ClassInfo {
     let mut methods: HashMap<String, Sig> = c.methods.iter().map(|f| (f.name.clone(), native_sig(f, names))).collect();
     if let Some(init) = &c.init {
         methods.insert("__init__".into(), native_sig(init, names));
     }
-    let instances = c.instances.iter().map(|(a, i)| (a.iter().map(|t| ntype_ty(t, names)).collect(), native_class_info(i, names))).collect();
+    let instances: Vec<(Vec<Ty>, ClassInfo)> =
+        c.instances.iter().map(|(a, i)| (a.iter().map(|t| ntype_ty(t, names)).collect(), native_class_info(i, m, names))).collect();
     let tparams = c.tparams.iter().map(|n| TParamSig { name: n.clone(), bounds: Vec::new() }).collect();
-    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls: Vec::new(), instances }
+    // The module's traits are qualified (`geom.Shape`); builtin ones are not.
+    let mut impls: Vec<(String, Vec<Ty>)> = c
+        .traits
+        .iter()
+        .map(|t| (if m.traits.iter().any(|x| x.name == *t) { format!("{}.{t}", m.name) } else { t.clone() }, Vec::new()))
+        .collect();
+    if let Some((_, first)) = instances.first() {
+        // A generic family implements what every instantiation does.
+        impls = first.impls.iter().filter(|t| instances.iter().all(|(_, i)| i.impls.contains(t))).cloned().collect();
+    }
+    ClassInfo { local: c.local, tparams, fields: Vec::new(), methods, impls, instances }
 }
 
 fn native_sig(f: &FnSpec, classes: &NativeNames) -> Sig {
@@ -482,7 +496,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
     let module = &module;
     let mut globals: Vec<String> = slim_vm::builtins::names().into_iter().map(String::from).collect();
     for m in &used {
-        for n in m.functions.iter().map(|f| &f.name).chain(m.classes.iter().map(|c| &c.name)) {
+        for n in m.functions.iter().map(|f| &f.name).chain(m.classes.iter().map(|c| &c.name)).chain(m.traits.iter().map(|t| &t.name)) {
             globals.push(format!("{}.{n}", m.name));
         }
     }
@@ -542,8 +556,12 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
         }
     }
     for m in &used {
+        for t in &m.traits {
+            let methods = t.methods.iter().map(|f| (f.name.clone(), native_sig(f, &native_names))).collect();
+            info.traits.insert(format!("{}.{}", m.name, t.name), TraitInfo { tparams: Vec::new(), methods, native: true });
+        }
         for c in &m.classes {
-            info.classes.insert(format!("{}.{}", m.name, c.name), native_class_info(c, &native_names));
+            info.classes.insert(format!("{}.{}", m.name, c.name), native_class_info(c, m, &native_names));
         }
         for f in &m.functions {
             info.funcs.insert(format!("{}.{}", m.name, f.name), native_sig(f, &native_names));
@@ -566,7 +584,7 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
                 if builtin_names.contains(&t.name) {
                     return Err(syn_err(format!("cannot redefine builtin `{}`", t.name), t.span));
                 }
-                info.traits.insert(t.name.clone(), TraitInfo { tparams: names(&t.tparams), methods: HashMap::new() });
+                info.traits.insert(t.name.clone(), TraitInfo { tparams: names(&t.tparams), methods: HashMap::new(), native: false });
             }
             _ => {}
         }
@@ -731,6 +749,30 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
             }
         }
     }
+    // Native traits: every method is required.
+    for s in &module.body.stmts {
+        if let StmtKind::Class(c) = &s.kind {
+            for (tname, _, _) in &c.traits {
+                let Some(ti) = info.traits.get(tname).filter(|t| t.native) else { continue };
+                let mut req: Vec<&String> = ti.methods.keys().collect();
+                req.sort();
+                for m in req {
+                    if !c.methods.iter().any(|cm| cm.name == *m) {
+                        return Err(type_err(
+                            format!("class `{}` implements `{tname}` but does not define required method `{}`", c.name, m),
+                            c.span,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // `impl Trait for NativeClass`.
+    for s in &module.body.stmts {
+        if let StmtKind::ImplFor { tr, targs, target, tspan } = &s.kind {
+            impl_for(&mut info, module, tr, targs, target, *tspan, s.span)?;
+        }
+    }
     let mut ctx = FnCtx::new(&info, "<module>".into(), true);
     ctx.state = Some(HashMap::new());
     ctx.block(&module.body)?;
@@ -739,6 +781,103 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
     ctx.emit(Instr::Return { src: r });
     let code = ctx.finish(Vec::new(), RetKind::Any, false, false);
     Ok((Arc::new(code), globals))
+}
+
+/// Checks `impl tr for target` (a program's trait for a native class) and
+/// records it: the class (each instantiation of a generic one) implements
+/// the trait and gets its default methods.
+fn impl_for(info: &mut ModInfo, module: &Module, tr: &str, targs: &[TypeExpr], target: &str, tspan: Span, span: Span) -> R<()> {
+    let header = |tr: &str| format!("declare it in the class header: `class {target}(impl {tr})`");
+    if !targs.is_empty() {
+        return Err(type_err(format!("generic traits cannot be implemented for native classes (`impl {tr}<...> for {target}`)"), tspan));
+    }
+    match info.classes.get(target) {
+        None if info.builtin_classes.contains(target) => return Err(type_err(format!("cannot implement traits for builtin class `{target}`"), span)),
+        None => return Err(name_err(format!("unknown class `{target}`"), span)),
+        Some(_) if !target.contains('.') => return Err(type_err(format!("`{target}` is a slim class; {}", header(tr)), span)),
+        Some(_) => {}
+    }
+    let user = info.traits.get(tr);
+    if user.is_some_and(|t| t.native) {
+        return Err(type_err(format!("`{tr}` is a native trait: its implementations for native classes are declared in Rust (`c.implements(..)`)"), tspan));
+    }
+    if user.is_some_and(|t| !t.tparams.is_empty()) {
+        return Err(type_err(format!("generic traits cannot be implemented for native classes (`{tr}`)"), tspan));
+    }
+    // The trait must be defined before the `impl`, which runs where it is.
+    let pos = |pred: &dyn Fn(&StmtKind) -> bool| module.body.stmts.iter().position(|s| pred(&s.kind));
+    if user.is_some() {
+        let def = pos(&|k| matches!(k, StmtKind::Trait(t) if t.name == tr));
+        let imp = pos(&|k| matches!(k, StmtKind::ImplFor { tr: t, target: c, .. } if t == tr && c == target));
+        if def > imp {
+            return Err(type_err(format!("`impl {tr} for {target}` comes before trait `{tr}` is defined"), span));
+        }
+    }
+    let required: Vec<(String, Option<Sig>)> = match (user, builtin_trait(tr)) {
+        (Some(t), _) => {
+            let tdef = module.body.stmts.iter().find_map(|s| match &s.kind {
+                StmtKind::Trait(t) if t.name == tr => Some(t),
+                _ => None,
+            });
+            let mut req: Vec<(String, Option<Sig>)> = tdef
+                .map(|d| d.methods.iter().filter(|m| m.body.is_none()).map(|m| (m.name.clone(), t.methods.get(&m.name).cloned())).collect())
+                .unwrap_or_default();
+            req.sort_by(|a, b| a.0.cmp(&b.0));
+            req
+        }
+        (None, Some((_, 0, implies, methods))) => {
+            let implied = implies.iter().filter_map(|i| builtin_trait(i)).flat_map(|t| t.3.iter());
+            methods.iter().chain(implied).map(|m| (m.to_string(), None)).collect()
+        }
+        (None, Some(_)) => return Err(type_err(format!("generic traits cannot be implemented for native classes (`{tr}`)"), tspan)),
+        (None, None) if tr == "Send" => {
+            return Err(type_err("`Send` is automatic: a native class is `Send` when its Rust type is (`class`/`class_send`)", tspan))
+        }
+        (None, None) => return Err(name_err(format!("unknown trait `{tr}`"), tspan)),
+    };
+    let defaults = info.trait_methods(tr, &[]).unwrap_or_default();
+    let ci = &info.classes[target];
+    let classes: Vec<(Vec<Ty>, &ClassInfo)> =
+        if ci.instances.is_empty() { vec![(Vec::new(), ci)] } else { ci.instances.iter().map(|(a, i)| (a.clone(), i)).collect() };
+    for (args, k) in &classes {
+        let what = if args.is_empty() { target.to_string() } else { Ty::Instance(target.into(), args.clone()).name() };
+        if k.impls.iter().any(|(t, _)| t == tr) {
+            return Err(type_err(format!("`{what}` already implements `{tr}`"), span));
+        }
+        for (m, want) in &required {
+            let Some(have) = k.methods.get(m) else {
+                return Err(type_err(format!("`impl {tr} for {target}`: `{what}` does not define required method `{m}`"), span));
+            };
+            let Some(want) = want else { continue };
+            let params_ok = have.params.len() == want.params.len() && have.params.iter().zip(&want.params).all(|(h, w)| h.ty == w.ty);
+            if !params_ok || !ty_compatible(&want.ret, &have.ret) {
+                let show = |s: &Sig| format!("({}) -> {}", s.params.iter().map(|p| p.ty.name()).collect::<Vec<_>>().join(", "), s.ret.name());
+                return Err(type_err(
+                    format!("`impl {tr} for {target}`: `{what}.{m}` is `{}`, but `{tr}` needs `{}`", show(have), show(want)),
+                    span,
+                ));
+            }
+        }
+    }
+    let add = |k: &mut ClassInfo| {
+        k.impls.push((tr.to_string(), Vec::new()));
+        if let Some((_, _, implies, _)) = builtin_trait(tr) {
+            for i in implies.iter() {
+                if !k.impls.iter().any(|(t, _)| t == i) {
+                    k.impls.push((i.to_string(), Vec::new()));
+                }
+            }
+        }
+        for (n, sig) in &defaults {
+            k.methods.entry(n.clone()).or_insert_with(|| sig.clone());
+        }
+    };
+    let ci = info.classes.get_mut(target).unwrap();
+    add(ci);
+    for (_, i) in &mut ci.instances {
+        add(i);
+    }
+    Ok(())
 }
 
 fn check_method_typing(m: &FuncDef) -> R<()> {
@@ -1557,6 +1696,13 @@ impl<'m> FnCtx<'m> {
             StmtKind::Def(f) => self.def_stmt(f),
             StmtKind::Class(c) => self.class_stmt(c),
             StmtKind::Trait(t) => self.trait_stmt(t),
+            StmtKind::ImplFor { tr, target, .. } => {
+                if !self.is_module {
+                    return Err(syn_err(format!("`impl {tr} for {target}` must be at module level"), s.span));
+                }
+                self.emit(Instr::ImplNative { tr: self.m.gindex[tr], class: self.m.gindex[target] });
+                Ok(())
+            }
             StmtKind::Raise { exc, cause } => self.raise_stmt(exc.as_ref(), cause.as_ref(), s.span),
             // Resolved before compiling (see `imports`).
             StmtKind::Import { .. } | StmtKind::FromImport { .. } => Ok(()),

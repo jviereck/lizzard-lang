@@ -112,6 +112,24 @@ fn runtime() -> (Runtime, Log) {
             g.class::<String, _>(stack::<String>);
             g.class_not_send::<Native<Point>, _>(stack::<Native<Point>>);
         });
+        // A Rust trait, implemented by a Rust class (with builtin `Len` and
+        // `Ord` through dunders) and by slim classes.
+        m.trait_def("Shape", |t| {
+            t.method::<(), f64>("area");
+            t.method::<(f64,), ()>("scale");
+        });
+        m.class::<Poly>("Polygon", |c| {
+            c.init(|| Poly { points: Vec::new() });
+            c.method_mut("add", |p: &mut Poly, x: f64, y: f64| p.points.push((x, y)));
+            c.method("area", |p: &Poly| p.area());
+            c.method_mut("scale", |p: &mut Poly, k: f64| p.points.iter_mut().for_each(|q| *q = (q.0 * k, q.1 * k)));
+            c.method("__len__", |p: &Poly| p.points.len() as i64);
+            c.method("__lt__", |p: &Poly, o: Native<Poly>| -> Result<bool, SlimError> { Ok(p.area() < o.with(|q| q.area())?) });
+            c.implements("Shape");
+            c.implements("Len");
+            c.implements("Ord");
+            c.repr(|p: &Poly| format!("Polygon({})", p.area()));
+        });
         m.function("countdown", |n: i64| -> Result<Native<Stack<i64>>, SlimError> { Native::new(Stack { items: (1..=n).rev().collect() }) });
     });
     (rt, log)
@@ -128,6 +146,17 @@ struct Cell(std::rc::Rc<std::cell::Cell<i64>>);
 struct Stack<T> {
     items: Vec<T>,
 }
+struct Poly {
+    points: Vec<(f64, f64)>,
+}
+
+impl Poly {
+    fn area(&self) -> f64 {
+        let n = self.points.len();
+        let twice: f64 = (0..n).map(|i| self.points[i].0 * self.points[(i + 1) % n].1 - self.points[(i + 1) % n].0 * self.points[i].1).sum();
+        twice.abs() / 2.0
+    }
+}
 
 fn stack<T: FromSlim + IntoSlim + Clone + 'static>(c: &mut ClassBuilder<Stack<T>>) {
     c.init(|| Stack { items: Vec::new() });
@@ -135,6 +164,7 @@ fn stack<T: FromSlim + IntoSlim + Clone + 'static>(c: &mut ClassBuilder<Stack<T>
     c.method_mut("pop", |s: &mut Stack<T>| s.items.pop());
     c.method("peek", |s: &Stack<T>| s.items.last().cloned());
     c.method("len", |s: &Stack<T>| s.items.len() as i64);
+    c.method("__len__", |s: &Stack<T>| s.items.len() as i64);
     c.locked();
 }
 
@@ -404,6 +434,101 @@ main()
     assert_eq!(l, ["400"]);
     let e = err("from geom import Stack, Point\ndef show(s: Stack<Point>) -> int:\n    s.len()\ndef main() -> ():\n    spawn(show, Stack::<Point>())\nmain()\n");
     assert!(e.contains("is not `Send` (`geom.Stack<geom.Point>`)"), "{e}");
+    // Native traits: a Rust trait implemented by a Rust and a slim class;
+    // a program's trait implemented for a Rust class; builtin traits.
+    let l = ok(r#"
+from util import log
+from geom import Polygon, Shape, Stack
+class Square(impl Shape):
+    side: float
+    def __init__(self, side: float) -> ():
+        self.side = side
+    def area(self) -> float:
+        self.side * self.side
+    def scale(self, k: float) -> ():
+        self.side = self.side * k
+
+trait Describe:
+    def area(self) -> float: ...
+    def describe(self) -> str:
+        "area " + str(self.area())
+
+impl Describe for Polygon
+impl Len for Stack
+
+def tri(k: float) -> Polygon:
+    p = Polygon()
+    p.add(0.0, 0.0)
+    p.add(4.0 * k, 0.0)
+    p.add(0.0, 3.0 * k)
+    p
+
+def total<T: Shape>(xs: list<T>) -> float:
+    t = 0.0
+    for x in xs:
+        t = t + x.area()
+    t
+
+def size<T: Len>(x: T) -> int:
+    len(x)
+
+def main() -> ():
+    shapes: list<Shape> = [tri(1.0), Square(2.0)]
+    for s in shapes:
+        s.scale(2.0)
+        log(str(s.area()))
+    log(str(total([tri(1.0), tri(2.0)])))
+    log(tri(1.0).describe())
+    d: Describe = tri(2.0)
+    log(d.describe())
+    log(str(len(tri(1.0))) + " " + str(tri(1.0) < tri(2.0)) + " " + str(tri(2.0) < tri(1.0)))
+    log(str(sorted([tri(3.0), tri(1.0), tri(2.0)])))
+    log(str(isinstance(tri(1.0), Shape)) + " " + str(isinstance(tri(1.0), Describe)))
+    st = Stack::<int>()
+    st.push(5)
+    log(str(size(st)) + " " + str(size(tri(1.0))))
+main()
+"#);
+    assert_eq!(
+        l,
+        ["24.0", "16.0", "30.0", "area 6.0", "area 24.0", "3 True False", "[Polygon(6), Polygon(24), Polygon(54)]", "True True", "1 3"]
+    );
+
+    // A bound checked at runtime (the type argument is only known then).
+    let l = ok(r#"
+from util import log
+from geom import Polygon, Shape
+def area_of<T: Shape>(x: T) -> float:
+    x.area()
+def untyped(x):
+    x++
+def main() -> ():
+    log(str(area_of(untyped(Polygon()))))
+    try:
+        area_of(untyped(5))
+    except TypeError as e:
+        log("TypeError")
+main()
+"#);
+    assert_eq!(l, ["0.0", "TypeError"]);
+
+    let e = err("from geom import Shape\nclass Sq(impl Shape):\n    def __init__(self) -> ():\n        pass\n    def area(self) -> float:\n        1.0\n");
+    assert!(e.contains("class `Sq` implements `geom.Shape` but does not define required method `scale`"), "{e}");
+    let e = err("from geom import Point\ntrait D:\n    def area(self) -> float: ...\nimpl D for Point\n");
+    assert!(e.contains("`impl D for geom.Point`: `geom.Point` does not define required method `area`"), "{e}");
+    let e = err("from geom import Point\ntrait D:\n    def x(self) -> int: ...\nimpl D for Point\n");
+    assert!(e.contains("`geom.Point.x` is `() -> float`, but `D` needs `() -> int`"), "{e}");
+    let e = err("trait D:\n    def f(self) -> int: ...\nclass C(impl D):\n    def __init__(self) -> ():\n        pass\n    def f(self) -> int:\n        1\nclass E:\n    def __init__(self) -> ():\n        pass\nimpl D for E\n");
+    assert!(e.contains("`E` is a slim class; declare it in the class header: `class E(impl D)`"), "{e}");
+    let e = err("from geom import Shape, Point\nimpl Shape for Point\n");
+    assert!(e.contains("`geom.Shape` is a native trait"), "{e}");
+    let e = err("from geom import Polygon\ntrait D:\n    def area(self) -> float: ...\ndef f() -> ():\n    impl D for Polygon\n");
+    assert!(e.contains("must be at module level"), "{e}");
+    let e = err("from geom import Polygon\nimpl D for Polygon\ntrait D:\n    def area(self) -> float: ...\n");
+    assert!(e.contains("comes before trait `D` is defined"), "{e}");
+    let e = err("from geom import Polygon\nimpl Len for Polygon\n");
+    assert!(e.contains("`geom.Polygon` already implements `Len`"), "{e}");
+
     let e = err("from geom import Stack, Point\ndef untyped(x):\n    x++\ndef main() -> ():\n    xs: list<any + Send> = []\n    xs.append(untyped(Stack::<Point>()))\nmain()\n");
     assert!(e.contains("cannot store `Stack<Point>`, which is not `Send`, in `list<any + Send>`"), "{e}");
 }

@@ -93,6 +93,33 @@ impl Parser {
             Tok::Def => StmtKind::Def(Box::new(self.funcdef()?)),
             Tok::Class => StmtKind::Class(Box::new(self.classdef()?)),
             Tok::Trait => StmtKind::Trait(Box::new(self.traitdef()?)),
+            Tok::Impl => {
+                self.advance();
+                let (tr, tspan) = self.name("trait name")?;
+                let mut targs = Vec::new();
+                if self.eat(&Tok::Lt) {
+                    loop {
+                        targs.push(self.type_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.close_angle()?;
+                }
+                if !self.eat(&Tok::For) {
+                    return Err(Error::syntax(
+                        format!("expected `for` in `impl {tr} for Class` (slim classes list their traits in the header: `class C(impl {tr})`)"),
+                        self.span(),
+                    ));
+                }
+                let (mut target, _) = self.name("class name")?;
+                while self.eat(&Tok::Dot) {
+                    target.push('.');
+                    target.push_str(&self.name("class name")?.0);
+                }
+                self.expect_line_end()?;
+                StmtKind::ImplFor { tr, targs, target, tspan }
+            }
             Tok::While => {
                 self.advance();
                 let cond = self.expr()?;

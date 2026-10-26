@@ -52,11 +52,18 @@ fn main() {
             c.method("inc", |c: &Counter| c.0.fetch_add(1, Ordering::Relaxed) + 1);
             c.method("get", |c: &Counter| c.0.load(Ordering::Relaxed));
         });
+        // A trait for Rust and slim classes alike.
+        m.trait_def("Shape", |t| {
+            t.method::<(), f64>("area");
+        });
         m.class_send::<Polygon>("Polygon", |c| {
             c.init(|| Polygon { points: Vec::new() });
             c.method_mut("add", |p: &mut Polygon, x: f64, y: f64| p.points.push((x, y)));
             c.method("area", |p: &Polygon| p.area());
+            c.method("__len__", |p: &Polygon| p.points.len() as i64);
             c.repr(|p: &Polygon| format!("Polygon({} points)", p.points.len()));
+            c.implements("Shape");
+            c.implements("Len");
         });
         m.generic_class("Stack", &["T"], |g| {
             g.class::<i64, _>(stack::<i64>);

@@ -315,7 +315,7 @@ pub trait Backend {
 8. **Lock-free-read `list` and `dict`;** no negative indexes.
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
-10. **Rust bindings** (static embedding). **10b:** generic native classes.
+10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`.
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**
@@ -451,9 +451,24 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - **Construction.** `Stack::<int>()`, or `s: Stack<str> = Stack()` with the arguments taken from the expected type, dispatches to the instantiation for those arguments. When they are known statically, the call is checked against that instantiation's constructor and its methods' signatures, and an unsupported instantiation, written or annotated, is a compile error: "`geom.Stack<float>` is not available: `geom.Stack` supports `geom.Stack<int>`, `geom.Stack<str>`". Inside a generic function (`Stack::<T>()`), the runtime picks the instantiation and raises `TypeError` for an unsupported one; method calls on such a value are dynamic.
     - **Natives.** A native function may take or return `Native<Stack<i64>>`, which slim sees as `geom.Stack<int>`.
     - **Registration errors panic:** a wrong number of type arguments, or the same instantiation registered twice.
+  - **Traits (10c).**
+    - **Rust traits.** A module defines a trait whose methods are all required: `m.trait_def("Shape", |t| { t.method::<(), f64>("area"); t.method::<(f64,), ()>("scale"); })`. The argument types are a tuple (`()`, `(f64,)`, ...). Its classes, defined after it, implement it with `c.implements("Shape")`.
+      - Slim imports it like a class (`from geom import Shape`) and uses it as any trait: `s: Shape`, `list<Shape + Send>`, `T: Shape`, `class Square(impl Shape)`.
+      - A slim class must define every method.
+    - **Builtin traits through dunders.** `c.implements("Ord" | "Num" | "Len")` with `__lt__`, the arithmetic dunders (`Num` implies `Ord`) or `__len__`. Operators, `sorted` and `len()` call a native object's dunder methods like an instance's. `Send` is never implemented this way: it follows the Rust type.
+    - **Registration checks.** At registration, the class's methods are checked against the trait's signatures; a missing or mismatched method panics with the class, trait and method names.
+    - **Program traits for native classes:** `impl Describe for Polygon`, a module-level statement after the trait's definition. It is checked at compile time:
+      - every required method exists on the class, with the trait's parameter types and a compatible return type;
+      - the target is a native class (a slim class lists its traits in its header);
+      - the trait is not a native one (those are implemented in Rust) and is not generic.
+
+      For a generic native class (`impl Len for Stack`), the impl covers every instantiation, and each instantiation is checked. At runtime, the statement (`ImplNative`) adds the class to the trait's `native_impls` and those of the traits it implies, which `rtype::satisfies` consults for bounds, `has_type` and `isinstance`. It also records the trait's default methods in `vm.native_methods`, which method calls on native objects fall back to, so `p.describe()` runs the slim default with `self` the native object.
   - **Imports.** `import geom [as g]` and `from geom import dot [as d], Point` are only allowed at module level. Before compiling, imports are resolved by an AST rewrite (`crates/slim-compiler/src/imports.rs`): every name an import binds (`dot`, `g.dot`) becomes the qualified global `geom.dot`, and the compiler registers the native signatures under those names. A function's parameters and locals shadow imported names. Redefining an imported name at module level is an error, and so is using a module as a value. Unknown modules and items are compile-time `NameError`s.
   - **Limitations.**
-    - Native classes cannot implement slim traits.
+    - Rust traits have no default methods and no type parameters. Generic traits cannot be implemented for native classes from slim.
+    - Natives cannot implement `Iterable`/`Iterator`.
+    - `impl Trait for NativeClass` applies to the program that declares it: native trait objects are shared by programs, the program's traits are not.
+    - Default methods of a program trait are reachable through method calls (`p.describe()`); `p.describe` without a call does not see them.
     - A generic native class supports only its registered instantiations: there is no generic Rust code behind `Stack<T>` for an arbitrary `T`, and each instantiation's values are converted (`FromSlim`/`IntoSlim`) when they cross into Rust.
     - Annotations need the class imported by name (`from m import C`); dotted type names (`m.C`) are not supported.
     - Error messages show qualified names such as `geom.Point`.

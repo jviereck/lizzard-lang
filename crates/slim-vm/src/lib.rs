@@ -56,6 +56,7 @@ pub fn new_vm_with(global_names: Vec<String>, natives: &[(String, Value)]) -> Ar
         builtins,
         next_class_id,
         recursion_limit: 3000,
+        native_methods: Default::default(),
     })
 }
 

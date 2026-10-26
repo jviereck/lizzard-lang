@@ -30,7 +30,7 @@ struct Rewriter<'a> {
 }
 
 fn has_item(m: &ModuleSpec, item: &str) -> bool {
-    m.functions.iter().any(|f| f.name == item) || m.classes.iter().any(|c| c.name == item)
+    m.functions.iter().any(|f| f.name == item) || m.classes.iter().any(|c| c.name == item) || m.traits.iter().any(|t| t.name == item)
 }
 
 /// Rewrites the imports of `module`. Returns the native modules it uses.
@@ -149,7 +149,10 @@ impl Rewriter<'_> {
                 for tp in &mut c.tparams {
                     tp.bounds.iter_mut().for_each(|b| self.ty(b));
                 }
-                for (_, args, _) in &mut c.traits {
+                for (n, args, _) in &mut c.traits {
+                    if let Some(q) = self.names.get(n.as_str()) {
+                        *n = q.clone();
+                    }
                     args.iter_mut().for_each(|a| self.ty(a));
                 }
                 for f in &mut c.fields {
@@ -163,6 +166,23 @@ impl Rewriter<'_> {
             StmtKind::Trait(t) => {
                 for m in &mut t.methods {
                     self.func(m)?;
+                }
+                Ok(())
+            }
+            StmtKind::ImplFor { tr, targs, target, .. } => {
+                if let Some(q) = self.names.get(tr.as_str()) {
+                    *tr = q.clone();
+                }
+                targs.iter_mut().for_each(|a| self.ty(a));
+                if let Some(q) = self.names.get(target.as_str()) {
+                    *target = q.clone();
+                } else if let Some((m, item)) = target.split_once('.') {
+                    if let Some(spec) = self.modules.get(m) {
+                        if !has_item(spec, item) {
+                            return Err(Error::new("AttributeError", format!("module `{}` has no `{item}`", spec.name), s.span));
+                        }
+                        *target = format!("{}.{item}", spec.name);
+                    }
                 }
                 Ok(())
             }

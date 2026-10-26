@@ -1,4 +1,4 @@
-from geom import dot, Counter, Polygon, Stack
+from geom import dot, Counter, Polygon, Shape, Stack
 
 print("dot:", dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
 try:
@@ -23,7 +23,29 @@ square.add(0.0, 0.0)
 square.add(2.0, 0.0)
 square.add(2.0, 2.0)
 square.add(0.0, 2.0)
-print(square, "area:", square.area())
+print(square, "area:", square.area(), "points:", len(square))
+
+# `Shape` is defined in Rust; slim classes implement it too.
+class Circle(impl Shape):
+    r: float
+    def __init__(self, r: float) -> ():
+        self.r = r
+    def area(self) -> float:
+        3.14159 * self.r * self.r
+
+# A trait of the program, implemented for the Rust class.
+trait Describe:
+    def area(self) -> float: ...
+    def describe(self) -> str:
+        "a shape of area " + str(self.area())
+
+impl Describe for Polygon
+
+# Module variables are shared between threads, so their values must be `Send`.
+shapes: list<Shape + Send> = [square++, Circle(1.0)]
+for s in shapes:
+    print("shape area:", s.area())
+print(square.describe())
 
 words: Stack<str> = Stack()
 words.push("hello")

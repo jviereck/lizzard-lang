@@ -109,7 +109,7 @@ fn dunder_binop(th: &mut Thread, op: &str, a: Value, b: Value) -> Option<VResult
         "**" => "__pow__",
         _ => return None,
     };
-    let m = *a.as_instance()?.class().methods.get(name)?;
+    let m = dunder(a, name)?;
     Some(call_simple(th, m, Some(a), &[b]))
 }
 
@@ -343,7 +343,7 @@ pub extern "C" fn neg(th: &mut Thread, a: Value) -> Value {
         },
         Some(Num::Big(b)) => big_value(-b),
         Some(Num::Float(f)) => Value::float(-f),
-        None => match a.as_instance().and_then(|i| i.class().methods.get("__neg__").copied()) {
+        None => match dunder(a, "__neg__") {
             Some(m) => vres(call_simple(th, m, Some(a), &[])),
             None => vres(Err(unary_error(th, "-", a))),
         },
@@ -459,15 +459,15 @@ fn order(th: &mut Thread, op: &str, a: Value, b: Value) -> VResult<std::cmp::Ord
             seq_order(th, op, &x, &y)
         }
         // Instances of a class implementing `Ord` compare with `__lt__`.
-        (Some(Body::Instance(i)), _) if i.class().methods.contains_key("__lt__") => {
-            let m = i.class().methods["__lt__"];
+        (Some(Body::Instance(_) | Body::Native(_)), _) if dunder(a, "__lt__").is_some() => {
+            let m = dunder(a, "__lt__").unwrap();
             let less = call_simple(th, m, Some(a), &[b])?;
             let is_less = is_truthy(th, less);
             less.decref();
             if is_less? {
                 return Ok(O::Less);
             }
-            let greater = match b.as_instance().and_then(|j| j.class().methods.get("__lt__").copied()) {
+            let greater = match dunder(b, "__lt__") {
                 Some(m2) => {
                     let r = call_simple(th, m2, Some(b), &[a])?;
                     let g = is_truthy(th, r);
@@ -1125,6 +1125,23 @@ pub fn lookup_method(recv: Value, name: &str) -> Option<Value> {
     }
 }
 
+/// A trait default method of a native object's class, from the program's
+/// `impl Trait for Class`.
+fn native_default(th: &Thread, recv: Value, name: &str) -> Option<Value> {
+    let Some(Body::Native(n)) = recv.body() else { return None };
+    th.vm.native_methods.read().unwrap().get(&(n.class, name.to_string())).copied()
+}
+
+/// An operator method (`__add__`, `__lt__`, `__len__`) of an instance or a
+/// native object.
+pub fn dunder(v: Value, name: &str) -> Option<Value> {
+    match v.body() {
+        Some(Body::Instance(i)) => i.class().methods.get(name).copied(),
+        Some(Body::Native(n)) => n.class().methods.get(name).copied(),
+        _ => None,
+    }
+}
+
 pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, recv: u32, name: u32, args: u32) -> u32 {
     let code = frame.code();
     let al = &code.arglists[args as usize];
@@ -1138,7 +1155,7 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
     if al.pins {
         rc::pin();
     }
-    let result = match lookup_method(r, mname) {
+    let result = match lookup_method(r, mname).or_else(|| native_default(th, r, mname)) {
         Some(m) => invoke(th, Some(frame), m, Some(r), Some(recv as Reg), &cargs),
         None => {
             // A callable stored in a field: `self.callback(x)`.
@@ -1224,8 +1241,37 @@ pub extern "C" fn f_make_trait(th: &mut Thread, frame: &mut Frame, dst: u32, spe
         })
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new() }));
+    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new(), native_impls: Default::default() }));
     frame.set(dst as Reg, t);
+    OK
+}
+
+/// `impl Trait for NativeClass`: records the class (each instantiation of a
+/// generic one) as implementing the trait and the traits it implies, and
+/// makes the trait's default methods available on it.
+pub extern "C" fn f_impl_native(th: &mut Thread, _frame: &mut Frame, tr: u32, class: u32, _: u32, _: u32) -> u32 {
+    let (trv, cv) = (th.vm.global(tr), th.vm.global(class));
+    let (Some(t), Some(Body::NativeClass(c))) = (trv.as_trait(), cv.body()) else {
+        th.raise("TypeError", "`impl ... for ...` needs a trait and a native class");
+        return RAISED;
+    };
+    let classes = if c.is_family() { c.instances.clone() } else { vec![cv] };
+    let mut defaults = th.vm.native_methods.write().unwrap();
+    for k in classes {
+        let Some(Body::NativeClass(kc)) = k.body() else { continue };
+        for x in std::iter::once(trv).chain(t.implies.iter().copied()) {
+            let Some(xt) = x.as_trait() else { continue };
+            let mut impls = xt.native_impls.write().unwrap();
+            if !impls.contains(&k) {
+                impls.push(k);
+            }
+            for (m, d) in &xt.methods {
+                if let (Some(d), false) = (d, kc.methods.contains_key(m)) {
+                    defaults.entry((k, m.clone())).or_insert(*d);
+                }
+            }
+        }
+    }
     OK
 }
 

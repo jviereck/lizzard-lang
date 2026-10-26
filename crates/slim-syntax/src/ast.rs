@@ -31,6 +31,10 @@ pub enum StmtKind {
     Def(Box<FuncDef>),
     Class(Box<ClassDef>),
     Trait(Box<TraitDef>),
+    /// `impl Trait for Class`: a program's trait for a native class (slim
+    /// classes list their traits in the header). `target` may be dotted
+    /// (`geom.Polygon`).
+    ImplFor { tr: String, targs: Vec<TypeExpr>, target: String, tspan: Span },
     Return(Option<Expr>),
     While { cond: Expr, body: Block },
     For { target: Expr, iter: Expr, body: Block },
