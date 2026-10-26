@@ -1,0 +1,17 @@
+# A generator that holds a local value across a `yield` must be declared
+# `+ Local`: otherwise it could be resumed on another thread.
+class Counter(impl Local):
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+    def inc(self) -> int:
+        self.n += 1
+        self.n
+
+def ticks() -> Iterator<int>:
+    c = Counter()
+    yield c.inc()
+    yield c.inc()
+
+for t in ticks():
+    print(t)

@@ -94,13 +94,29 @@ pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value>
         }
         _ => unreachable!("generator of a non-function"),
     };
-    f.incref();
-    // A generator holding a local argument is local itself.
-    let mut ty = crate::rtype::iterator_of(item.value());
     let Some(Body::Function(func)) = f.body() else { unreachable!() };
-    if regs.iter().zip(func.code.owned.iter()).any(|(v, owned)| *owned && v.is_local()) || f.is_local() {
+    // Only a generator declared `-> Iterator<T> + Local` may hold local values.
+    let mut ty = crate::rtype::iterator_of(item.value());
+    if matches!(func.code.ret, crate::code::RetKind::Typed(crate::code::TypeDesc::Local(_))) {
         ty = crate::rtype::local_of(crate::rtype::as_type(ty).unwrap());
     }
+    if !crate::rtype::as_type(ty).unwrap().local {
+        let held = regs.iter().zip(func.code.owned.iter()).find(|(v, owned)| **owned && v.is_local()).map(|(v, _)| *v);
+        if held.is_some() || f.is_local() {
+            let what = match held {
+                Some(v) => format!("holds local `{}`", crate::types::value_type_name(v)),
+                None => "captures local values".to_string(),
+            };
+            let msg = format!("generator `{}` {what}; declare it `-> {} + Local`", func.code.name, crate::rtype::name(ty));
+            for (v, owned) in regs.iter().zip(func.code.owned.iter()) {
+                if *owned {
+                    v.decref();
+                }
+            }
+            return Err(th.raise("TypeError", msg));
+        }
+    }
+    f.incref();
     let g = Generator {
         ty,
         func: f,

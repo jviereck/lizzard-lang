@@ -1,0 +1,13 @@
+# `any` holds non-local values only; `any + Local` also takes local ones.
+class Counter(impl Local):
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+
+def show(x: any) -> str:
+    str(x)
+
+def main() -> ():
+    print(show(Counter()))
+
+main()

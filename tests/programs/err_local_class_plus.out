@@ -1,0 +1,5 @@
+  File "err_local_class_plus.slim", line 7
+    def f(c: Counter + Local) -> ():
+             ^
+TypeError: `+ Local` only applies to `any`, `function`, `Iterator<T>` and traits; a class is local by implementing `Local` (`class Counter(impl Local)`)
+[exit 1]

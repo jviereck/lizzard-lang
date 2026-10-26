@@ -13,8 +13,8 @@ use slim_vm::code::{Ctor, TypeDesc};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ty {
     Unknown,
-    /// An explicit `any` type argument (`list<any>`). A value read from such
-    /// a container is untyped (`Unknown`).
+    /// A declared `any` (`x: any`, `list<any>`): any non-local value. A
+    /// value read from such a slot is untyped (`Unknown`).
     Any,
     Int,
     Float,
@@ -53,9 +53,9 @@ pub enum Ty {
     Array(Option<Elem>),
     /// A type used as a value (`list::<int>`); calling it builds that type.
     TypeVal(Box<Ty>),
-    /// `T + local`: values confined to their thread. Only declared types
-    /// (and the expected types derived from them) carry it; the static type
-    /// of a value never does (parameters and variables ignore locality).
+    /// `T + Local`: an erased type (`any`, `function`, `Iterator<T>`, a
+    /// trait) whose values may be local. Other types are local by what they
+    /// are (a class implementing `Local`, a container of local values).
     Local(Box<Ty>),
 }
 
@@ -77,43 +77,21 @@ fn read_ty(t: &Ty) -> Ty {
 }
 
 impl Ty {
-    /// The type with all locality removed.
-    pub fn unlocal(&self) -> Ty {
-        let b = |t: &Ty| Box::new(t.unlocal());
-        let v = |ts: &[Ty]| ts.iter().map(Ty::unlocal).collect::<Vec<_>>();
+    /// The static type of a value read from a slot declared with this type:
+    /// a declared `any` holds untyped values.
+    pub fn as_value(&self) -> Ty {
         match self {
-            Ty::Local(t) => t.unlocal(),
-            Ty::List(t) => Ty::List(b(t)),
-            Ty::Dict(k, x) => Ty::Dict(b(k), b(x)),
-            Ty::Iter(t) => Ty::Iter(b(t)),
-            Ty::Chan(t) => Ty::Chan(b(t)),
-            Ty::Option(t) => Ty::Option(b(t)),
-            Ty::TypeVal(t) => Ty::TypeVal(b(t)),
-            Ty::Tuple(Some(ts)) => Ty::Tuple(Some(v(ts))),
-            Ty::Instance(c, a) => Ty::Instance(c.clone(), v(a)),
-            Ty::Trait(c, a) => Ty::Trait(c.clone(), v(a)),
+            Ty::Any => Ty::Unknown,
+            Ty::Local(t) if **t == Ty::Any => Ty::Local(Box::new(Ty::Unknown)),
             t => t.clone(),
         }
     }
 
-    /// Whether `+ local` appears in the type.
-    pub fn mentions_local(&self) -> bool {
+    /// The type without a top-level `+ Local`.
+    pub fn peel(&self) -> &Ty {
         match self {
-            Ty::Local(_) => true,
-            Ty::List(t) | Ty::Iter(t) | Ty::Chan(t) | Ty::Option(t) | Ty::TypeVal(t) => t.mentions_local(),
-            Ty::Dict(k, v) => k.mentions_local() || v.mentions_local(),
-            Ty::Tuple(Some(ts)) | Ty::Instance(_, ts) | Ty::Trait(_, ts) => ts.iter().any(Ty::mentions_local),
-            _ => false,
-        }
-    }
-
-    /// Values of this type are never local objects (scalars and strings).
-    pub fn never_local(&self) -> bool {
-        match self {
-            Ty::Int | Ty::Float | Ty::Bool | Ty::BigInt | Ty::Str | Ty::Unit | Ty::NoneT | Ty::Array(_) => true,
-            Ty::Option(t) => t.never_local(),
-            Ty::Tuple(Some(ts)) => ts.iter().all(Ty::never_local),
-            _ => false,
+            Ty::Local(t) => t,
+            t => t,
         }
     }
 
@@ -152,7 +130,7 @@ impl Ty {
     /// The element type produced by indexing (a borrow) or `None` if unknown.
     pub fn elem(&self) -> Option<Ty> {
         let t = match self {
-            Ty::Local(t) => return t.elem().map(|t| t.unlocal()),
+            Ty::Local(t) => return t.elem(),
             Ty::List(t) => read_ty(t),
             Ty::Dict(_, v) => read_ty(v),
             Ty::Array(Some(e)) => elem_ty(*e),
@@ -165,7 +143,7 @@ impl Ty {
     /// The type of the items a `for` loop over this type produces.
     pub fn item(&self) -> Ty {
         match self {
-            Ty::Local(t) => t.item().unlocal(),
+            Ty::Local(t) => t.item(),
             Ty::Dict(k, _) => read_ty(k),
             Ty::Iter(t) | Ty::Chan(t) => read_ty(t),
             Ty::Tuple(Some(ts)) => match ts.first() {
@@ -210,10 +188,12 @@ impl Ty {
         if self == other {
             return self.clone();
         }
-        if self.mentions_local() || other.mentions_local() {
-            return self.unlocal().join(&other.unlocal());
-        }
         match (self, other) {
+            (Ty::Local(a), Ty::Local(b)) => Ty::Local(Box::new(a.join(b))),
+            (Ty::Local(a), b) | (b, Ty::Local(a)) => match a.join(b) {
+                Ty::Unknown => Ty::Unknown,
+                j => Ty::Local(Box::new(j)),
+            },
             (Ty::NoneT, Ty::Option(_)) => other.clone(),
             (Ty::Option(_), Ty::NoneT) => self.clone(),
             (Ty::NoneT, t) | (t, Ty::NoneT) if *t != Ty::Unknown => Ty::Option(Box::new(t.clone())),
@@ -264,13 +244,8 @@ impl Ty {
             Ty::Array(None) => "array".into(),
             Ty::Array(Some(e)) => format!("array<{}>", e.name()),
             Ty::TypeVal(t) => format!("type {}", t.name()),
-            Ty::Local(t) => {
-                let n = t.name();
-                match n.strip_suffix('>') {
-                    Some(head) => format!("{head} + local>"),
-                    None => format!("{n}<+local>"),
-                }
-            }
+            Ty::Local(t) if **t == Ty::Unknown => "any + Local".into(),
+            Ty::Local(t) => format!("{} + Local", t.name()),
         }
     }
 }
@@ -291,29 +266,25 @@ pub fn resolve(
     t: &TypeExpr,
     lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
 ) -> Result<(Ty, TypeDesc), String> {
-    resolve_in(t, lookup, false)
-}
-
-/// `nested`: `t` is a type argument (where `any` is a type of its own).
-fn resolve_in(
-    t: &TypeExpr,
-    lookup: &dyn Fn(&str) -> Option<(u32, TypeName)>,
-    nested: bool,
-) -> Result<(Ty, TypeDesc), String> {
     match t {
         TypeExpr::Unit(_) => Ok((Ty::Unit, TypeDesc::prim(Ctor::Unit))),
         TypeExpr::Local(inner) => {
-            let (ty, d) = resolve_in(inner, lookup, nested)?;
+            let (ty, d) = resolve(inner, lookup)?;
             match &ty {
-                Ty::List(_) | Ty::Dict(..) | Ty::Iter(_) | Ty::Tuple(_) | Ty::Instance(..) | Ty::Trait(..) | Ty::Func | Ty::Unknown | Ty::Any => {
-                    Ok((Ty::Local(Box::new(ty)), TypeDesc::Local(Box::new(d))))
-                }
+                Ty::Any | Ty::Func | Ty::Iter(_) | Ty::Trait(..) => Ok((Ty::Local(Box::new(ty)), TypeDesc::Local(Box::new(d)))),
+                Ty::Instance(c, _) => Err(format!(
+                    "`+ Local` only applies to `any`, `function`, `Iterator<T>` and traits; a class is local by implementing `Local` (`class {c}(impl Local)`)"
+                )),
+                Ty::List(_) | Ty::Dict(..) | Ty::Tuple(_) | Ty::Option(_) => Err(format!(
+                    "`+ Local` only applies to `any`, `function`, `Iterator<T>` and traits; `{}` is local when its contents are",
+                    ty.name()
+                )),
                 Ty::Chan(_) => Err("channels connect threads and cannot be local".into()),
                 other => Err(format!("`{}` values cannot be local (only objects that hold references can)", other.name())),
             }
         }
         TypeExpr::Named(n, args, _) => {
-            let arg = |i: usize| resolve_in(&args[i], lookup, true);
+            let arg = |i: usize| resolve(&args[i], lookup);
             let no_args = |ty: Ty, c: Ctor| -> Result<(Ty, TypeDesc), String> {
                 if !args.is_empty() {
                     return Err(format!("`{n}` does not take type arguments"));
@@ -358,10 +329,7 @@ fn resolve_in(
                     _ => Err("`dict` takes a key and a value type: `dict<K, V>`".into()),
                 },
                 "function" | "Callable" | "Fn" => no_args(Ty::Func, Ctor::Function),
-                "any" | "Any" => {
-                    let (ty, d) = no_args(Ty::Unknown, Ctor::Any)?;
-                    Ok((if nested { Ty::Any } else { ty }, d))
-                }
+                "any" | "Any" => no_args(Ty::Any, Ctor::Any),
                 "Lock" => no_args(Ty::Opaque(n.clone()), Ctor::Lock),
                 "Thread" => no_args(Ty::Opaque(n.clone()), Ctor::Thread),
                 "array" => match args.as_slice() {

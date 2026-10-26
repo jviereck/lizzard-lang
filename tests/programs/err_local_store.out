@@ -1,6 +1,5 @@
-rc-audit: ok
-Traceback (most recent call last):
-  File "err_local_store.slim", line 13, in <module>
-  File "err_local_store.slim", line 11, in main
-TypeError: cannot store local `Counter<+local>` in non-local `dict<str, Counter>`
+  File "err_local_store.slim", line 11
+        shared["c"] <- mine
+        ^
+TypeError: `Counter` is local and cannot be used as `any`; use `any + Local`
 [exit 1]

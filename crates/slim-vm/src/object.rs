@@ -16,7 +16,8 @@ const IMMORTAL: u64 = 1 << 63;
 const REVIVED: u64 = 1 << 62;
 /// The object has an entry in a pending-free queue.
 const QUEUED: u64 = 1 << 61;
-/// The object is confined to the thread that created it (`+local`): it may
+/// The object is confined to the thread that created it (its type is local,
+/// or it is a closure or generator holding local values): it may
 /// only be referenced from that thread's frames and from other local
 /// objects. Set at creation and never changed.
 const LOCAL: u64 = 1 << 60;
@@ -129,7 +130,8 @@ pub struct Class {
     /// Type arguments of generic implemented traits (`impl Iterable<T>`).
     pub trait_args: Vec<(Value, Vec<TypeDesc>)>,
     pub is_exception: bool,
-    /// Some field has a local type, so every instance is local.
+    /// The class implements `Local` (or has a field of local type), so every
+    /// instance is local.
     pub always_local: bool,
     /// The type of instances of a non-generic class.
     pub canonical: std::sync::OnceLock<Value>,

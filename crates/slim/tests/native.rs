@@ -288,28 +288,23 @@ log(str(a.get()))
 "#);
     assert_eq!(l, ["1200"]);
 
-    // Not Send: instances are local and never leave their thread.
+    // Not Send: the class implements `Local`, so instances never leave their
+    // thread. `Any`/`Func` handles may hold local values.
     let l = ok(r#"
-from util import log
+from util import log, apply
 from geom import Cell
-def show(x: Cell) -> int:
-    x.get()
 def main() -> ():
     c = Cell(1)
     c.set(c.get() + 1)
     log(str(c.get()))
-    try:
-        spawn(show, c++)
-    except TypeError as e:
-        log(str(e))
     cells: list<Cell> = [Cell(5)]
     log(str(cells[0].get()))
+    log(str(apply(|x: int| c.get() + x, 10)))
 main()
 "#);
-    assert_eq!(
-        l,
-        ["2", "spawn(): argument 1 is local (`Cell`) and cannot be sent to another thread", "5"]
-    );
+    assert_eq!(l, ["2", "5", "12"]);
+    let e = err("from geom import Cell\ndef show(x: Cell) -> int:\n    x.get()\ndef main() -> ():\n    spawn(show, Cell(1))\nmain()\n");
+    assert!(e.contains("spawn(): argument 1 is local (`geom.Cell`) and cannot be sent to another thread"), "{e}");
     let e = err("from geom import Cell\nshared = Cell(1)\n");
-    assert!(e.contains("cannot store local `Cell` in module variable `shared`"), "{e}");
+    assert!(e.contains("cannot store local `geom.Cell` in module variable `shared`"), "{e}");
 }

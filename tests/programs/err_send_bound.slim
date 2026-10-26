@@ -1,0 +1,9 @@
+# A type parameter may be local, so generic code needs `T: Send` to send a
+# `T` to another thread.
+def work(x: any) -> ():
+    print(x)
+
+def run<T>(x: T + keep) -> Thread:
+    spawn(work, x)
+
+run(1).join()

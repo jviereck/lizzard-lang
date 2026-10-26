@@ -54,12 +54,13 @@ pub struct RtType {
     /// container type, which stands for any container of that kind.
     pub args: Box<[Value]>,
     pub name: String,
-    /// Values of this type are confined to the thread that created them
-    /// (`+ local`, a local type argument, or a class with a local field).
+    /// Values of this type may be confined to the thread that created them:
+    /// a class implementing `Local` (or with a local field), a type with a
+    /// local type argument, or an erased type written `+ Local`.
     pub local: bool,
     /// The type's own value (set when it is interned).
     this: OnceLock<Value>,
-    /// The same type with every explicit `+ local` removed.
+    /// The same type without an explicit `+ Local` (erased types only).
     base: OnceLock<Value>,
     list_of: OnceLock<Value>,
     option_of: OnceLock<Value>,
@@ -111,10 +112,18 @@ fn implied_local(ctor: Ctor, args: &[Value]) -> bool {
         })
 }
 
-/// `ctor<args>`, local if `explicit` (`+ local`) or if implied by its parts.
+/// Types that do not show what their values hold: only these can be made
+/// local explicitly (`any + Local`); other types are local by their parts.
+pub fn erased(c: Ctor) -> bool {
+    matches!(c, Ctor::Any | Ctor::Function | Ctor::Iterator | Ctor::Trait(_))
+}
+
+/// `ctor<args>`, local if implied by its parts, or if `explicit` (`+ Local`)
+/// on an erased type.
 pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
-    let implied = implied_local(ctor, args);
-    let local = can_be_local(ctor) && (explicit || implied);
+    let implied = can_be_local(ctor) && implied_local(ctor, args);
+    let explicit = explicit && erased(ctor);
+    let local = explicit || implied;
     let key = (ctor, args.iter().map(|a| a.0).collect::<Box<[u64]>>(), local);
     if let Some(v) = table().read().unwrap().get(&key) {
         return *v;
@@ -139,21 +148,14 @@ pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
     v
 }
 
-/// The local version of `t` (`t + local`); `t` itself if it cannot be local.
+/// `t + Local` for an erased type; `t` itself for any other type.
 pub fn local_of(t: &RtType) -> Value {
     intern_with(t.ctor, &t.args, true)
 }
 
-/// `t` without explicit locality (also in its arguments): annotations on
-/// parameters and variables compare types this way.
-pub fn base(t: &RtType) -> &'static RtType {
-    let v = *t.base.get_or_init(|| {
-        if !t.local && t.args.iter().all(|a| !as_type(*a).unwrap().local) {
-            return t.value();
-        }
-        let args: Vec<Value> = t.args.iter().map(|a| base(as_type(*a).unwrap()).value()).collect();
-        intern_with(t.ctor, &args, false)
-    });
+/// `t` without an explicit `+ Local`.
+fn base(t: &RtType) -> &'static RtType {
+    let v = *t.base.get_or_init(|| if t.local && erased(t.ctor) { intern_with(t.ctor, &t.args, false) } else { t.value() });
     as_type(v).unwrap()
 }
 
@@ -162,10 +164,7 @@ fn type_name(ctor: Ctor, args: &[Value], show_local: bool) -> String {
     if !show_local {
         return n;
     }
-    match n.strip_suffix('>') {
-        Some(head) => format!("{head} + local>"),
-        None => format!("{n}<+local>"),
-    }
+    format!("{n} + Local")
 }
 
 fn type_name_plain(ctor: Ctor, args: &[Value]) -> String {
@@ -248,6 +247,7 @@ pub fn impls_of(t: &RtType) -> &[Value] {
 /// `Iterable<int>`). The builtin traits are structural; user traits are
 /// satisfied by classes that implement them with the same type arguments.
 pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
+    let tr = base(tr);
     let Ctor::Trait(trv) = tr.ctor else { return false };
     let Some(trait_) = trv.as_trait() else { return false };
     let class = match t.ctor {
@@ -258,6 +258,8 @@ pub fn satisfies(t: &RtType, tr: &RtType) -> bool {
     // Tuples (and `Option`s, for hashing) qualify when all their parts do.
     let parts = || !t.is_bare() && t.args.iter().all(|a| satisfies(as_type(*a).unwrap(), tr));
     match trait_.name.as_str() {
+        "Send" => !t.local,
+        "Local" => t.local,
         "Ord" => match t.ctor {
             Ctor::Int | Ctor::Float | Ctor::BigInt | Ctor::Bool | Ctor::Str => true,
             Ctor::Tuple => parts(),
@@ -447,7 +449,14 @@ pub fn type_of(v: Value) -> Value {
         Some(Body::Array(a)) => prim(Ctor::Array(Some(a.elem))),
         Some(Body::Instance(i)) => i.ty,
         Some(Body::Native(n)) => n.ty,
-        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Instantiated { .. }) => prim(Ctor::Function),
+        Some(Body::Function(_) | Body::Builtin(_) | Body::BoundMethod { .. } | Body::Instantiated { .. }) => {
+            let f = prim(Ctor::Function);
+            if v.is_local() {
+                local_of(as_type(f).unwrap())
+            } else {
+                f
+            }
+        }
         Some(Body::Lock(_)) => prim(Ctor::Lock),
         Some(Body::Thread(_)) => prim(Ctor::Thread),
         _ => any(),
@@ -462,6 +471,11 @@ pub fn type_of(v: Value) -> Value {
 /// a `list<float>` or `list<any>`; a bare `list` accepts every list. The
 /// numeric tower lets an `int` stand where a `float` is expected.
 pub fn has_type(v: Value, t: &RtType) -> bool {
+    has_shape(v, t) && local_ok(v, t)
+}
+
+/// `has_type` without the locality check (for error messages).
+pub fn has_shape(v: Value, t: &RtType) -> bool {
     if v.is_dead() {
         return false;
     }
@@ -519,24 +533,25 @@ pub fn has_type(v: Value, t: &RtType) -> bool {
     }
 }
 
-/// `a` (a type value) is `t`, ignoring explicit locality.
+/// The type of a value, `a`, is `t`; `X + Local` also accepts an `X`.
 #[inline]
 fn same(a: Value, t: &RtType) -> bool {
-    as_type(a).is_some_and(|a| std::ptr::eq(a, t) || std::ptr::eq(base(a), base(t)))
+    as_type(a).is_some_and(|a| std::ptr::eq(a, t) || (t.local && std::ptr::eq(base(a), base(t))))
 }
 
-/// Whether `v` may be stored in a heap slot of type `t`: a local value only
-/// goes into a local slot.
+/// Locality allows `v` where `t` is expected: a non-local erased type
+/// (`any`, `function`, `Iterator<T>`, a trait) does not accept a local value.
+/// (Other types are local exactly when their values are.)
 #[inline]
 pub fn local_ok(v: Value, t: &RtType) -> bool {
-    t.local || !v.is_local()
+    t.local || !erased(t.ctor) || !v.is_local()
 }
 
 /// Converts an owned value for storage as an element of type `t`: checks it
 /// and coerces an `int` stored as a `float`. Returns `None` (leaving `v`
 /// untouched) if the value does not have the type.
 pub fn admit(v: Value, t: &RtType) -> Option<Value> {
-    if !has_type(v, t) || !local_ok(v, t) {
+    if !has_type(v, t) {
         return None;
     }
     let float_slot = match t.ctor {

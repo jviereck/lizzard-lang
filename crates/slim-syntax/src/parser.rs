@@ -616,24 +616,27 @@ impl Parser {
             return Ok(TypeExpr::Unit(span));
         }
         let (name, span) = self.name("a type")?;
-        let (args, local) = if self.eat(&Tok::Lt) { self.angle_args()? } else { (Vec::new(), false) };
+        let args = if self.eat(&Tok::Lt) { self.angle_args()? } else { Vec::new() };
         let t = TypeExpr::Named(name, args, span);
-        Ok(if local { TypeExpr::Local(Box::new(t)) } else { t })
+        // `T + Local`: an erased type that may hold local values. (`+ keep`
+        // after a parameter's type is left to the caller.)
+        if self.at(&Tok::Plus) && matches!(self.peek_at(1), Tok::Name(n) if n == "Local") {
+            self.advance();
+            self.advance();
+            return Ok(TypeExpr::Local(Box::new(t)));
+        }
+        Ok(t)
     }
 
-    /// The rest of `<A, B + local>` after the `<`: the type arguments and
-    /// whether a trailing `+ local` makes the enclosing type local.
-    fn angle_args(&mut self) -> R<(Vec<TypeExpr>, bool)> {
+    /// The rest of `<A, B>` after the `<`.
+    fn angle_args(&mut self) -> R<Vec<TypeExpr>> {
         let mut args = Vec::new();
-        let mut local = false;
         loop {
-            if self.eat(&Tok::Plus) {
-                let (m, sp) = self.name("`local` after `+`")?;
-                if m != "local" {
-                    return Err(Error::syntax(format!("unknown type modifier `{m}` (only `+ local` is allowed here)"), sp));
-                }
-                local = true;
-                break;
+            if self.at(&Tok::Plus) {
+                return Err(Error::syntax(
+                    "`+ local` was removed: a class is local by implementing `Local` (`class Counter(impl Local)`), and erased types are written `any + Local`",
+                    self.span(),
+                ));
             }
             args.push(self.type_expr()?);
             if !self.eat(&Tok::Comma) {
@@ -644,7 +647,7 @@ impl Parser {
             }
         }
         self.close_angle()?;
-        Ok((args, local))
+        Ok(args)
     }
 
     /// Consumes one `>`, splitting `>>` and `>=` tokens when needed.
@@ -929,8 +932,8 @@ impl Parser {
                 Tok::ColonColon => {
                     let span = self.advance().span;
                     self.expect(&Tok::Lt, "`<` after `::` (type arguments: `f::<T>`)")?;
-                    let (args, local) = self.angle_args()?;
-                    e = Expr { kind: ExprKind::TypeApp(Box::new(e), args, local), span };
+                    let args = self.angle_args()?;
+                    e = Expr { kind: ExprKind::TypeApp(Box::new(e), args), span };
                 }
                 _ => return Ok(e),
             }

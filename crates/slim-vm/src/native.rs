@@ -13,9 +13,9 @@
 //! - [`Module::class`] (`T: Send + Sync`): `&self` methods run concurrently
 //!   from any thread; `&mut self` methods are exclusive.
 //! - [`Module::class_send`] (`T: Send`): every method call is exclusive.
-//! - [`Module::class_local`] (any `T`): instances are local (`+ local`) to
-//!   the thread that created them, which is checked on every call
-//!   (`ThreadError`), and are dropped on that thread.
+//! - [`Module::class_local`] (any `T`): the class implements `Local`, so
+//!   instances stay on the thread that created them, which is also checked
+//!   on every call (`ThreadError`), and are dropped on that thread.
 //!
 //! A call that conflicts with a running one (a `&mut self` method while
 //! another method runs) raises `BorrowError`, or waits for it to finish if
@@ -354,7 +354,9 @@ impl SlimType for Func {
 
 impl FromSlim for Func {
     fn from_slim(v: Value) -> Result<Self, SlimError> {
-        if !rtype::has_type(v, rtype::as_type(rtype::prim(Ctor::Function)).unwrap()) {
+        // A local closure is fine: the handle is `!Send`, so it stays on
+        // this thread (the compiler types the parameter `function + Local`).
+        if !rtype::has_shape(v, rtype::as_type(rtype::prim(Ctor::Function)).unwrap()) {
             return Err(expected(NType::Function, v));
         }
         Ok(Func(Handle::borrow(v)))
@@ -1073,12 +1075,19 @@ impl NativeObj {
     }
 
     /// Drops the Rust value (when the object is freed). A local object is
-    /// only dropped on its owner thread; elsewhere it is leaked.
+    /// only dropped on its owner thread: locality guarantees it is freed
+    /// there, so anything else is a VM bug. Debug builds panic; release
+    /// builds leak the value with a warning (dropping it would be unsound).
     pub(crate) fn release(&mut self) {
         let data = self.data.get_mut().take();
         if self.class().mode == Mode::Local && std::thread::current().id() != self.owner {
-            eprintln!("warning: native `{}` object freed off its owner thread; leaked", self.class().name);
+            // Forgotten first, so a panic cannot drop it on this thread.
             std::mem::forget(data);
+            let name = &self.class().name;
+            if cfg!(debug_assertions) {
+                panic!("native `{name}` object freed off its owner thread");
+            }
+            eprintln!("warning: native `{name}` object freed off its owner thread; leaked");
         }
     }
 

@@ -962,8 +962,7 @@ fn unify(th: &Thread, d: &TypeDesc, t: &'static rtype::RtType, regs: &mut [Value
     match d {
         TypeDesc::Param(r, _) => {
             if regs[*r as usize] == Value::UNINIT {
-                // Locality is not part of an inferred type argument.
-                regs[*r as usize] = rtype::base(t).value();
+                regs[*r as usize] = t.value();
             }
         }
         TypeDesc::Local(inner) => unify(th, inner, t, regs),
@@ -1283,7 +1282,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         .iter()
         .map(|f| Field::new(f.name.clone(), f.ty.clone(), slot_kind(&f.ty)))
         .collect();
-    let always_local = s.fields.iter().any(|f| f.ty.mentions_local());
+    let always_local = s.local;
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
     Ok(Obj::alloc_immortal(Body::Class(Class {
         name: s.name.clone(),
@@ -1465,16 +1464,12 @@ fn check_store(th: &mut Thread, inst: &Instance, i: usize, v: Value, mode: Store
     }
     let t = types::field_type(th, inst, i)?;
     if !rtype::has_type(v, t) {
-        return Err(th.raise(
-            "TypeError",
-            format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, t.name, types::value_type_name(v)),
-        ));
-    }
-    if !rtype::local_ok(v, t) {
-        return Err(th.raise(
-            "TypeError",
-            format!("cannot store local `{}` in non-local field `{}.{}` of type `{}`", types::value_type_name(v), class.name, f.name, t.name),
-        ));
+        let msg = if rtype::has_shape(v, t) {
+            format!("cannot store local `{}` in field `{}.{}` of non-local type `{}`", types::value_type_name(v), class.name, f.name, t.name)
+        } else {
+            format!("field `{}.{}` expected `{}`, got `{}`", class.name, f.name, t.name, types::value_type_name(v))
+        };
+        return Err(th.raise("TypeError", msg));
     }
     if mode == StoreMode::Copy && !v.is_copy() {
         return Err(th.raise(

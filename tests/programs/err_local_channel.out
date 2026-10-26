@@ -1,5 +1,5 @@
   File "err_local_channel.slim", line 8
-        ch: Channel<Counter<+local>> = Channel()
+        ch: Channel<Counter> = Channel()
             ^
-TypeError: `Channel<Counter<+local>>`: channels connect threads and cannot carry local values
+TypeError: `Channel<Counter>`: channels connect threads and cannot carry local values
 [exit 1]

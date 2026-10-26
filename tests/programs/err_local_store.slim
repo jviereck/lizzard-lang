@@ -1,13 +1,13 @@
-# A local value cannot be stored in a non-local container: another thread
-# could reach it through the container.
-class Counter:
+# A local value cannot be stored where a non-local `any` is expected:
+# another thread could reach it through the container.
+class Counter(impl Local):
     n: int
     def __init__(self) -> ():
         self.n = 0
 
 def main() -> ():
-    mine = Counter::<+local>()
-    shared: dict<str, Counter> = {}
+    mine = Counter()
+    shared: dict<str, any> = {}
     shared["c"] <- mine
 
 main()

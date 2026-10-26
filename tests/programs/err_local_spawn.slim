@@ -1,6 +1,6 @@
-# A closure that captures a local value is local, so it cannot run on
-# another thread.
-class Counter:
+# A closure that captures a local value is local (`function + Local`), so it
+# cannot run on another thread.
+class Counter(impl Local):
     n: int
     def __init__(self) -> ():
         self.n = 0
@@ -9,7 +9,7 @@ class Counter:
         self.n
 
 def main() -> ():
-    c = Counter::<+local>()
+    c = Counter()
     work = || c.inc()
     print(work())
     spawn(work).join()

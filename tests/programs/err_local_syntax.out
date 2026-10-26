@@ -1,0 +1,5 @@
+  File "err_local_syntax.slim", line 8
+    c: Counter<+local> = Counter()
+               ^
+SyntaxError: `+ local` was removed: a class is local by implementing `Local` (`class Counter(impl Local)`), and erased types are written `any + Local`
+[exit 1]

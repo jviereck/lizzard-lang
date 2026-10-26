@@ -1,16 +1,18 @@
 Counter(n=2) 1 2
 1
+1 2
 3 3
-['a', 'b']
-1
-error: cannot store local `Counter<+local>` in non-local `list<Counter>`
-error: cannot store local `Counter<+local>` in non-local field `Box.value` of type `Counter`
-non-local counter in a local slot: 1
-error: spawn(): argument 1 is local (`Counter<+local>`) and cannot be sent to another thread
-error: spawn(): the function is local (`function`) and cannot be sent to another thread
+5
+got Counter(n=3)
+got 5
+12
 104
-error: the thread's result is local (`Counter<+local>`) and cannot leave its thread
-error: generator `ticks` is not local and cannot keep local `Counter<+local>` across a `yield`
-error: cannot store local `Counter<+local>` in module variable `shared` (module variables are shared between threads)
+2
+tick 1
+tick 2
+49
+36
+error: cannot store local `Counter` in `list<any>`
+0
 rc-audit: ok
 [exit 0]

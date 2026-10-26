@@ -1,0 +1,5 @@
+  File "err_send_channel.slim", line 3
+        jobs: Channel<T>
+        ^
+TypeError: `Channel<T>`: `T` may be local, and channels connect threads; add a `T: Send` bound
+[exit 1]

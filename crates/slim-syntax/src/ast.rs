@@ -73,8 +73,7 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     /// `f::<T, U>`: explicit type arguments.
-    /// `name::<args>`; the flag is a trailing `+ local` (`Counter::<+local>`).
-    TypeApp(Box<Expr>, Vec<TypeExpr>, bool),
+    TypeApp(Box<Expr>, Vec<TypeExpr>),
     /// `expr++`: a new counted reference.
     Dup(Box<Expr>),
     Unary(UnOp, Box<Expr>),
@@ -227,7 +226,8 @@ pub enum TypeExpr {
     Unit(Span),
     /// `Name` or `Name<args>`
     Named(String, Vec<TypeExpr>, Span),
-    /// `Name<args + local>` / `Name<+local>`: the local version of a type.
+    /// `T + Local`: an erased type (`any`, `function`, `Iterator<T>`, a
+    /// trait) that may hold local values.
     Local(Box<TypeExpr>),
 }
 
@@ -244,13 +244,7 @@ impl std::fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TypeExpr::Unit(_) => f.write_str("()"),
-            TypeExpr::Local(t) => {
-                let s = t.to_string();
-                match s.strip_suffix('>') {
-                    Some(head) => write!(f, "{head} + local>"),
-                    None => write!(f, "{s}<+local>"),
-                }
-            }
+            TypeExpr::Local(t) => write!(f, "{t} + Local"),
             TypeExpr::Named(n, args, _) => {
                 f.write_str(n)?;
                 if !args.is_empty() {

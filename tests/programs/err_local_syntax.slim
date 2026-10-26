@@ -1,0 +1,8 @@
+# The `+local` modifier of earlier versions is gone: a class is local by
+# implementing `Local`.
+class Counter:
+    n: int
+    def __init__(self) -> ():
+        self.n = 0
+
+c: Counter<+local> = Counter()

@@ -266,7 +266,7 @@ impl Rewriter<'_> {
                 self.expr(f)?;
                 args.iter_mut().try_for_each(|a| self.expr(a))
             }
-            ExprKind::TypeApp(f, ts, _) => {
+            ExprKind::TypeApp(f, ts) => {
                 ts.iter_mut().for_each(|t| self.ty(t));
                 self.expr(f)
             }
