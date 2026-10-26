@@ -1,0 +1,8 @@
+freed while pinned: 0
+freed after revive: 0
+freed after call: 0
+still alive: ab
+drop ab
+freed after del: 2
+rc-audit: ok
+[exit 0]

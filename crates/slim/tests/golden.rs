@@ -13,6 +13,7 @@ fn run_program(name: &str) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_slim"))
         .arg(name)
         .arg("--rc-audit")
+        .env("SLIM_POISON", "1")
         .current_dir(programs_dir())
         .output()
         .expect("failed to run slim");

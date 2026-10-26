@@ -7,7 +7,7 @@ use crate::backend::interp::Interp;
 use crate::backend::Exit;
 use crate::code::{Code, Reg};
 use crate::display;
-use crate::object::Body;
+use crate::object::{Body, FreeCheck, Obj};
 use crate::ops::dispatch;
 use crate::rc;
 use crate::value::Value;
@@ -162,17 +162,27 @@ impl Thread {
         for v in rc::take_deferred(h) {
             v.decref();
         }
+        rc::free_retired(h);
         let mut freed = 0;
         while limit.is_none_or(|l| freed < l) {
             let Some(p) = rc::pop_ready(h) else { break };
-            // SAFETY: the object's count reached zero, it is unreachable and
-            // its grace period passed; only this thread holds the pointer.
+            // SAFETY: the object was queued when its count reached zero and
+            // its grace period passed, so no borrow taken before that can be
+            // live; `free_check` catches borrows that revived it since.
             let obj = unsafe { &mut *p };
+            match obj.free_check() {
+                FreeCheck::Free => {}
+                FreeCheck::Requeue => {
+                    rc::requeue(p);
+                    continue;
+                }
+                FreeCheck::Skip => continue,
+            }
             if let Body::Instance(inst) = &obj.body {
                 if let Some(&m) = inst.class().methods.get("__drop__") {
                     let me = Value(p as u64);
                     // Hold a temporary reference while the destructor runs.
-                    me.incref_raw_from_zero();
+                    obj.hold_for_drop();
                     let saved = self.exc.take();
                     match crate::helpers::call_simple(self, m, Some(me), &[]) {
                         Ok(v) => v.decref(),
@@ -190,7 +200,7 @@ impl Thread {
                         }
                     }
                     self.exc = saved;
-                    if !me.release_raw_to_zero() {
+                    if !obj.release_after_drop() {
                         // Resurrected: the destructor stored a new reference.
                         continue;
                     }
@@ -199,8 +209,14 @@ impl Thread {
             rc::set_cascade(true);
             obj.release_children();
             rc::set_cascade(false);
-            // SAFETY: allocated by `Obj::alloc` as a Box.
-            drop(unsafe { Box::from_raw(p) });
+            #[cfg(debug_assertions)]
+            let leak = Obj::poison(p);
+            #[cfg(not(debug_assertions))]
+            let leak = false;
+            if !leak {
+                // SAFETY: allocated by `Obj::alloc` as a Box.
+                drop(unsafe { Box::from_raw(p) });
+            }
             rc::note_free();
             freed += 1;
         }
@@ -210,28 +226,6 @@ impl Thread {
     pub fn maybe_auto_rc(&mut self) {
         if self.rc_auto && rc::pending_count() > self.rc_threshold && rc::has_ready_work() {
             self.rc_run(Some(self.rc_threshold));
-        }
-    }
-}
-
-impl Value {
-    /// Gives a zero-count object a temporary reference (destructor call).
-    fn incref_raw_from_zero(self) {
-        if let Some(o) = self.obj() {
-            o.incref();
-        }
-    }
-
-    /// Drops the temporary reference; returns true if the count is zero again
-    /// (the object can be freed).
-    fn release_raw_to_zero(self) -> bool {
-        let o = self.obj().unwrap();
-        if o.refcount() == 1 {
-            o.set_rc(0);
-            true
-        } else {
-            o.set_rc(o.refcount() - 1);
-            false
         }
     }
 }

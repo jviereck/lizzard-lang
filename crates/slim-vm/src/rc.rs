@@ -37,14 +37,24 @@ static THREADS: Mutex<Vec<Arc<ThreadRec>>> = Mutex::new(Vec::new());
 struct Orphans {
     pending: Vec<(u64, usize)>,
     deferred: Vec<(u64, Value)>,
+    retired: Vec<(u64, Retired)>,
 }
 
-static ORPHANS: Mutex<Orphans> = Mutex::new(Orphans { pending: Vec::new(), deferred: Vec::new() });
+static ORPHANS: Mutex<Orphans> =
+    Mutex::new(Orphans { pending: Vec::new(), deferred: Vec::new(), retired: Vec::new() });
+
+/// Raw memory (an old list buffer or dict table) that lock-free readers may
+/// still be reading; freed without touching the values it contains.
+pub struct Retired {
+    ptr: usize,
+    free: unsafe fn(usize),
+}
 
 struct RcState {
     rec: Arc<ThreadRec>,
     pending: VecDeque<(u64, *mut Obj)>,
     deferred: Vec<(u64, Value)>,
+    retired: Vec<(u64, Retired)>,
     pins: Vec<u64>,
     cascade: Vec<*mut Obj>,
     in_cascade: bool,
@@ -57,7 +67,7 @@ impl RcState {
             min_pin: AtomicU64::new(u64::MAX),
         });
         THREADS.lock().unwrap().push(rec.clone());
-        RcState { rec, pending: VecDeque::new(), deferred: Vec::new(), pins: Vec::new(), cascade: Vec::new(), in_cascade: false }
+        RcState { rec, pending: VecDeque::new(), deferred: Vec::new(), retired: Vec::new(), pins: Vec::new(), cascade: Vec::new(), in_cascade: false }
     }
 }
 
@@ -68,6 +78,7 @@ impl Drop for RcState {
         o.pending.extend(self.pending.drain(..).map(|(e, p)| (e, p as usize)));
         o.pending.extend(self.cascade.drain(..).map(|p| (0, p as usize)));
         o.deferred.append(&mut self.deferred);
+        o.retired.append(&mut self.retired);
     }
 }
 
@@ -112,6 +123,56 @@ pub fn defer_decref(v: Value) {
     }
     let e = epoch();
     let _ = RC.try_with(|rc| rc.borrow_mut().deferred.push((e, v)));
+}
+
+/// Puts an object revived from zero back into the pending queue with a new
+/// stamp, so borrows taken since it was first queued end before it is freed.
+pub(crate) fn requeue(p: *mut Obj) {
+    let e = epoch();
+    RC.with(|rc| rc.borrow_mut().pending.push_back((e, p)));
+}
+
+/// Frees `ptr` with `free` once no lock-free reader can still hold it.
+///
+/// # Safety
+/// `free(ptr)` must be sound to call once, from any thread, after every
+/// borrow taken before now has ended.
+pub unsafe fn retire(ptr: usize, free: unsafe fn(usize)) {
+    let e = epoch();
+    if RC.try_with(|rc| rc.borrow_mut().retired.push((e, Retired { ptr, free }))).is_err() {
+        // The thread is exiting: hand the memory to the orphan queue.
+        ORPHANS.lock().unwrap().retired.push((e, Retired { ptr, free }));
+    }
+}
+
+/// Frees retired memory whose grace period passed.
+pub(crate) fn free_retired(h: u64) {
+    let mut ready = Vec::new();
+    {
+        let mut o = ORPHANS.lock().unwrap();
+        o.retired.retain(|(e, r)| {
+            if *e < h {
+                ready.push(Retired { ptr: r.ptr, free: r.free });
+                false
+            } else {
+                true
+            }
+        });
+    }
+    RC.with(|rc| {
+        rc.borrow_mut().retired.retain(|(e, r)| {
+            if *e < h {
+                ready.push(Retired { ptr: r.ptr, free: r.free });
+                false
+            } else {
+                true
+            }
+        })
+    });
+    for r in ready {
+        // SAFETY: guaranteed by the caller of `retire`.
+        unsafe { (r.free)(r.ptr) };
+    }
 }
 
 /// Hands a fresh object to the epoch system: it stays alive until the next
@@ -237,14 +298,14 @@ pub(crate) fn pop_ready(h: u64) -> Option<*mut Obj> {
 pub fn pending_count() -> usize {
     RC.with(|rc| {
         let rc = rc.borrow();
-        rc.pending.len() + rc.deferred.len()
+        rc.pending.len() + rc.deferred.len() + rc.retired.len()
     })
 }
 
 /// Total entries still queued anywhere (this thread and exited threads).
 pub fn total_pending() -> usize {
     let o = ORPHANS.lock().unwrap();
-    pending_count() + o.pending.len() + o.deferred.len()
+    pending_count() + o.pending.len() + o.deferred.len() + o.retired.len()
 }
 
 pub(crate) fn has_ready_work() -> bool {

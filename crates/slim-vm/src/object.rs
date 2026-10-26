@@ -11,6 +11,25 @@ use crate::interp::{Raised, Thread};
 use crate::value::Value;
 
 const IMMORTAL: u64 = 1 << 63;
+/// Set by an increment from zero: a borrow of shared memory revived an object
+/// that is queued for freeing, so `rc_run` must wait for a new grace period.
+const REVIVED: u64 = 1 << 62;
+/// The object has an entry in a pending-free queue.
+const QUEUED: u64 = 1 << 61;
+const FLAGS: u64 = IMMORTAL | REVIVED | QUEUED;
+/// Count word of a freed object in poison mode (`SLIM_POISON=1`, debug builds).
+#[cfg(debug_assertions)]
+const POISONED: u64 = 0x0BAD_F00D_DEAD_0000;
+
+/// What `rc_run` should do with a dequeued object.
+pub(crate) enum FreeCheck {
+    /// The count is zero and no borrow revived it: free it.
+    Free,
+    /// Revived from zero: wait for a new grace period.
+    Requeue,
+    /// Live again (owned by someone); its next drop to zero queues it anew.
+    Skip,
+}
 
 #[repr(C)]
 pub struct Obj {
@@ -144,6 +163,20 @@ impl Instance {
     }
 }
 
+#[cfg(debug_assertions)]
+fn poison_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SLIM_POISON").is_some_and(|v| v != "0"))
+}
+
+#[cfg(debug_assertions)]
+#[inline(always)]
+fn check_poison(w: u64) {
+    if w == POISONED {
+        panic!("use after free: refcount operation on a freed object");
+    }
+}
+
 impl Obj {
     pub fn alloc(body: Body) -> Value {
         let b = Box::new(Obj { rc: AtomicU64::new(1), body });
@@ -163,31 +196,93 @@ impl Obj {
         self.rc.load(Ordering::Relaxed) & IMMORTAL != 0
     }
 
-    pub(crate) fn set_rc(&self, n: u64) {
-        self.rc.store(n, Ordering::Relaxed);
-    }
-
     pub fn refcount(&self) -> u64 {
-        self.rc.load(Ordering::Relaxed) & !IMMORTAL
+        self.rc.load(Ordering::Relaxed) & !FLAGS
     }
 
     #[inline(always)]
     pub fn incref(&self) {
-        if !self.is_immortal() {
-            self.rc.fetch_add(1, Ordering::Relaxed);
+        let old = self.rc.load(Ordering::Relaxed);
+        if old & IMMORTAL != 0 {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        check_poison(old);
+        let old = self.rc.fetch_add(1, Ordering::Relaxed);
+        if old & !FLAGS == 0 {
+            self.rc.fetch_or(REVIVED, Ordering::Relaxed);
         }
     }
 
     /// Decrements the count; an object reaching zero is queued for `rc_run`.
     #[inline(always)]
     pub fn decref(&self) {
-        if self.is_immortal() {
+        let w = self.rc.load(Ordering::Relaxed);
+        if w & IMMORTAL != 0 {
             return;
         }
-        if self.rc.fetch_sub(1, Ordering::Release) == 1 {
+        #[cfg(debug_assertions)]
+        check_poison(w);
+        let old = self.rc.fetch_sub(1, Ordering::Release);
+        if old & !FLAGS == 1 {
             fence(Ordering::Acquire);
-            crate::rc::enqueue_free(self as *const Obj as *mut Obj);
+            if self.rc.fetch_or(QUEUED, Ordering::AcqRel) & QUEUED == 0 {
+                crate::rc::enqueue_free(self as *const Obj as *mut Obj);
+            }
         }
+    }
+
+    /// Decides the fate of an object popped from a pending-free queue whose
+    /// grace period passed.
+    pub(crate) fn free_check(&self) -> FreeCheck {
+        loop {
+            let w = self.rc.load(Ordering::Acquire);
+            let (new, verdict) = if w & !FLAGS > 0 {
+                (w & !(QUEUED | REVIVED), FreeCheck::Skip)
+            } else if w & REVIVED != 0 {
+                (w & !REVIVED, FreeCheck::Requeue)
+            } else {
+                return FreeCheck::Free;
+            };
+            if self.rc.compare_exchange(w, new, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return verdict;
+            }
+        }
+    }
+
+    /// Gives a zero-count object a temporary reference while its destructor
+    /// runs, without marking it revived.
+    pub(crate) fn hold_for_drop(&self) {
+        self.rc.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drops the destructor's temporary reference. Returns true if the object
+    /// can be freed; false if the destructor stored a new reference (the
+    /// object is live again and no longer queued).
+    pub(crate) fn release_after_drop(&self) -> bool {
+        loop {
+            let w = self.rc.load(Ordering::Acquire);
+            let new = if w & !FLAGS == 1 { w & !REVIVED & !1 } else { (w - 1) & !(QUEUED | REVIVED) };
+            if self.rc.compare_exchange(w, new, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return w & !FLAGS == 1;
+            }
+        }
+    }
+
+    /// Marks freed memory in poison mode; returns true if the memory must be
+    /// leaked instead of returned to the allocator.
+    #[cfg(debug_assertions)]
+    pub(crate) fn poison(p: *mut Obj) -> bool {
+        if !poison_enabled() {
+            return false;
+        }
+        // SAFETY: the object is unreachable; its body was already released.
+        unsafe {
+            std::ptr::drop_in_place(&mut (*p).body);
+            std::ptr::write(&mut (*p).body, Body::Int(0));
+            (*p).rc.store(POISONED, Ordering::Relaxed);
+        }
+        true
     }
 
     /// Releases all references held by the object (called by `rc_run` just
