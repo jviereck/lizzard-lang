@@ -129,10 +129,10 @@ pub extern "C" fn add(th: &mut Thread, a: Value, b: Value) -> Value {
     }
     match (a.body(), b.body()) {
         (Some(Body::List(x)), Some(Body::List(y))) => {
-            let mut out: Vec<Value> = x.lock().unwrap().clone();
-            out.extend(y.lock().unwrap().iter().copied());
+            let mut out: Vec<Value> = x.snapshot();
+            out.extend(y.snapshot());
             out.iter().for_each(|v| v.incref());
-            return Obj::alloc(Body::List(std::sync::Mutex::new(out)));
+            return Obj::list(out);
         }
         (Some(Body::Tuple(x)), Some(Body::Tuple(y))) => {
             let out: Vec<Value> = x.iter().chain(y.iter()).copied().collect();
@@ -156,13 +156,13 @@ pub extern "C" fn mul(th: &mut Thread, a: Value, b: Value) -> Value {
             return Some(Value::str(st.repeat(n)));
         }
         if let Some(Body::List(l)) = s.body() {
-            let items = l.lock().unwrap();
+            let items = l.snapshot();
             let mut out = Vec::with_capacity(items.len() * n);
             for _ in 0..n {
                 out.extend(items.iter().copied());
             }
             out.iter().for_each(|v| v.incref());
-            return Some(Obj::alloc(Body::List(std::sync::Mutex::new(out))));
+            return Some(Obj::list(out));
         }
         None
     };
@@ -351,7 +351,7 @@ pub fn is_truthy(th: &mut Thread, v: Value) -> VResult<bool> {
         Some(Body::BigInt(b)) => !b.is_zero(),
         Some(Body::Str(s)) => !s.is_empty(),
         Some(Body::Tuple(t)) => !t.is_empty(),
-        Some(Body::List(l)) => !l.lock().unwrap().is_empty(),
+        Some(Body::List(l)) => !l.is_empty(),
         _ => true,
     })
 }
@@ -385,7 +385,7 @@ pub fn values_eq(a: Value, b: Value) -> bool {
             if std::ptr::eq(x, y) {
                 return true;
             }
-            let (x, y) = (x.lock().unwrap().clone(), y.lock().unwrap().clone());
+            let (x, y) = (x.snapshot(), y.snapshot());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_eq(*p, *q))
         }
         _ => false,
@@ -406,7 +406,7 @@ fn order(th: &mut Thread, op: &str, a: Value, b: Value) -> VResult<std::cmp::Ord
         (Some(Body::Str(x)), Some(Body::Str(y))) => Ok(x.cmp(y)),
         (Some(Body::Tuple(x)), Some(Body::Tuple(y))) => seq_order(th, op, x, y),
         (Some(Body::List(x)), Some(Body::List(y))) => {
-            let (x, y) = (x.lock().unwrap().clone(), y.lock().unwrap().clone());
+            let (x, y) = (x.snapshot(), y.snapshot());
             seq_order(th, op, &x, &y)
         }
         _ => {
@@ -470,10 +470,9 @@ fn contains_impl(th: &mut Thread, item: Value, container: Value) -> VResult<bool
         },
         Some(Body::Tuple(t)) => Ok(t.iter().any(|v| values_eq(*v, item))),
         Some(Body::List(l)) => {
-            let items = l.lock().unwrap().clone();
-            Ok(items.iter().any(|v| values_eq(*v, item)))
+            Ok(l.snapshot().iter().any(|v| values_eq(*v, item)))
         }
-        Some(Body::Dict(d)) => Ok(d.lock().unwrap().get(item).is_some()),
+        Some(Body::Dict(d)) => Ok(d.get(item).is_some()),
         _ => Err(th.raise("TypeError", format!("argument of type '{}' is not iterable", container.type_name()))),
     }
 }
@@ -1194,15 +1193,23 @@ pub extern "C" fn f_swap_field(th: &mut Thread, frame: &mut Frame, dst: u32, obj
 
 // ---------------------------------------------------------------- elements
 
-fn index_of(th: &mut Thread, idx: Value, len: usize) -> VResult<usize> {
-    let Some(i) = idx.as_int() else {
-        return Err(th.raise("TypeError", format!("indices must be integers, not '{}'", idx.type_name())));
-    };
-    let j = if i < 0 { i + len as i64 } else { i };
-    if j < 0 || j >= len as i64 {
-        return Err(th.raise("IndexError", "index out of range"));
+/// Checks an index against `len`. Negative indexes are errors (no
+/// wrap-around), so this is a single unsigned compare.
+pub(crate) fn index_of(th: &mut Thread, idx: Value, len: usize, what: &str) -> VResult<usize> {
+    let i = int_index(th, idx)?;
+    if (i as u64) >= len as u64 {
+        return Err(index_error(th, i, what, len));
     }
-    Ok(j as usize)
+    Ok(i as usize)
+}
+
+pub(crate) fn int_index(th: &mut Thread, idx: Value) -> VResult<i64> {
+    idx.as_int()
+        .ok_or_else(|| th.raise("TypeError", format!("indices must be integers, not '{}'", idx.type_name())))
+}
+
+pub(crate) fn index_error(th: &mut Thread, i: i64, what: &str, len: usize) -> Raised {
+    th.raise("IndexError", format!("index {i} out of range for {what} of length {len}"))
 }
 
 pub extern "C" fn f_load_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, idx: u32, _: u32) -> u32 {
@@ -1211,17 +1218,19 @@ pub extern "C" fn f_load_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     let r = (|| -> VResult<Value> {
         match o.body() {
             Some(Body::List(l)) => {
-                let items = l.lock().unwrap();
-                let i = index_of(th, k, items.len())?;
-                Ok(items[i])
+                let i = int_index(th, k)?;
+                match usize::try_from(i).ok().and_then(|i| l.get(i)) {
+                    Some(v) => Ok(v),
+                    None => Err(index_error(th, i, "list", l.len())),
+                }
             }
             Some(Body::Tuple(t)) => {
-                let i = index_of(th, k, t.len())?;
+                let i = index_of(th, k, t.len(), "tuple")?;
                 Ok(t[i])
             }
             Some(Body::Str(s)) => {
                 let chars: Vec<char> = s.chars().collect();
-                let i = index_of(th, k, chars.len())?;
+                let i = index_of(th, k, chars.len(), "str")?;
                 Ok(rc::autorelease(Value::str(chars[i].to_string())))
             }
             _ => crate::builtins::index_other(th, o, k),
@@ -1249,12 +1258,16 @@ pub extern "C" fn f_store_index(th: &mut Thread, frame: &mut Frame, obj: u32, id
         }
         match o.body() {
             Some(Body::List(l)) => {
-                let mut items = l.lock().unwrap();
-                let i = index_of(th, k, items.len())?;
-                let old = std::mem::replace(&mut items[i], v);
-                frame.set(src as Reg, Value::MOVED);
-                rc::defer_decref(old);
-                Ok(())
+                let i = int_index(th, k)?;
+                let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));
+                match old {
+                    Some(old) => {
+                        frame.set(src as Reg, Value::MOVED);
+                        rc::defer_decref(old);
+                        Ok(())
+                    }
+                    None => Err(index_error(th, i, "list", l.len())),
+                }
             }
             _ => {
                 if crate::builtins::store_index_other(th, o, k, v)? {
@@ -1276,12 +1289,16 @@ pub extern "C" fn f_swap_index(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     let r = (|| -> VResult<()> {
         match o.body() {
             Some(Body::List(l)) => {
-                let mut items = l.lock().unwrap();
-                let i = index_of(th, k, items.len())?;
-                let old = std::mem::replace(&mut items[i], v);
-                frame.set(src as Reg, Value::MOVED);
-                frame.set(dst as Reg, old);
-                Ok(())
+                let i = int_index(th, k)?;
+                let old = l.write(|w| ((i as u64) < w.len() as u64).then(|| w.set(i as usize, v)));
+                match old {
+                    Some(old) => {
+                        frame.set(src as Reg, Value::MOVED);
+                        frame.set(dst as Reg, old);
+                        Ok(())
+                    }
+                    None => Err(index_error(th, i, "list", l.len())),
+                }
             }
             _ => match crate::builtins::swap_index_other(th, o, k, v)? {
                 Some(old) => {
@@ -1317,7 +1334,7 @@ pub extern "C" fn f_build_tuple(_th: &mut Thread, frame: &mut Frame, dst: u32, a
 
 pub extern "C" fn f_build_list(_th: &mut Thread, frame: &mut Frame, dst: u32, args: u32, _: u32, _: u32) -> u32 {
     let items = take_args(frame, args);
-    frame.set(dst as Reg, Obj::alloc(Body::List(std::sync::Mutex::new(items))));
+    frame.set(dst as Reg, Obj::list(items));
     OK
 }
 
@@ -1338,7 +1355,7 @@ pub extern "C" fn f_unpack(th: &mut Thread, frame: &mut Frame, src: u32, dsts: u
     let targets = &code.arglists[dsts as usize].args;
     let items: Vec<Value> = match v.body() {
         Some(Body::Tuple(t)) => t.to_vec(),
-        Some(Body::List(l)) => l.lock().unwrap().clone(),
+        Some(Body::List(l)) => l.snapshot(),
         _ => match crate::builtins::collect(th, v) {
             Ok(items) => {
                 // `collect` returned owned items; release our extra references below.

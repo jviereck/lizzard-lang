@@ -16,6 +16,7 @@ use crate::display;
 use crate::generator;
 use crate::helpers::{self, values_eq};
 use crate::interp::{Raised, Thread, VResult};
+use crate::list::ListObj;
 use crate::object::{Body, Builtin, BuiltinFn, Class, Field, Obj, SlotKind, Trait};
 use crate::rc;
 use crate::value::Value;
@@ -65,7 +66,7 @@ pub fn get_iter(th: &mut Thread, v: Value) -> VResult<Value> {
         }
         Some(Body::Str(s)) => Ok(items_iter(s.chars().map(|c| Value::str(c.to_string())).collect())),
         Some(Body::Dict(d)) => {
-            let keys: Vec<Value> = d.lock().unwrap().entries().map(|(k, _)| k).collect();
+            let keys: Vec<Value> = d.entries().into_iter().map(|(k, _)| k).collect();
             keys.iter().for_each(|x| x.incref());
             Ok(items_iter(keys))
         }
@@ -117,14 +118,13 @@ pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
             match &mut *k {
                 IterKind::List { list, idx } => {
                     let Some(Body::List(l)) = list.body() else { unreachable!() };
-                    let items = l.lock().unwrap();
-                    if *idx < items.len() {
-                        let v = items[*idx];
-                        v.incref();
-                        *idx += 1;
-                        Ok(Some(v))
-                    } else {
-                        Ok(None)
+                    match l.get(*idx) {
+                        Some(v) => {
+                            v.incref();
+                            *idx += 1;
+                            Ok(Some(v))
+                        }
+                        None => Ok(None),
                     }
                 }
                 IterKind::Items { items } => Ok(items.next()),
@@ -190,7 +190,7 @@ fn key_error(th: &mut Thread, k: Value) -> Raised {
 }
 
 pub fn build_dict(th: &mut Thread, items: Vec<Value>) -> VResult<Value> {
-    let mut d = Dict::default();
+    let d = Dict::default();
     let mut it = items.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
         match d.insert(k, v) {
@@ -212,22 +212,16 @@ pub fn build_dict(th: &mut Thread, items: Vec<Value>) -> VResult<Value> {
             }
         }
     }
-    Ok(Obj::alloc(Body::Dict(Mutex::new(d))))
+    Ok(Obj::alloc(Body::Dict(d)))
 }
 
 /// `o[k]` for types other than list/tuple/str (borrowed result).
 pub fn index_other(th: &mut Thread, o: Value, k: Value) -> VResult<Value> {
     match o.body() {
-        Some(Body::Dict(d)) => {
-            let d = d.lock().unwrap();
-            match d.get(k) {
-                Some(v) => Ok(v),
-                None => {
-                    drop(d);
-                    Err(key_error(th, k))
-                }
-            }
-        }
+        Some(Body::Dict(d)) => match d.get(k) {
+            Some(v) => Ok(v),
+            None => Err(key_error(th, k)),
+        },
         _ => {
             if o.is_dead() {
                 return Err(th.raise("OwnershipError", "use of a moved value"));
@@ -242,20 +236,20 @@ pub fn index_other(th: &mut Thread, o: Value, k: Value) -> VResult<Value> {
 pub fn store_index_other(th: &mut Thread, o: Value, k: Value, v: Value) -> VResult<bool> {
     match o.body() {
         Some(Body::Dict(d)) => {
-            let mut d = d.lock().unwrap();
-            if let Some(old) = d.swap(k, v) {
-                rc::defer_decref(old);
-                return Ok(true);
-            }
-            if !k.is_copy() && k.as_str().is_none() && !matches!(k.body(), Some(Body::Tuple(_))) && dict_hash_check(k).is_none() {
-                drop(d);
+            if dict_hash_check(k).is_none() {
                 return Err(unhashable(th, k));
             }
             k.incref();
-            if d.insert(k, v).is_err() {
-                k.decref();
-                drop(d);
-                return Err(unhashable(th, k));
+            match d.insert(k, v) {
+                Ok(Some((dup, old))) => {
+                    dup.decref();
+                    rc::defer_decref(old);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    k.decref();
+                    return Err(unhashable(th, k));
+                }
             }
             Ok(true)
         }
@@ -269,16 +263,10 @@ fn dict_hash_check(k: Value) -> Option<u64> {
 
 pub fn swap_index_other(th: &mut Thread, o: Value, k: Value, v: Value) -> VResult<Option<Value>> {
     match o.body() {
-        Some(Body::Dict(d)) => {
-            let mut d = d.lock().unwrap();
-            match d.swap(k, v) {
-                Some(old) => Ok(Some(old)),
-                None => {
-                    drop(d);
-                    Err(key_error(th, k))
-                }
-            }
-        }
+        Some(Body::Dict(d)) => match d.swap(k, v) {
+            Some(old) => Ok(Some(old)),
+            None => Err(key_error(th, k)),
+        },
         _ => Ok(None),
     }
 }
@@ -389,8 +377,8 @@ fn b_len(th: &mut Thread, args: &[Value]) -> VResult<Value> {
     let n = match v.body() {
         Some(Body::Str(s)) => s.chars().count(),
         Some(Body::Tuple(t)) => t.len(),
-        Some(Body::List(l)) => l.lock().unwrap().len(),
-        Some(Body::Dict(d)) => d.lock().unwrap().len(),
+        Some(Body::List(l)) => l.len(),
+        Some(Body::Dict(d)) => d.len(),
         Some(Body::Channel(_)) => return crate::helpers::call_simple(th, type_method(v, "__len__").unwrap(), Some(v), &[]),
         Some(Body::Instance(inst)) if inst.class().methods.contains_key("__len__") => {
             let m = inst.class().methods["__len__"];
@@ -533,7 +521,7 @@ fn b_list(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         Some(v) => collect(th, *v)?,
         None => Vec::new(),
     };
-    Ok(Obj::alloc(Body::List(Mutex::new(items))))
+    Ok(Obj::list(items))
 }
 
 fn b_tuple(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -545,7 +533,7 @@ fn b_tuple(th: &mut Thread, args: &[Value]) -> VResult<Value> {
 }
 
 fn b_dict(_th: &mut Thread, _args: &[Value]) -> VResult<Value> {
-    Ok(Obj::alloc(Body::Dict(Mutex::new(Dict::default()))))
+    Ok(Obj::alloc(Body::Dict(Dict::default())))
 }
 
 fn b_isinstance(th: &mut Thread, args: &[Value]) -> VResult<Value> {
@@ -575,7 +563,7 @@ fn b_sorted(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         items.iter().for_each(|v| v.decref());
         return Err(e);
     }
-    Ok(Obj::alloc(Body::List(Mutex::new(items))))
+    Ok(Obj::list(items))
 }
 
 fn sort_values(th: &mut Thread, items: &mut [Value]) -> VResult<()> {
@@ -856,7 +844,7 @@ fn m_split(th: &mut Thread, a: &[Value]) -> VResult<Value> {
         }
         None => s.split_whitespace().map(Value::str).collect(),
     };
-    Ok(Obj::alloc(Body::List(Mutex::new(parts))))
+    Ok(Obj::list(parts))
 }
 
 fn m_join(th: &mut Thread, a: &[Value]) -> VResult<Value> {
@@ -925,7 +913,7 @@ fn m_isalpha(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     Ok(Value::bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())))
 }
 
-fn list_of(v: Value) -> &'static Mutex<Vec<Value>> {
+fn list_of(v: Value) -> &'static ListObj {
     match v.body() {
         Some(Body::List(l)) => l,
         _ => unreachable!(),
@@ -933,32 +921,41 @@ fn list_of(v: Value) -> &'static Mutex<Vec<Value>> {
 }
 
 fn m_append(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    list_of(a[0]).lock().unwrap().push(a[1]);
+    list_of(a[0]).push(a[1]);
     Ok(Value::UNIT)
 }
 
+/// `l.pop()` / `l.pop(i)`: `Some(item)` (owned), or `None` if the list is
+/// empty or `i` is out of range.
 fn m_pop(th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let mut l = list_of(a[0]).lock().unwrap();
-    if l.is_empty() {
-        drop(l);
-        return Err(th.raise("IndexError", "pop from empty list"));
-    }
     let i = match a.get(1) {
-        Some(i) => {
-            let i = arg_int!(th, *i, "index");
-            let n = l.len() as i64;
-            let j = if i < 0 { i + n } else { i };
-            if j < 0 || j >= n {
-                drop(l);
-                return Err(th.raise("IndexError", "pop index out of range"));
-            }
-            j as usize
-        }
-        None => l.len() - 1,
+        Some(i) => Some(arg_int!(th, *i, "index")),
+        None => None,
     };
-    Ok(l.remove(i))
+    Ok(list_of(a[0])
+        .write(|w| match i {
+            None => w.pop(),
+            Some(i) if (i as u64) < w.len() as u64 => Some(w.remove(i as usize)),
+            Some(_) => None,
+        })
+        .unwrap_or(Value::NONE))
 }
 
+/// `l.first()` / `l.last()`: `Some(item)` (a new reference) or `None`.
+fn m_first(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let v = list_of(a[0]).get(0).unwrap_or(Value::NONE);
+    v.incref();
+    Ok(v)
+}
+
+fn m_last(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
+    let l = list_of(a[0]);
+    let v = l.len().checked_sub(1).and_then(|i| l.get(i)).unwrap_or(Value::NONE);
+    v.incref();
+    Ok(v)
+}
+
+/// `l.insert(i, x)`: `i` may be at most the length (appends at the end).
 fn m_insert(th: &mut Thread, a: &[Value]) -> VResult<Value> {
     let i = match a[1].as_int() {
         Some(i) => i,
@@ -967,28 +964,33 @@ fn m_insert(th: &mut Thread, a: &[Value]) -> VResult<Value> {
             return Err(th.raise("TypeError", "list index must be an int"));
         }
     };
-    let mut l = list_of(a[0]).lock().unwrap();
-    let n = l.len() as i64;
-    let j = if i < 0 { (i + n).max(0) } else { i.min(n) } as usize;
-    l.insert(j, a[2]);
+    let l = list_of(a[0]);
+    let ok = l.write(|w| {
+        if (i as u64) <= w.len() as u64 {
+            w.insert(i as usize, a[2]);
+            true
+        } else {
+            false
+        }
+    });
+    if !ok {
+        a[2].decref();
+        return Err(helpers::index_error(th, i, "list", l.len()));
+    }
     Ok(Value::UNIT)
 }
 
 fn m_extend(th: &mut Thread, a: &[Value]) -> VResult<Value> {
     let items = collect(th, a[1])?;
-    list_of(a[0]).lock().unwrap().extend(items);
+    list_of(a[0]).write(|w| w.extend(items));
     Ok(Value::UNIT)
 }
 
 fn m_clear(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     match a[0].body() {
-        Some(Body::List(l)) => {
-            let old: Vec<Value> = std::mem::take(&mut *l.lock().unwrap());
-            old.into_iter().for_each(rc::defer_decref);
-        }
+        Some(Body::List(l)) => l.write(|w| w.clear()).into_iter().for_each(rc::defer_decref),
         Some(Body::Dict(d)) => {
-            let old = d.lock().unwrap().drain();
-            for (k, v) in old {
+            for (k, v) in d.drain() {
                 rc::defer_decref(k);
                 rc::defer_decref(v);
             }
@@ -1000,7 +1002,7 @@ fn m_clear(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
 
 fn m_index(th: &mut Thread, a: &[Value]) -> VResult<Value> {
     let found = match a[0].body() {
-        Some(Body::List(l)) => l.lock().unwrap().iter().position(|v| values_eq(*v, a[1])),
+        Some(Body::List(l)) => l.snapshot().iter().position(|v| values_eq(*v, a[1])),
         Some(Body::Tuple(t)) => t.iter().position(|v| values_eq(*v, a[1])),
         _ => None,
     };
@@ -1012,7 +1014,7 @@ fn m_index(th: &mut Thread, a: &[Value]) -> VResult<Value> {
 
 fn m_seq_count(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
     let n = match a[0].body() {
-        Some(Body::List(l)) => l.lock().unwrap().iter().filter(|v| values_eq(**v, a[1])).count(),
+        Some(Body::List(l)) => l.snapshot().iter().filter(|v| values_eq(**v, a[1])).count(),
         Some(Body::Tuple(t)) => t.iter().filter(|v| values_eq(**v, a[1])).count(),
         _ => 0,
     };
@@ -1020,41 +1022,59 @@ fn m_seq_count(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
 }
 
 fn m_remove(th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let mut l = list_of(a[0]).lock().unwrap();
-    match l.iter().position(|v| values_eq(*v, a[1])) {
-        Some(i) => {
-            let v = l.remove(i);
+    // Equality is pure, so the search can run under the writer lock.
+    let removed = list_of(a[0]).write(|w| {
+        let i = (0..w.len()).find(|&i| values_eq(w.get(i), a[1]))?;
+        Some(w.remove(i))
+    });
+    match removed {
+        Some(v) => {
             rc::defer_decref(v);
             Ok(Value::UNIT)
         }
-        None => {
-            drop(l);
-            Err(th.raise("ValueError", "list.remove(x): x not in list"))
-        }
+        None => Err(th.raise("ValueError", "list.remove(x): x not in list")),
     }
 }
 
 fn m_reverse(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    list_of(a[0]).lock().unwrap().reverse();
+    list_of(a[0]).write(|w| w.reverse());
     Ok(Value::UNIT)
 }
 
+/// Sorts outside the writer lock (comparisons may run user code), then
+/// writes the order back if nothing changed the list meanwhile.
 fn m_sort(th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let mut items = std::mem::take(&mut *list_of(a[0]).lock().unwrap());
+    let l = list_of(a[0]);
+    // References keep the items alive if the comparisons modify the list.
+    let (mut items, version) = l.write(|w| {
+        let items = w.items();
+        items.iter().for_each(|v| v.incref());
+        (items, w.final_version())
+    });
     let r = sort_values(th, &mut items);
-    let mut l = list_of(a[0]).lock().unwrap();
-    let added = std::mem::replace(&mut *l, items);
-    l.extend(added);
-    r.map(|_| Value::UNIT)
+    let ok = r.is_ok()
+        && l.write(|w| {
+            if w.prior_version() != version || w.len() != items.len() {
+                return false;
+            }
+            w.permute(&items);
+            true
+        });
+    items.into_iter().for_each(rc::defer_decref);
+    r?;
+    if !ok {
+        return Err(th.raise("RuntimeError", "list modified during sort"));
+    }
+    Ok(Value::UNIT)
 }
 
 fn m_list_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let items = list_of(a[0]).lock().unwrap().clone();
+    let items = list_of(a[0]).snapshot();
     items.iter().for_each(|v| v.incref());
-    Ok(Obj::alloc(Body::List(Mutex::new(items))))
+    Ok(Obj::list(items))
 }
 
-fn dict_of(v: Value) -> &'static Mutex<Dict> {
+fn dict_of(v: Value) -> &'static Dict {
     match v.body() {
         Some(Body::Dict(d)) => d,
         _ => unreachable!(),
@@ -1062,27 +1082,26 @@ fn dict_of(v: Value) -> &'static Mutex<Dict> {
 }
 
 fn m_dict_get(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let d = dict_of(a[0]).lock().unwrap();
-    let v = d.get(a[1]).or_else(|| a.get(2).copied()).unwrap_or(Value::NONE);
+    let v = dict_of(a[0]).get(a[1]).or_else(|| a.get(2).copied()).unwrap_or(Value::NONE);
     v.incref();
     Ok(v)
 }
 
 fn m_keys(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let ks: Vec<Value> = dict_of(a[0]).lock().unwrap().entries().map(|(k, _)| k).collect();
+    let ks: Vec<Value> = dict_of(a[0]).entries().into_iter().map(|(k, _)| k).collect();
     ks.iter().for_each(|v| v.incref());
-    Ok(Obj::alloc(Body::List(Mutex::new(ks))))
+    Ok(Obj::list(ks))
 }
 
 fn m_values(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let vs: Vec<Value> = dict_of(a[0]).lock().unwrap().entries().map(|(_, v)| v).collect();
+    let vs: Vec<Value> = dict_of(a[0]).entries().into_iter().map(|(_, v)| v).collect();
     vs.iter().for_each(|v| v.incref());
-    Ok(Obj::alloc(Body::List(Mutex::new(vs))))
+    Ok(Obj::list(vs))
 }
 
 fn m_items(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let es: Vec<(Value, Value)> = dict_of(a[0]).lock().unwrap().entries().collect();
-    let items = es
+    let items = dict_of(a[0])
+        .entries()
         .into_iter()
         .map(|(k, v)| {
             k.incref();
@@ -1090,12 +1109,11 @@ fn m_items(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
             Obj::alloc(Body::Tuple(vec![k, v].into_boxed_slice()))
         })
         .collect();
-    Ok(Obj::alloc(Body::List(Mutex::new(items))))
+    Ok(Obj::list(items))
 }
 
 fn m_dict_pop(th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let removed = dict_of(a[0]).lock().unwrap().remove(a[1]);
-    match removed {
+    match dict_of(a[0]).remove(a[1]) {
         Some((k, v)) => {
             rc::defer_decref(k);
             Ok(v)
@@ -1111,14 +1129,13 @@ fn m_dict_pop(th: &mut Thread, a: &[Value]) -> VResult<Value> {
 }
 
 fn m_dict_copy(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
-    let es: Vec<(Value, Value)> = dict_of(a[0]).lock().unwrap().entries().collect();
-    let mut d = Dict::default();
-    for (k, v) in es {
+    let d = Dict::default();
+    for (k, v) in dict_of(a[0]).entries() {
         k.incref();
         v.incref();
         let _ = d.insert(k, v);
     }
-    Ok(Obj::alloc(Body::Dict(Mutex::new(d))))
+    Ok(Obj::alloc(Body::Dict(d)))
 }
 
 fn m_send(th: &mut Thread, a: &[Value]) -> VResult<Value> {
@@ -1210,6 +1227,8 @@ fn method_table() -> &'static MethodTable {
             mk(&[
                 def("append", m_append, 2, 2, 1 << 1),
                 def("pop", m_pop, 1, 2, 0),
+                def("first", m_first, 1, 1, 0),
+                def("last", m_last, 1, 1, 0),
                 def("insert", m_insert, 3, 3, 1 << 2),
                 def("extend", m_extend, 2, 2, 0),
                 def("clear", m_clear, 1, 1, 0),

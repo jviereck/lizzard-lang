@@ -67,7 +67,7 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
             out.push(')');
         }
         Body::List(items) => {
-            let items = items.lock().unwrap_or_else(|e| e.into_inner());
+            let items = items.snapshot();
             out.push('[');
             for (i, x) in items.iter().enumerate() {
                 if i > 0 {
@@ -86,9 +86,8 @@ fn fmt(v: Value, repr: bool, out: &mut String, depth: usize) {
         }
         Body::Class(c) => out.push_str(&format!("<class {}>", c.name)),
         Body::Dict(d) => {
-            let d = d.lock().unwrap_or_else(|e| e.into_inner());
             out.push('{');
-            for (i, (k, v)) in d.entries().enumerate() {
+            for (i, (k, v)) in d.entries().into_iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }

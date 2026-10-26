@@ -1,7 +1,7 @@
 nums = [3, 1, 2]
 nums.append(5)
 nums.sort()
-print(nums, len(nums), nums[0], nums[-1])
+print(nums, len(nums), nums[0], nums.last().some_or(0))
 first = nums[0]
 print(first + 1)
 words = "the quick brown fox".split()
@@ -30,3 +30,11 @@ print(items, sum(items), max(items), min(items))
 big = bigint("123456789012345678901234567890")
 print(big * bigint(2))
 print(sorted([5, 3, 9]), 9 in [5, 3, 9])
+
+# Rust-style access: no negative indexes; pop/first/last return Option.
+empty = []
+print(empty.pop(), empty.first(), empty.last(), [7, 8].pop(), [7, 8].pop(5))
+words = ["a" + "b", "c" + "d"]
+w = words.pop()
+if w is not None:
+    print("popped", w, len(words))

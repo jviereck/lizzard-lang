@@ -15,5 +15,7 @@ e 2 heLLo True
 [0, 1, 4, 9] 14 9 0
 246913578024691357802469135780
 [3, 5, 9] True
+None None None 8 None
+popped cd 1
 rc-audit: ok
 [exit 0]

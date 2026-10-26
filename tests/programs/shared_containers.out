@@ -1,0 +1,5 @@
+pushed 16000 popped 16000 left 3
+consistent: True
+dict keys <= 16: True
+rc-audit: ok
+[exit 0]

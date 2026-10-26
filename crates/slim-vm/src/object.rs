@@ -44,14 +44,14 @@ pub enum Body {
     BigInt(BigInt),
     Str(Box<str>),
     Tuple(Box<[Value]>),
-    List(Mutex<Vec<Value>>),
+    List(crate::list::ListObj),
     Function(Function),
     Builtin(Builtin),
     Class(Class),
     Trait(Trait),
     Instance(Instance),
     BoundMethod { recv: Value, func: Value },
-    Dict(Mutex<crate::dict::Dict>),
+    Dict(crate::dict::Dict),
     Iter(Mutex<crate::builtins::IterKind>),
     Generator(crate::generator::Generator),
     Thread(crate::threads::ThreadHandle),
@@ -178,6 +178,11 @@ fn check_poison(w: u64) {
 }
 
 impl Obj {
+    /// A new list owning `items`.
+    pub fn list(items: Vec<Value>) -> Value {
+        Obj::alloc(Body::List(crate::list::ListObj::new(items)))
+    }
+
     pub fn alloc(body: Body) -> Value {
         let b = Box::new(Obj { rc: AtomicU64::new(1), body });
         let p = Box::into_raw(b) as u64;
@@ -290,10 +295,7 @@ impl Obj {
     pub fn release_children(&mut self) {
         match &mut self.body {
             Body::Tuple(items) => items.iter().for_each(|v| v.decref()),
-            Body::List(items) => {
-                let items = items.get_mut().unwrap_or_else(|e| e.into_inner());
-                items.drain(..).for_each(|v| v.decref());
-            }
+            Body::List(l) => l.take_all().into_iter().for_each(|v| v.decref()),
             Body::Function(f) => f.captures.iter().for_each(|v| v.decref()),
             Body::Instance(inst) => {
                 let class = inst.class();
@@ -308,8 +310,7 @@ impl Obj {
                 func.decref();
             }
             Body::Dict(d) => {
-                let d = d.get_mut().unwrap_or_else(|e| e.into_inner());
-                for (k, v) in d.drain() {
+                for (k, v) in d.take_all() {
                     k.decref();
                     v.decref();
                 }

@@ -9,6 +9,7 @@ pub mod display;
 pub mod generator;
 pub mod helpers;
 pub mod interp;
+pub mod list;
 pub mod object;
 pub mod ops;
 pub mod rc;
