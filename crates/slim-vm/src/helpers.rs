@@ -1253,8 +1253,9 @@ fn no_attribute(th: &mut Thread, v: Value, name: &str) -> Raised {
     th.raise("AttributeError", format!("'{}' object has no attribute '{name}'", v.type_name()))
 }
 
-pub extern "C" fn f_safepoint(_th: &mut Thread, _frame: &mut Frame, _: u32, _: u32, _: u32, _: u32) -> u32 {
+pub extern "C" fn f_safepoint(th: &mut Thread, _frame: &mut Frame, _: u32, _: u32, _: u32, _: u32) -> u32 {
     rc::safepoint();
+    th.maybe_auto_rc();
     OK
 }
 
