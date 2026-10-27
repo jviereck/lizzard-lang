@@ -127,7 +127,7 @@ pub fn create(th: &mut Thread, f: Value, mut regs: Vec<Value>) -> VResult<Value>
         state: Mutex::new(GenState { regs, pc: 0, yield_dst: None, status: Status::Created, retval: Value::UNIT }),
         running: AtomicBool::new(false),
     };
-    Ok(Obj::alloc(Body::Generator(g)))
+    Ok(Obj::alloc(Body::Generator(Box::new(g))))
 }
 
 pub fn as_generator(v: Value) -> Option<&'static Generator> {

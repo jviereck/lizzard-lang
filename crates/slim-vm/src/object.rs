@@ -1,5 +1,6 @@
 //! Heap objects.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -65,9 +66,9 @@ pub enum Body {
     Tuple(Box<[Value]>),
     List(crate::list::ListObj),
     Function(Function),
-    Builtin(Builtin),
-    Class(Class),
-    Trait(Trait),
+    Builtin(Box<Builtin>),
+    Class(Box<Class>),
+    Trait(Box<Trait>),
     Instance(Instance),
     BoundMethod { recv: Value, func: Value },
     /// A generic function with its type arguments (`first::<int>`).
@@ -78,19 +79,23 @@ pub enum Body {
     /// An array element type (`f64`, `u8`, ...), as passed to `array(...)`.
     ElemType(crate::array::Elem),
     /// A runtime type (immortal, interned).
-    Type(crate::rtype::RtType),
-    Iter(crate::builtins::IterObj),
-    Generator(crate::generator::Generator),
+    Type(Box<crate::rtype::RtType>),
+    Iter(Box<crate::builtins::IterObj>),
+    Generator(Box<crate::generator::Generator>),
     Thread(crate::threads::ThreadHandle),
     Lock(crate::threads::LockObj),
-    Channel(crate::threads::ChannelObj),
+    Channel(Box<crate::threads::ChannelObj>),
     /// A Rust function or method (immortal).
-    NativeFn(crate::native::NativeFn),
+    NativeFn(Box<crate::native::NativeFn>),
     /// A Rust class (immortal).
-    NativeClass(crate::native::NativeClass),
+    NativeClass(Box<crate::native::NativeClass>),
     /// An instance of a Rust class.
-    Native(crate::native::NativeObj),
+    Native(Box<crate::native::NativeObj>),
 }
+
+// Every object has the size of the largest body: rare or large bodies are
+// boxed so that ints, floats, instances and lists stay small.
+const _: () = assert!(std::mem::size_of::<Body>() <= 40);
 
 pub struct Function {
     pub code: Arc<Code>,
@@ -282,6 +287,68 @@ fn body_is_local(body: &Body) -> bool {
     }
 }
 
+/// Memory of freed objects, reused by `Obj::alloc` (like CPython's free
+/// lists; all objects have one size). A linked list through the first word.
+/// Also counts the thread's allocations minus frees, added to the global
+/// count of live objects at each `rc_run` and at thread exit.
+pub(crate) struct FreeList {
+    head: Cell<*mut Obj>,
+    len: Cell<usize>,
+    live: Cell<i64>,
+}
+
+const FREE_MAX: usize = 8192;
+
+thread_local! {
+    static FREE: FreeList = const { FreeList { head: Cell::new(std::ptr::null_mut()), len: Cell::new(0), live: Cell::new(0) } };
+}
+
+impl FreeList {
+    #[inline(always)]
+    fn pop(&self) -> Option<*mut Obj> {
+        let p = self.head.get();
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: entries are dead objects whose first word links the next.
+        self.head.set(unsafe { *(p as *mut *mut Obj) });
+        self.len.set(self.len.get() - 1);
+        Some(p)
+    }
+
+    #[inline(always)]
+    fn push(&self, p: *mut Obj) -> bool {
+        if self.len.get() >= FREE_MAX {
+            return false;
+        }
+        // SAFETY: `p` is dead memory of an object.
+        unsafe { *(p as *mut *mut Obj) = self.head.get() };
+        self.head.set(p);
+        self.len.set(self.len.get() + 1);
+        true
+    }
+}
+
+/// This thread's allocations minus frees since the last `take_live_delta`.
+pub(crate) fn take_live_delta() -> i64 {
+    FREE.try_with(|f| f.live.replace(0)).unwrap_or(0)
+}
+
+/// Counts a free whose memory is kept (poison mode).
+pub(crate) fn note_leaked_free() {
+    let _ = FREE.try_with(|f| f.live.set(f.live.get() - 1));
+}
+
+/// Returns the thread's free list to the allocator (at thread exit).
+pub(crate) fn release_free_list() {
+    let _ = FREE.try_with(|f| {
+        while let Some(p) = f.pop() {
+            // SAFETY: allocated as a `Box<Obj>`, whose body was dropped.
+            unsafe { std::alloc::dealloc(p as *mut u8, std::alloc::Layout::new::<Obj>()) };
+        }
+    });
+}
+
 #[cfg(debug_assertions)]
 #[inline(always)]
 fn check_poison(w: u64) {
@@ -298,11 +365,37 @@ impl Obj {
 
     pub fn alloc(body: Body) -> Value {
         let rc = if body_is_local(&body) { 1 | LOCAL } else { 1 } | kind_bits(&body);
-        let b = Box::new(Obj { rc: AtomicU64::new(rc), body });
-        let p = Box::into_raw(b) as u64;
-        debug_assert!(p & 7 == 0);
-        crate::rc::note_alloc();
-        Value(p)
+        let obj = Obj { rc: AtomicU64::new(rc), body };
+        let p = match FREE.with(|f| {
+            f.live.set(f.live.get() + 1);
+            f.pop()
+        }) {
+            Some(p) => {
+                // SAFETY: `p` is the memory of a freed object (same layout).
+                unsafe { p.write(obj) };
+                p
+            }
+            None => Box::into_raw(Box::new(obj)),
+        };
+        debug_assert!(p as u64 & 7 == 0);
+        Value(p as u64)
+    }
+
+    /// Destroys an object whose count reached zero and whose children were
+    /// released, keeping its memory for reuse.
+    ///
+    /// # Safety
+    /// `p` was allocated by `Obj::alloc` and is unreachable.
+    pub(crate) unsafe fn free(p: *mut Obj) {
+        // SAFETY: the caller's contract; the body is dropped exactly once.
+        unsafe { std::ptr::drop_in_place(&mut (*p).body) };
+        FREE.with(|f| {
+            f.live.set(f.live.get() - 1);
+            if !f.push(p) {
+                // SAFETY: allocated as a `Box<Obj>`, whose body is dropped.
+                unsafe { std::alloc::dealloc(p as *mut u8, std::alloc::Layout::new::<Obj>()) };
+            }
+        });
     }
 
     pub fn alloc_immortal(body: Body) -> Value {

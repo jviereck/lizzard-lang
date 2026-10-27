@@ -179,6 +179,7 @@ impl Thread {
                 freed += 1;
             }
         }
+        rc::flush_live();
         freed
     }
 
@@ -225,18 +226,21 @@ impl Thread {
                 }
             }
         }
-        rc::set_cascade(true);
-        obj.release_children();
-        rc::set_cascade(false);
+        if !matches!(obj.body, Body::Int(_) | Body::Float(_) | Body::Str(_) | Body::BigInt(_)) {
+            rc::set_cascade(true);
+            obj.release_children();
+            rc::set_cascade(false);
+        }
         #[cfg(debug_assertions)]
         let leak = Obj::poison(p);
         #[cfg(not(debug_assertions))]
         let leak = false;
         if !leak {
-            // SAFETY: allocated by `Obj::alloc` as a Box.
-            drop(unsafe { Box::from_raw(p) });
+            // SAFETY: allocated by `Obj::alloc`; unreachable.
+            unsafe { Obj::free(p) };
+        } else {
+            crate::object::note_leaked_free();
         }
-        rc::note_free();
         true
     }
 
@@ -307,6 +311,11 @@ pub fn execute_inner(th: &mut Thread, frame: &mut Frame, mut raising: bool) -> V
 
 /// Runs a code object with prepared registers (parameters already in place).
 pub fn run_code(th: &mut Thread, code: &Arc<Code>, regs: &mut [Value], captures: *const Value) -> VResult<Value> {
+    run_code_at(th, code, regs, captures, 0)
+}
+
+/// Like `run_code`, starting at instruction `pc`.
+pub fn run_code_at(th: &mut Thread, code: &Arc<Code>, regs: &mut [Value], captures: *const Value, pc: u32) -> VResult<Value> {
     if th.depth >= th.vm.recursion_limit {
         return Err(th.raise("RecursionError", "maximum recursion depth exceeded"));
     }
@@ -316,8 +325,8 @@ pub fn run_code(th: &mut Thread, code: &Arc<Code>, regs: &mut [Value], captures:
         regs: regs.as_mut_ptr(),
         code: Arc::as_ptr(code),
         captures,
-        pc: 0,
-        cur_pc: 0,
+        pc,
+        cur_pc: pc,
         ret: Value::UNIT,
         yield_dst: u32::MAX,
         yielded: false,

@@ -2,6 +2,7 @@
 
 mod compiler;
 mod imports;
+mod peephole;
 mod scan;
 mod ty;
 

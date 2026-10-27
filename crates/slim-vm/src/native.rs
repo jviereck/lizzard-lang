@@ -529,7 +529,7 @@ pub(crate) fn new_object(key: u64, data: *mut c_void) -> Option<Value> {
         holder: AtomicU64::new(0),
         data: UnsafeCell::new(data),
     };
-    Some(Obj::alloc(Body::Native(obj)))
+    Some(Obj::alloc(Body::Native(Box::new(obj))))
 }
 
 // ---------------------------------------------------------------- modules
@@ -671,7 +671,7 @@ impl Module {
     }
 
     pub(crate) fn add_function(&mut self, f: NativeFn) {
-        self.functions.push((f.name.clone(), Obj::alloc_immortal(Body::NativeFn(f))));
+        self.functions.push((f.name.clone(), Obj::alloc_immortal(Body::NativeFn(Box::new(f)))));
     }
 
     /// Adds a trait whose methods are all required, for classes of this
@@ -680,14 +680,14 @@ impl Module {
         if self.traits.iter().any(|(t, _)| t.name == name) {
             return Err(format!("module `{}` defines trait `{name}` twice", self.name));
         }
-        let tr = Obj::alloc_immortal(Body::Trait(crate::object::Trait {
+        let tr = Obj::alloc_immortal(Body::Trait(Box::new(crate::object::Trait {
             name: name.into(),
             id: NEXT_TRAIT_ID.fetch_add(1, Ordering::Relaxed),
             nparams: 0,
             methods: methods.iter().map(|m| (m.name.clone(), None)).collect(),
             implies: Vec::new(),
             impls: Default::default(),
-        }));
+        })));
         self.traits.push((TraitSpec { name: name.into(), methods }, tr));
         Ok(())
     }
@@ -718,7 +718,7 @@ impl Module {
         for p in instances {
             classes.push(new_class(&self.name, &self.traits, p)?);
         }
-        let family = Obj::alloc_immortal(Body::NativeClass(NativeClass {
+        let family = Obj::alloc_immortal(Body::NativeClass(Box::new(NativeClass {
             name: name.into(),
             module: self.name.clone(),
             key: 0,
@@ -735,7 +735,7 @@ impl Module {
             type_args: Vec::new(),
             traits: Vec::new(),
             builtin_traits: Vec::new(),
-        }));
+        })));
         for c in &classes {
             let Some(Body::NativeClass(c)) = c.body() else { unreachable!() };
             let _ = c.family.set(family);
@@ -836,14 +836,14 @@ fn new_class(module: &str, traits: &Traits, p: ClassParts) -> Result<Value, Stri
         methods.insert(short, m);
     }
     let (traits, builtin_traits) = class_traits(&p.name, &p.implements, traits, &methods)?;
-    let class = Obj::alloc_immortal(Body::NativeClass(NativeClass {
+    let class = Obj::alloc_immortal(Body::NativeClass(Box::new(NativeClass {
         name: p.name,
         module: module.into(),
         key: p.key,
         mode: p.mode,
         locked: p.locked,
-        init: p.init.map(|f| Obj::alloc_immortal(Body::NativeFn(f))),
-        methods: methods.into_iter().map(|(n, f)| (n, Obj::alloc_immortal(Body::NativeFn(f)))).collect(),
+        init: p.init.map(|f| Obj::alloc_immortal(Body::NativeFn(Box::new(f)))),
+        methods: methods.into_iter().map(|(n, f)| (n, Obj::alloc_immortal(Body::NativeFn(Box::new(f))))).collect(),
         repr: p.repr,
         drop: Some(p.drop),
         canonical: OnceLock::new(),
@@ -853,7 +853,7 @@ fn new_class(module: &str, traits: &Traits, p: ClassParts) -> Result<Value, Stri
         type_args: p.type_args,
         traits,
         builtin_traits,
-    }));
+    })));
     registry().write().unwrap().insert(p.key, class);
     Ok(class)
 }

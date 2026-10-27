@@ -13,7 +13,7 @@
 //! or blocks while holding it.
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::rc;
 use crate::value::Value;
@@ -66,11 +66,11 @@ fn slot<'a>(b: *mut Buf, i: usize) -> &'a AtomicU64 {
 pub struct ListObj {
     /// The list's type (`list<T>`), an immortal type value.
     pub ty: Value,
-    wlock: AtomicBool,
     len: AtomicUsize,
     buf: AtomicPtr<Buf>,
-    /// Bumped at the start and end of every write (odd while one is in
-    /// progress); lets `sort` detect concurrent modification.
+    /// Bumped at the start and end of every write: odd while one is in
+    /// progress, which makes it the writer lock too. Lets `sort` detect
+    /// concurrent modification.
     version: AtomicU64,
 }
 
@@ -83,7 +83,6 @@ impl ListObj {
     pub fn new(ty: Value, items: Vec<Value>) -> ListObj {
         let l = ListObj {
             ty,
-            wlock: AtomicBool::new(false),
             len: AtomicUsize::new(0),
             buf: AtomicPtr::new(std::ptr::null_mut()),
             version: AtomicU64::new(0),
@@ -130,24 +129,25 @@ impl ListObj {
     /// Runs `f` with exclusive write access.
     pub fn write<R>(&self, f: impl FnOnce(&mut ListWriter<'_>) -> R) -> R {
         let mut spins = 0u32;
-        while self.wlock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        let prior = loop {
+            let v = self.version.load(Ordering::Relaxed);
+            if v & 1 == 0 && self.version.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                break v;
+            }
             spins += 1;
             if spins < 64 {
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();
             }
-        }
-        struct Unlock<'a>(&'a ListObj);
+        };
+        struct Unlock<'a>(&'a ListObj, u64);
         impl Drop for Unlock<'_> {
             fn drop(&mut self) {
-                self.0.version.fetch_add(1, Ordering::AcqRel);
-                self.0.wlock.store(false, Ordering::Release);
+                self.0.version.store(self.1 + 2, Ordering::Release);
             }
         }
-        // The version is odd while a write is in progress.
-        let prior = self.version.fetch_add(1, Ordering::AcqRel);
-        let _u = Unlock(self);
+        let _u = Unlock(self, prior);
         f(&mut ListWriter { l: self, prior })
     }
 

@@ -277,7 +277,7 @@ fn m_locked(_th: &mut Thread, a: &[Value]) -> VResult<Value> {
 
 /// A new channel of type `ty` (`Channel<T>`).
 pub fn new_channel(ty: Value) -> Value {
-    Obj::alloc(Body::Channel(ChannelObj { ty, q: Mutex::new((VecDeque::new(), false)), cv: Condvar::new() }))
+    Obj::alloc(Body::Channel(Box::new(ChannelObj { ty, q: Mutex::new((VecDeque::new(), false)), cv: Condvar::new() })))
 }
 
 fn chan_of(v: Value) -> &'static ChannelObj {

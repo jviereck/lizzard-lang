@@ -11,9 +11,9 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 
-use crate::code::{Arg, ClassSpec, Code, Ctor, Reg, TypeDesc};
+use crate::code::{Arg, ArgList, ClassSpec, Code, Ctor, Reg, TypeDesc};
 use crate::display;
-use crate::interp::{run_code, Frame, Raised, Thread, VResult};
+use crate::interp::{run_code, run_code_at, Frame, Raised, Thread, VResult};
 use crate::list::ListObj;
 use crate::object::{Body, Class, Field, Function, Instance, Obj, SlotKind, Trait};
 use crate::ops::StoreMode;
@@ -703,16 +703,47 @@ impl CallArg {
     }
 }
 
-fn collect_args(frame: &Frame, args: &[Arg]) -> Vec<CallArg> {
-    args.iter()
-        .map(|a| CallArg {
-            v: frame.reg(a.reg),
-            owned: a.owned,
-            reg: Some(a.reg),
-            root: a.root,
-            global: (a.global != u32::MAX).then_some(a.global),
-        })
-        .collect()
+/// Registers of a callee with at most this many live in a buffer on the
+/// native stack (the interpreter threads have large stacks).
+const INLINE_REGS: usize = 24;
+
+const INLINE_ARGS: usize = 6;
+
+/// A call's arguments, inline for short argument lists.
+struct ArgBuf {
+    len: usize,
+    inline: [CallArg; INLINE_ARGS],
+    heap: Vec<CallArg>,
+}
+
+impl std::ops::Deref for ArgBuf {
+    type Target = [CallArg];
+    fn deref(&self) -> &[CallArg] {
+        if self.len <= INLINE_ARGS {
+            &self.inline[..self.len]
+        } else {
+            &self.heap
+        }
+    }
+}
+
+fn collect_args(frame: &Frame, args: &[Arg]) -> ArgBuf {
+    let arg = |a: &Arg| CallArg {
+        v: frame.reg(a.reg),
+        owned: a.owned,
+        reg: Some(a.reg),
+        root: a.root,
+        global: (a.global != u32::MAX).then_some(a.global),
+    };
+    let mut b = ArgBuf { len: args.len(), inline: [CallArg::borrowed(Value::UNINIT); INLINE_ARGS], heap: Vec::new() };
+    if args.len() <= INLINE_ARGS {
+        for (i, a) in args.iter().enumerate() {
+            b.inline[i] = arg(a);
+        }
+    } else {
+        b.heap = args.iter().map(arg).collect();
+    }
+    b
 }
 
 pub fn callable_name(f: Value) -> String {
@@ -811,7 +842,15 @@ pub fn invoke(
                     format!("{} takes {want} argument{} but {given} {} given", callable_name(f), if want == 1 { "" } else { "s" }, if given == 1 { "was" } else { "were" }),
                 ));
             }
-            let mut regs = vec![Value::UNINIT; code.nregs as usize];
+            let n = code.nregs as usize;
+            let mut inline = [Value::UNINIT; INLINE_REGS];
+            let mut heap = Vec::new();
+            let regs: &mut [Value] = if n <= INLINE_REGS && !code.is_generator {
+                &mut inline[..n]
+            } else {
+                heap = vec![Value::UNINIT; n];
+                &mut heap
+            };
             if let Some(s) = self_val {
                 regs[0] = s;
             }
@@ -828,7 +867,7 @@ pub fn invoke(
                 };
             }
             if nt > 0 {
-                if let Err(e) = bind_type_args(th, code, &mut regs, nself) {
+                if let Err(e) = bind_type_args(th, code, regs, nself) {
                     // Values moved into `keep` parameters are released.
                     for (i, p) in code.params.iter().enumerate() {
                         if p.keep {
@@ -839,9 +878,9 @@ pub fn invoke(
                 }
             }
             if code.is_generator {
-                return crate::generator::create(th, f, regs);
+                return crate::generator::create(th, f, heap);
             }
-            run_code(th, code, &mut regs, func.captures.as_ptr())
+            run_code(th, code, regs, func.captures.as_ptr())
         }
         Some(Body::Builtin(b)) => {
             let nargs = args.len() + self_val.is_some() as usize;
@@ -1076,6 +1115,11 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
     let code = frame.code();
     let al = &code.arglists[args as usize];
     let f = frame.reg(func as Reg);
+    if al.fast {
+        if let Some(status) = call_fast(th, frame, f, None, al, dst) {
+            return status;
+        }
+    }
     let cargs = collect_args(frame, &al.args);
     if al.pins {
         rc::pin();
@@ -1091,6 +1135,46 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
         }
         Err(Raised) => RAISED,
     }
+}
+
+/// An `ArgList::fast` call of `f` (with `recv` as `self` for a method):
+/// the arguments' types are proven, so they are passed as they are and the
+/// callee starts after its parameter checks. `None` if `f` is not a plain
+/// slim function of that arity.
+fn call_fast(th: &mut Thread, frame: &mut Frame, f: Value, recv: Option<Value>, al: &ArgList, dst: u32) -> Option<u32> {
+    let Some(Body::Function(func)) = f.body() else { return None };
+    let code = &func.code;
+    let n = code.nregs as usize;
+    let nself = recv.is_some() as usize;
+    if n > INLINE_REGS || code.is_generator || code.params.len() != al.args.len() + nself || code.params.first().is_some_and(|p| p.keep) {
+        return None;
+    }
+    let mut regs = [Value::UNINIT; INLINE_REGS];
+    if let Some(r) = recv {
+        regs[0] = r;
+    }
+    for (i, a) in al.args.iter().enumerate() {
+        let v = frame.reg(a.reg);
+        if v.is_dead() {
+            raise_dead(th, frame, a.reg);
+            return Some(RAISED);
+        }
+        regs[nself + i] = v;
+    }
+    if al.pins {
+        rc::pin();
+    }
+    let r = run_code_at(th, code, &mut regs[..n], func.captures.as_ptr(), code.entry);
+    if al.pins {
+        rc::unpin();
+    }
+    Some(match r {
+        Ok(v) => {
+            frame.set(dst as Reg, v);
+            OK
+        }
+        Err(Raised) => RAISED,
+    })
 }
 
 /// Finds the method for `recv.name()`, as in Rust: an inherent method (of
@@ -1170,15 +1254,21 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
     let al = &code.arglists[args as usize];
     let r = frame.reg(recv as Reg);
     let mname = &code.names[name as usize];
-    let cargs = collect_args(frame, &al.args);
     if r.is_dead() {
         raise_dead(th, frame, recv as Reg);
         return RAISED;
     }
+    let found = find_method(th, r, mname);
+    if let (true, Ok(m)) = (al.fast, &found) {
+        if let Some(status) = call_fast(th, frame, *m, Some(r), al, dst) {
+            return status;
+        }
+    }
+    let cargs = collect_args(frame, &al.args);
     if al.pins {
         rc::pin();
     }
-    let result = match find_method(th, r, mname) {
+    let result = match found {
         Ok(m) => invoke(th, Some(frame), m, Some(r), Some(recv as Reg), &cargs),
         Err(traits) => {
             // A callable stored in a field: `self.callback(x)`.
@@ -1254,8 +1344,9 @@ fn no_attribute(th: &mut Thread, v: Value, name: &str) -> Raised {
 }
 
 pub extern "C" fn f_safepoint(th: &mut Thread, _frame: &mut Frame, _: u32, _: u32, _: u32, _: u32) -> u32 {
-    rc::safepoint();
-    th.maybe_auto_rc();
+    if rc::safepoint_pending() > th.rc_threshold && th.rc_auto {
+        th.rc_run(Some(th.rc_threshold));
+    }
     OK
 }
 
@@ -1310,7 +1401,7 @@ pub extern "C" fn f_make_trait(th: &mut Thread, frame: &mut Frame, dst: u32, spe
         })
         .collect();
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    let t = Obj::alloc_immortal(Body::Trait(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new(), impls: Default::default() }));
+    let t = Obj::alloc_immortal(Body::Trait(Box::new(Trait { name: s.name.clone(), id, nparams: s.nparams, methods, implies: Vec::new(), impls: Default::default() })));
     frame.set(dst as Reg, t);
     OK
 }
@@ -1495,7 +1586,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
     trait_methods.retain(|_, v| !v.is_empty());
     let always_local = s.local;
     let id = th.vm.next_class_id.fetch_add(1, Ordering::Relaxed);
-    Ok(Obj::alloc_immortal(Body::Class(Class {
+    Ok(Obj::alloc_immortal(Body::Class(Box::new(Class {
         name: s.name.clone(),
         id,
         tparams: s.tparams.clone(),
@@ -1507,7 +1598,7 @@ pub fn build_class(th: &mut Thread, s: &ClassSpec, codes: &[Arc<Code>]) -> VResu
         is_exception,
         always_local,
         canonical: std::sync::OnceLock::new(),
-    })))
+    }))))
 }
 
 pub extern "C" fn f_make_class(th: &mut Thread, frame: &mut Frame, dst: u32, spec: u32, _: u32, _: u32) -> u32 {

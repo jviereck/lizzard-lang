@@ -1563,6 +1563,8 @@ struct FnCtx<'m> {
     m: &'m ModInfo,
     name: String,
     instrs: Vec<Instr>,
+    /// See `Code::entry`.
+    entry: u32,
     lines: Vec<u32>,
     consts: Vec<Value>,
     names: Vec<String>,
@@ -1632,6 +1634,7 @@ impl<'m> FnCtx<'m> {
             m,
             name,
             instrs: Vec::new(),
+            entry: 0,
             lines: Vec::new(),
             consts: Vec::new(),
             names: Vec::new(),
@@ -1677,6 +1680,7 @@ impl<'m> FnCtx<'m> {
     }
 
     fn finish(mut self, params: Vec<ParamInfo>, ret: RetKind, is_generator: bool, is_method: bool) -> Code {
+        crate::peephole::run(&mut self.instrs, &mut self.lines, &mut self.exc_table, &mut self.entry, &self.reg_names);
         let yield_ty = is_generator.then(|| {
             let t = match self.yield_decl.clone() {
                 Some(t) => t,
@@ -1706,6 +1710,7 @@ impl<'m> FnCtx<'m> {
             owned: self.owned,
             reg_names: self.reg_names,
             instrs: self.instrs,
+            entry: self.entry,
             lines: self.lines,
             consts: self.consts,
             names: self.names,
@@ -2533,7 +2538,7 @@ impl<'m> FnCtx<'m> {
                     item_tys.push(r.ty.clone());
                     args.push(Arg::new(r.reg, true, false, None));
                 }
-                let al = self.arglist(ArgList { args, pins: false });
+                let al = self.arglist(ArgList { args, pins: false, fast: false });
                 let dst = self.tmp_owned();
                 self.emit(Instr::BuildTuple { dst, args: al });
                 Ok(owned(dst, Ty::Tuple(Some(item_tys))))
@@ -2554,7 +2559,7 @@ impl<'m> FnCtx<'m> {
                 let elem = self.literal_elem(ctx, &tys, "list element", e.span)?;
                 let d = TypeDesc::Builtin(Ctor::List, vec![self.elem_desc(&elem)]);
                 let ti = self.type_idx(d);
-                let al = self.arglist(ArgList { args, pins: false });
+                let al = self.arglist(ArgList { args, pins: false, fast: false });
                 let dst = self.tmp_owned();
                 self.emit(Instr::BuildList { dst, args: al, ty: ti });
                 Ok(owned(dst, Ty::list(elem)))
@@ -2584,7 +2589,7 @@ impl<'m> FnCtx<'m> {
                 self.m.check_wf(&Ty::dict(kt.clone(), vt.clone()), &|n| self.pbounds(n), e.span)?;
                 let d = TypeDesc::Builtin(Ctor::Dict, vec![self.elem_desc(&kt), self.elem_desc(&vt)]);
                 let ti = self.type_idx(d);
-                let al = self.arglist(ArgList { args, pins: false });
+                let al = self.arglist(ArgList { args, pins: false, fast: false });
                 let dst = self.tmp_owned();
                 self.emit(Instr::BuildDict { dst, args: al, ty: ti });
                 Ok(owned(dst, Ty::dict(kt, vt)))
@@ -2627,7 +2632,7 @@ impl<'m> FnCtx<'m> {
                     // `first::<str>`: the function with its type arguments bound.
                     let f = self.expr(base)?;
                     let regs = self.make_types(&tys).ok_or_else(|| type_err("cannot instantiate this function here", e.span))?;
-                    let al = self.arglist(ArgList { args: regs.into_iter().map(|r| Arg::new(r, false, false, None)).collect(), pins: false });
+                    let al = self.arglist(ArgList { args: regs.into_iter().map(|r| Arg::new(r, false, false, None)).collect(), pins: false, fast: false });
                     let dst = self.tmp_owned();
                     self.emit(Instr::Instantiate { dst, func: f.reg, targs: al });
                     return Ok(owned(dst, Ty::Func));
@@ -3668,7 +3673,7 @@ impl<'m> FnCtx<'m> {
                     let r = self.tmp_owned();
                     dsts.push(Arg::new(r, true, false, None));
                 }
-                let al = self.arglist(ArgList { args: dsts.clone(), pins: false });
+                let al = self.arglist(ArgList { args: dsts.clone(), pins: false, fast: false });
                 self.emit(Instr::Unpack { src: v.reg, dsts: al });
                 let tys: Vec<Ty> = match &v.ty {
                     Ty::Tuple(Some(ts)) if ts.len() == items.len() => ts.clone(),
@@ -3707,7 +3712,7 @@ impl<'m> FnCtx<'m> {
             None => v.ty.clone(),
         };
         let reg = self.locals[n].reg;
-        if let Some((_, d)) = &decl {
+        if let Some((_, d)) = decl.as_ref().filter(|(dty, _)| !self.proves(dty, &v.ty)) {
             let ti = self.type_idx(d.clone());
             let w = self.name_idx(&format!("variable `{n}`"));
             self.emit(Instr::CheckType { reg: v.reg, ty: ti, what: w });
@@ -3922,7 +3927,7 @@ impl<'m> FnCtx<'m> {
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
                 let i = self.expr(idx)?;
-                let al = self.arglist(ArgList { args: vec![Arg::new(i.reg, false, false, None)], pins: false });
+                let al = self.arglist(ArgList { args: vec![Arg::new(i.reg, false, false, None)], pins: false, fast: false });
                 let n = self.name_idx("pop");
                 let dst = self.tmp_owned();
                 self.emit(Instr::CallMethod { dst, recv: o.reg, name: n, args: al });
@@ -4092,7 +4097,7 @@ impl<'m> FnCtx<'m> {
         vals.sort_by_key(|(k, _, _)| *k);
         let args = vals.iter().map(|(_, r, _)| Arg::new(r.reg, true, false, None)).collect();
         let ti = self.type_idx(d);
-        let al = self.arglist(ArgList { args, pins: false });
+        let al = self.arglist(ArgList { args, pins: false, fast: false });
         let dst = self.tmp_owned();
         self.emit(Instr::BuildStruct { dst, args: al, ty: ti });
         Ok(Res { reg: dst, own: Own::Owned, ty: t, root: None, desc: "value".into() })
@@ -4212,8 +4217,14 @@ impl<'m> FnCtx<'m> {
         let arg_ty = |i: usize| -> Option<(String, Ty)> {
             sig.as_ref().and_then(|(s, _)| s.params.get(i)).map(|p| (p.name.clone(), p.ty.clone()))
         };
-        let al = self.call_args(args, &keep_of, &arg_ty, None, span)?;
+        let mut al = self.call_args(args, &keep_of, &arg_ty, None, span)?;
         let arg_tys = std::mem::take(&mut self.last_arg_tys);
+        if let (Some((s, _)), ExprKind::Name(n), None) = (&sig, &base.kind, &builtin) {
+            al.fast = self.m.funcs.contains_key(n)
+                && s.tparams.is_empty()
+                && s.params.len() == arg_tys.len()
+                && s.params.iter().zip(&arg_tys).all(|(p, t)| !p.keep && (p.ty == Ty::Unknown || self.proves(&p.ty, t)));
+        }
         if let Some((_, n)) = &builtin {
             self.check_builtin_bounds(n, &arg_tys, span)?;
             if n == "spawn" {
@@ -4535,7 +4546,7 @@ impl<'m> FnCtx<'m> {
         }
         let _ = span;
         self.last_arg_tys = arg_tys;
-        Ok(ArgList { args: out, pins: self.heap_borrows > 0 })
+        Ok(ArgList { args: out, pins: self.heap_borrows > 0, fast: false })
     }
 
     fn after_call(&mut self, al: &ArgList) {
@@ -4601,6 +4612,8 @@ impl<'m> FnCtx<'m> {
             self.option_check(&r, &format!("calling `.{mname}()`"), span)?;
         }
         let mut sig: Option<Sig> = None;
+        // An inherent method of a non-generic slim struct: `ArgList::fast` may apply.
+        let mut plain = false;
         // The trait whose method this is: the call is qualified with it.
         let mut qual: Option<String> = force.map(String::from);
         let ambiguous = |c: &str, ts: &[String]| {
@@ -4636,7 +4649,10 @@ impl<'m> FnCtx<'m> {
                             None if ci.native && ci.methods.contains_key(mname) => sig = ci.methods.get(mname).map(|s| s.subst(&map)),
                             None => return Err(type_err(format!("`{c}` has no method `{t}::{mname}`"), span)),
                         },
-                        (None, Some(MethodRef::Inherent(s))) => sig = Some(s.subst(&map)),
+                        (None, Some(MethodRef::Inherent(s))) => {
+                            sig = Some(s.subst(&map));
+                            plain = ci.tparams.is_empty() && !ci.native;
+                        }
                         (None, found) => {
                             if let Some((_, s)) = reg.iter().find(|(t, _)| t.is_none()) {
                                 // A conditional inherent impl (`impl<T: Ord> Stack<T>`).
@@ -4798,7 +4814,11 @@ impl<'m> FnCtx<'m> {
             }
             elem_arg.as_ref().filter(|(k, _)| *k == i).map(|(_, t)| (String::new(), t.clone()))
         };
-        let al = self.call_args(args, &keep_of, &arg_ty, r.root, span)?;
+        let mut al = self.call_args(args, &keep_of, &arg_ty, r.root, span)?;
+        if let (true, Some(s)) = (plain, &sig) {
+            al.fast = s.tparams.is_empty()
+                && s.params.iter().zip(&self.last_arg_tys).all(|(p, t)| !p.keep && (p.ty == Ty::Unknown || self.proves(&p.ty, t)));
+        }
         if let ("append" | "insert", Ty::List(_)) = (mname, &r.ty) {
             if let Some(arg) = al.args.last() {
                 let ty = self.last_arg_tys.last().cloned().unwrap_or(Ty::Unknown);
@@ -4840,28 +4860,43 @@ impl<'m> FnCtx<'m> {
         if self.is_module {
             return Err(syn_err("`return` outside function", span));
         }
-        let r = match v {
+        let (r, ty) = match v {
             Some(e) if self.is_generator => {
                 let r = self.expr_owned(e, "the return value")?;
-                r.reg
+                (r.reg, r.ty)
             }
             Some(e) => {
                 let dst = self.tmp_owned();
                 self.expect = (self.ret_ty != Ty::Unknown).then(|| self.ret_ty.clone());
-                self.value_into(e, dst)?;
-                dst
+                let ty = self.value_into(e, dst)?;
+                (dst, ty)
             }
             None => {
                 let dst = self.tmp_owned();
                 self.load_imm(dst, Value::UNIT);
-                dst
+                (dst, Ty::Unit)
             }
         };
-        self.emit_return(r);
+        self.emit_return(r, &ty);
         Ok(())
     }
 
-    fn emit_return(&mut self, r: Reg) {
+    /// Whether every value of static type `got` passes the runtime check of
+    /// the declared type `want` (so the check can be left out).
+    fn proves(&self, want: &Ty, got: &Ty) -> bool {
+        match (want, got) {
+            (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Bool, Ty::Bool) | (Ty::Str, Ty::Str) | (Ty::BigInt, Ty::BigInt) | (Ty::Unit, Ty::Unit) => {
+                true
+            }
+            (Ty::Instance(a, x), Ty::Instance(b, y)) => {
+                a == b && x.is_empty() && y.is_empty() && self.m.classes.get(a).is_some_and(|c| c.tparams.is_empty() && !c.native)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `r`, whose static type is `ty`.
+    fn emit_return(&mut self, r: Reg, ty: &Ty) {
         let finallys: Vec<Block> = self.finally_stack.iter().rev().cloned().collect();
         let saved = std::mem::take(&mut self.finally_stack);
         for f in &finallys {
@@ -4870,6 +4905,8 @@ impl<'m> FnCtx<'m> {
         self.finally_stack = saved;
         if !self.is_generator {
             match self.ret.clone() {
+                RetKind::Typed(_) if self.proves(&self.ret_ty, ty) => {}
+                RetKind::Unit if *ty == Ty::Unit => {}
                 RetKind::Typed(d) => {
                     let ti = self.type_idx(d);
                     self.emit(Instr::CheckType { reg: r, ty: ti, what: self.ret_desc });
@@ -5179,7 +5216,7 @@ impl<'m> FnCtx<'m> {
         let code = compile_function(self.m, f, Owner::None, &caps, &outer)?;
         self.codes.push(Arc::new(code));
         let ci = (self.codes.len() - 1) as u32;
-        let al = self.arglist(ArgList { args: cap_args, pins: false });
+        let al = self.arglist(ArgList { args: cap_args, pins: false, fast: false });
         self.emit(Instr::MakeFunction { dst, code: ci, captures: al });
         Ok(self.func_ty(local))
     }
@@ -5517,10 +5554,14 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     }
     ctx.state = Some(state);
     let fname = if f.is_lambda { "lambda".to_string() } else { format!("`{}()`", ctx.name) };
+    let first = ctx.here();
     for (reg, d, pname) in checks {
         let ti = ctx.type_idx(d);
         let w = ctx.name_idx(&format!("argument `{pname}` of {fname}"));
         ctx.emit(Instr::CheckType { reg, ty: ti, what: w });
+    }
+    if first == 0 {
+        ctx.entry = ctx.here();
     }
     let (ret, ret_ty) = match &f.ret {
         Some(TypeExpr::Unit(_)) => (RetKind::Unit, Ty::Unit),
@@ -5566,9 +5607,9 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
         }
     } else {
         let expect = (ctx.ret_ty != Ty::Unknown).then(|| ctx.ret_ty.clone());
-        ctx.block_value_expect(body, dst, expect)?;
+        let ty = ctx.block_value_expect(body, dst, expect)?;
         if ctx.state.is_some() {
-            ctx.emit_return(dst);
+            ctx.emit_return(dst, &ty);
         }
     }
     let is_method = class_name.is_some() || in_impl;

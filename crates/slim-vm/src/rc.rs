@@ -12,14 +12,14 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::object::Obj;
 use crate::value::Value;
 
 static EPOCH: AtomicU64 = AtomicU64::new(1);
-static LIVE_OBJECTS: AtomicU64 = AtomicU64::new(0);
+static LIVE_OBJECTS: AtomicI64 = AtomicI64::new(0);
 
 const OFFLINE: u64 = u64::MAX;
 
@@ -100,19 +100,24 @@ thread_local! {
 /// The thread must not touch slim values afterwards.
 pub(crate) fn thread_exit() {
     RC.with(|rc| rc.borrow_mut().hand_off());
+    flush_live();
+    crate::object::release_free_list();
 }
 
-pub(crate) fn note_alloc() {
-    LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn note_free() {
-    LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+/// Adds this thread's allocations minus frees to the global count.
+pub(crate) fn flush_live() {
+    let d = crate::object::take_live_delta();
+    if d != 0 {
+        LIVE_OBJECTS.fetch_add(d, Ordering::Relaxed);
+    }
 }
 
 /// Number of mortal heap objects currently allocated (for the RC audit).
+/// Threads count locally and add their counts at each `rc_run` and when
+/// they exit, so this is exact once other threads have finished.
 pub fn live_objects() -> u64 {
-    LIVE_OBJECTS.load(Ordering::Relaxed)
+    flush_live();
+    LIVE_OBJECTS.load(Ordering::Relaxed) as u64
 }
 
 fn epoch() -> u64 {
@@ -202,7 +207,27 @@ pub fn autorelease(v: Value) -> Value {
 /// Marks a safepoint: the thread holds no unpinned borrows of shared memory.
 #[inline]
 pub fn safepoint() {
-    let _ = RC.try_with(|rc| rc.borrow().rec.quiescent.store(epoch(), Ordering::SeqCst));
+    let _ = RC.try_with(|rc| quiesce(&rc.borrow().rec));
+}
+
+/// A safepoint that also returns `pending_count()` (for loop back-edges).
+#[inline]
+pub(crate) fn safepoint_pending() -> usize {
+    RC.try_with(|rc| {
+        let rc = rc.borrow();
+        quiesce(&rc.rec);
+        rc.pending.len() + rc.deferred.len() + rc.retired.len()
+    })
+    .unwrap_or(0)
+}
+
+#[inline(always)]
+fn quiesce(rec: &ThreadRec) {
+    let e = epoch();
+    // Republishing the same epoch would claim nothing new: skip the store.
+    if rec.quiescent.load(Ordering::Relaxed) != e {
+        rec.quiescent.store(e, Ordering::SeqCst);
+    }
 }
 
 /// The thread is about to block (join, lock, channel): it cannot touch

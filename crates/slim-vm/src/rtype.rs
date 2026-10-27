@@ -135,7 +135,7 @@ pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
     if let Some(v) = t.get(&key) {
         return *v;
     }
-    let v = Obj::alloc_immortal(Body::Type(RtType {
+    let v = Obj::alloc_immortal(Body::Type(Box::new(RtType {
         ctor,
         args: args.into(),
         name: type_name(ctor, args, erased(ctor) && !local),
@@ -145,7 +145,7 @@ pub fn intern_with(ctor: Ctor, args: &[Value], explicit: bool) -> Value {
         list_of: OnceLock::new(),
         option_of: OnceLock::new(),
         impls: OnceLock::new(),
-    }));
+    })));
     let _ = as_type(v).unwrap().this.set(v);
     t.insert(key, v);
     v

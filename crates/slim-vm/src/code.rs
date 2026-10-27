@@ -152,6 +152,10 @@ pub struct ArgList {
     /// Some argument is a borrow of a field/element/global: the call pins the
     /// thread's epoch so the borrowed object outlives the call.
     pub pins: bool,
+    /// The callee is a known, non-generic slim function without `keep`
+    /// parameters, and the compiler proved the arguments' types: the call
+    /// skips the generic argument handling and the parameter checks.
+    pub fast: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,6 +236,9 @@ pub struct Code {
     pub owned: Vec<bool>,
     pub reg_names: Vec<Option<String>>,
     pub instrs: Vec<Instr>,
+    /// First instruction after the parameter checks (where `ArgList::fast`
+    /// calls start).
+    pub entry: u32,
     pub lines: Vec<u32>,
     pub consts: Vec<Value>,
     pub names: Vec<String>,

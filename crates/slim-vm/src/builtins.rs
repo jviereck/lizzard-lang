@@ -57,7 +57,7 @@ impl IterKind {
 }
 
 fn new_iter(item: Value, k: IterKind) -> Value {
-    Obj::alloc(Body::Iter(IterObj { ty: rtype::iterator_of(item), k: Mutex::new(k) }))
+    Obj::alloc(Body::Iter(Box::new(IterObj { ty: rtype::iterator_of(item), k: Mutex::new(k) })))
 }
 
 fn items_iter(item: Value, items: Vec<Value>) -> Value {
@@ -961,7 +961,7 @@ pub fn names() -> Vec<&'static str> {
 }
 
 fn builtin_value(d: &BuiltinDef) -> Value {
-    Obj::alloc_immortal(Body::Builtin(Builtin { name: d.name, f: d.f, min_args: d.min, max_args: d.max, keep_mask: d.keep }))
+    Obj::alloc_immortal(Body::Builtin(Box::new(Builtin { name: d.name, f: d.f, min_args: d.min, max_args: d.max, keep_mask: d.keep })))
 }
 
 /// Creates the builtin objects: (name, value) pairs plus the exception table.
@@ -972,20 +972,20 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
     for (name, implies, required, nparams) in TRAITS {
         let implies = implies.iter().map(|n| traits.iter().find(|(m, _)| m == n).unwrap().1).collect();
         let methods = required.iter().map(|m| (m.to_string(), None)).collect();
-        let t = Obj::alloc_immortal(Body::Trait(Trait {
+        let t = Obj::alloc_immortal(Body::Trait(Box::new(Trait {
             name: name.to_string(),
             id: next_id.fetch_add(1, Ordering::Relaxed),
             nparams: *nparams,
             methods,
             implies,
             impls: Default::default(),
-        }));
+        })));
         traits.push((name, t));
     }
     let mut classes = Vec::new();
     for (name, impls) in EXCEPTIONS {
         let tr = impls.iter().map(|n| traits.iter().find(|(m, _)| m == n).unwrap().1).collect();
-        let c = Obj::alloc_immortal(Body::Class(Class {
+        let c = Obj::alloc_immortal(Body::Class(Box::new(Class {
             name: name.to_string(),
             id: next_id.fetch_add(1, Ordering::Relaxed),
             tparams: Vec::new(),
@@ -997,7 +997,7 @@ pub fn create(next_id: &std::sync::atomic::AtomicU32) -> (Vec<(&'static str, Val
             is_exception: true,
             always_local: false,
             canonical: std::sync::OnceLock::new(),
-        }));
+        })));
         classes.push((*name, c));
     }
     let exception = traits[0].1;
