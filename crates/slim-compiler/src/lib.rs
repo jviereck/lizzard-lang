@@ -28,3 +28,17 @@ pub fn compile_source_with(
     let module = slim_syntax::parse(src)?;
     compile_module_with(&module, filename, natives)
 }
+
+/// The modules a program imports (`import m`, `from m import x`), in order
+/// of first import.
+pub fn imported_modules(module: &slim_syntax::ast::Module) -> Vec<String> {
+    use slim_syntax::ast::StmtKind;
+    let mut out: Vec<String> = Vec::new();
+    for s in &module.body.stmts {
+        let (StmtKind::Import { module: m, .. } | StmtKind::FromImport { module: m, .. }) = &s.kind else { continue };
+        if !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
+}

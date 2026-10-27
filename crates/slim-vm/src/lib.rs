@@ -6,6 +6,7 @@ pub mod backend;
 pub mod builtins;
 pub mod code;
 pub mod dict;
+pub mod ext;
 pub mod display;
 pub mod generator;
 pub mod helpers;

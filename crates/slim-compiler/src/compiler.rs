@@ -683,8 +683,9 @@ fn ntype_ty(t: &NType, classes: &NativeNames) -> Ty {
 }
 
 /// The slim name and type arguments of the native class over each Rust
-/// type (`geom.Stack`, `[int]` for an instantiation of a generic class).
-type NativeNames = HashMap<std::any::TypeId, (String, Vec<NType>)>;
+/// type, by class key (`geom.Stack`, `[int]` for an instantiation of a
+/// generic class).
+type NativeNames = HashMap<u64, (String, Vec<NType>)>;
 
 fn native_class_info(c: &slim_vm::native::ClassSpec, m: &ModuleSpec, names: &NativeNames) -> ClassInfo {
     let mut methods: HashMap<String, Sig> = c.methods.iter().map(|f| (f.name.clone(), native_sig(f, names))).collect();
@@ -781,9 +782,9 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
         for c in &m.classes {
             let n = format!("{}.{}", m.name, c.name);
             for (args, i) in &c.instances {
-                native_names.insert(i.type_id, (n.clone(), args.clone()));
+                native_names.insert(i.key, (n.clone(), args.clone()));
             }
-            native_names.insert(c.type_id, (n, Vec::new()));
+            native_names.insert(c.key, (n, Vec::new()));
         }
     }
     for m in &used {

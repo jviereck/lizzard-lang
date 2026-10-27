@@ -1,0 +1,12 @@
+dot: 32.0
+error: dot(): lengths 1 and 2 differ
+counter: 4000
+Polygon(4 points) area: 4.0 points: 4
+shape area: 4.0
+shape area: 3.14159
+a shape of area 4.0
+stack: 2 slim
+stack: 1
+error: `Stack<float>` is not available: `Stack` supports `Stack<int>`, `Stack<str>`
+rc-audit: ok
+[exit 0]

@@ -1,0 +1,14 @@
+[package]
+name = "geom_ext"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# The `geom` module as an extension (`libgeom.so` / `libgeom.dylib`), which
+# `slim` loads at `import geom`; also a library for static embedding.
+[lib]
+name = "geom"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+slim-ext = { path = "../../crates/slim-ext" }

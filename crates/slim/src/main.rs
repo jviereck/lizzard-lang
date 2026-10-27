@@ -1,6 +1,9 @@
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: slim [run] <file.slim> [--dis] [--rc-audit]";
+const USAGE: &str = "usage: slim [run] <file.slim> [--dis] [--rc-audit]
+
+Extension modules (`import geom`) are loaded from libgeom.so / libgeom.dylib /
+geom.dll in the program's directory or a directory on SLIM_PATH.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -44,30 +47,21 @@ fn run(file: &str, dis: bool, audit: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (code, globals) = match slim_compiler::compile_source(&src, file) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", e.render(file, &src));
-            return ExitCode::from(1);
-        }
-    };
+    let mut rt = slim::Runtime::new();
+    rt.rc_audit = audit;
     if dis {
-        print!("{}", code.disassemble());
-        return ExitCode::SUCCESS;
+        return match rt.disassemble(&src, file) {
+            Ok(d) => {
+                print!("{d}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            }
+        };
     }
-    let vm = slim_vm::new_vm(globals);
-    let mut th = slim_vm::Thread::new(vm);
-    let result = slim_vm::run_module(&mut th, &code);
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    slim_vm::shutdown(&mut th);
-    if audit {
-        let live = slim_vm::rc::live_objects();
-        if live != 0 {
-            eprintln!("rc-audit: {live} object(s) still alive at exit (leaked or in a cycle)");
-        } else {
-            eprintln!("rc-audit: ok");
-        }
-    }
+    let result = rt.run_source(&src, file);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(tb) => {

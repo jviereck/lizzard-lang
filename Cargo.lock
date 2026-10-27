@@ -9,10 +9,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
 name = "embed_geom"
 version = "0.1.0"
 dependencies = [
+ "geom_ext",
  "slim",
+]
+
+[[package]]
+name = "geom_ext"
+version = "0.1.0"
+dependencies = [
+ "slim-ext",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]
@@ -47,10 +71,17 @@ dependencies = [
 name = "slim"
 version = "0.1.0"
 dependencies = [
+ "libloading",
+ "slim-abi",
  "slim-compiler",
+ "slim-ext",
  "slim-syntax",
  "slim-vm",
 ]
+
+[[package]]
+name = "slim-abi"
+version = "0.1.0"
 
 [[package]]
 name = "slim-compiler"
@@ -58,6 +89,13 @@ version = "0.1.0"
 dependencies = [
  "slim-syntax",
  "slim-vm",
+]
+
+[[package]]
+name = "slim-ext"
+version = "0.1.0"
+dependencies = [
+ "slim-abi",
 ]
 
 [[package]]
@@ -71,4 +109,11 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "slim-abi",
 ]
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"

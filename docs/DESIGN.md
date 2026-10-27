@@ -215,6 +215,8 @@ A decrement never frees anything inline; it only does bookkeeping.
 | `slim-runtime` | `Value`, object header + atomic RC, QSBR, classes/traits, str/tuple/list/dict/bigint/boxed float, exceptions, `Thread` state, `extern "C"` helpers |
 | `slim-vm` | `ops.rs` opcode table + **semantics written once**; `backend/mod.rs` trait; `backend/interp.rs`; dispatch loop; frames; generators |
 | `slim-jit` | `backend/jit.rs` Cranelift backend; compile-queue thread; entry/exit generation; code installation |
+| `slim-abi` | The C ABI between the interpreter and native modules: `SlimApi`, descriptors, `ABI_VERSION` |
+| `slim-ext` | The Rust binding API (`Module`, `ClassBuilder`, `FromSlim`, ...) over `slim-abi`; `module!` declares an extension library |
 | `slim` (bin) | CLI: `slim run file.slim [--jit=off\|auto\|always] [--dis]` |
 | `tests/` | Golden `.slim` programs with `.out` files (including expected compile errors), run under every JIT mode |
 
@@ -343,6 +345,7 @@ pub trait Backend {
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
 10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`. **10e:** trait-qualified methods (`Trait::m(x)`). **10f:** impls for builtin types, native classes, specialized and conditional targets (orphan rule, coherence, registered impls).
+11. **Extension modules:** a stable C ABI (`slim-abi`), the binding API as an interpreter-independent crate (`slim-ext`), and loading `cdylib` modules at `import`.
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**
@@ -443,7 +446,7 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - module variable stores and channel sends are checked;
     - a `+ Send` generator checks its owned registers at creation and at each `yield`.
   - **Freeing.** A local object only reaches zero on its own thread. When a thread exits, its queued local objects are freed on that thread without waiting for a grace period: no other thread can reach them. So destructors of non-`Send` Rust values always run on their owner thread.
-- **Rust bindings (10).** `crates/slim` is a library plus the CLI binary. `slim::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding layer lives in `crates/slim-vm/src/native.rs`.
+- **Rust bindings (10).** `crates/slim` is a library plus the CLI binary. `slim::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding API lives in `crates/slim-ext` and reaches the interpreter only through the C ABI of `crates/slim-abi` (milestone 11); the interpreter's side is `crates/slim-vm/src/native.rs` and `ext.rs`.
   - **Functions.** `m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| ...)` accepts any `Fn` of up to 8 arguments. A first parameter `&mut Ctx` gives access to the interpreter: `ctx.call(&func, (args,))` calls a slim function or closure, and `ctx.offline(|| ...)` runs a `Send` closure with the thread marked offline, so a long computation or a blocking wait doesn't hold back `rc_run` on other threads. A result of `Result<T, SlimError>` raises on `Err`. `SlimError::new("ZeroDivisionError", msg)` names any builtin exception class (an unknown name becomes `RuntimeError`), and an exception raised by a callback passes through unchanged when the native returns its error. A panic becomes `RuntimeError: native panic in f(): <message>`.
   - **Conversions.** The `SlimType` trait maps each Rust type to the slim type the compiler sees. `FromSlim` converts arguments; `IntoSlim` converts results.
     - Scalars: `i8`–`i64`, `u8`–`u64` and `usize` are range-checked, so `300` passed as a `u8` raises `OverflowError`. `f64` and `f32` accept ints too. Also `bool`, `String`, `()` and `Option<T>`.
@@ -496,3 +499,22 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - Error messages show qualified names such as `geom.Point`.
     - `ThreadError` cannot be reached from slim code, since a local value never reaches another thread; the check exists for misuse from Rust.
     - A local native object freed off its owner thread would be a VM bug. Debug builds panic; release builds leak the Rust value with a warning rather than drop it on the wrong thread.
+- **Extension modules (11).** A native module can also be a dynamic library that the `slim` interpreter loads at `import`, like a Python extension module. The same module definition works both ways (`examples/geom_ext` is loaded by `slim` and linked by `examples/embed_geom`):
+
+  ```rust
+  // Cargo.toml: [lib] name = "geom", crate-type = ["cdylib"]; [dependencies] slim-ext
+  pub fn build(m: &mut slim_ext::Module) { m.function("dot", ..); m.class::<Polygon>("Polygon", ..); }
+  slim_ext::module!(geom, build);
+  ```
+
+  - **Loading.** Before compiling, the runtime lists the program's imports. A module that no `Runtime::module` registered is looked up as `libgeom.so` / `libgeom.dylib` / `geom.dll` in the program's directory, then in each directory of `SLIM_PATH` (`Runtime::search_path`). Not found: the compiler's `NameError: no module named`. Found but unusable (not a library, no entry points, another ABI version, a panic while building, another module name): `ImportError: cannot load module ...`. A loaded library is never unloaded: the interpreter keeps its function pointers.
+  - **The ABI (`slim-abi`).** An extension exports `slim_ext_abi_version() -> u32` and `slim_ext_init(api, err) -> module`. The interpreter checks the version, then passes its function table `SlimApi` (`#[repr(C)]`, versioned by `ABI_VERSION` and its size). Everything goes through it:
+    - **Values** are opaque `u64`s that only the table's functions interpret (`incref`, `as_int`, `list_get`, `obj_enter`, ...). Each function says whether it borrows or takes the values it is given.
+    - **Memory** is freed by the side that allocated it. The interpreter frees an extension's closures, formatters and Rust values with the extension's `FreeFn`s. Strings cross as borrowed `Str`s that the receiver copies (into a `StrOut` sink when the interpreter answers).
+    - **Errors.** An interpreter error is an owned `HostErr` that the extension reads (`err_read`), then frees or re-raises; a slim exception from a callback passes through unchanged. A native call reports failure by raising in its `Ctx` and returning false.
+    - **Panics** never cross the boundary. `slim-ext` catches them in every callback (`RuntimeError: native panic in f(): ...`), and the interpreter's module-building functions return errors instead of panicking.
+    - **Types and signatures** are byte descriptors (a tag per type; `CLASS` carries a class key). Class keys are allocated by the interpreter (`class_key_new`) and stand for the Rust type a class wraps: the extension maps each `TypeId` to its key, and the interpreter and compiler identify native classes by key. `TypeId`s are not comparable across separately built libraries.
+    - **Native objects** hold an opaque pointer to the Rust value. The interpreter keeps the borrow counter, the thread check and the mode (`obj_enter`/`obj_leave`); the extension checks the class key before casting the pointer back to `&T`.
+  - **One binding implementation.** `slim-ext` holds the whole binding API (`Module`, `ClassBuilder`, `FromSlim`, `ListRef`, `Native<T>`, ...) and does not link the interpreter. A statically registered module (`Runtime::module`) is built through the same table, handed over directly, so the native tests exercise the ABI. An extension contains only `slim-ext` (two exported symbols), so it works with any interpreter of the same ABI version, whatever compiler built either.
+  - **Cost.** Every value access is a call through the table. A native method call costs a few nanoseconds more than with direct access; converting containers costs a call per element (`dot` of two 3-element lists is about 40 ns slower). Runtime types of signatures without classes are cached per thread.
+  - **Limitations.** Compatibility is all or nothing: any change to the function table needs a new `ABI_VERSION`. A process connects `slim-ext` to one interpreter (`install` refuses a second table). A loaded extension's module is rebuilt (`slim_ext_init`) for each program a runtime runs.
