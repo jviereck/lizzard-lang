@@ -1,6 +1,6 @@
 3
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_negative_index.slim", line 3, in <module>
+  File "err_negative_index.slim", line 4, in main
 IndexError: index -1 out of range for list of length 3
 [exit 1]

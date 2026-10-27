@@ -35,12 +35,14 @@ impl Log for Service:
 def use_log(l: Log) -> ():
     l.log("via trait")
 
-s = Service::new(Console::new())
-s.log("one")
-s.log("two")
-s.hello()
-use_log(s)
-print(s.count, s.out.lines)
-label = s.last++.some_or("none")
-print(label)
-print(s)
+
+def main() -> ():
+    s = Service::new(Console::new())
+    s.log("one")
+    s.log("two")
+    s.hello()
+    use_log(s)
+    print(s.count, s.out.lines)
+    label = s.last++.some_or("none")
+    print(label)
+    print(s)

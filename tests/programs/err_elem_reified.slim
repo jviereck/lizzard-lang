@@ -2,9 +2,11 @@
 def untyped(x: any + Send) -> any + Send:
     x++
 
-counts = [1, 2, 3]
-alias = untyped(counts)
-alias[1] = 2
-print(counts)
-alias.append("four")
-print("unreachable")
+
+def main() -> ():
+    counts = [1, 2, 3]
+    alias = untyped(counts)
+    alias[1] = 2
+    print(counts)
+    alias.append("four")
+    print("unreachable")

@@ -215,14 +215,6 @@ impl Rewriter<'_> {
                     None => Ok(()),
                 }
             }
-            StmtKind::Global(names) => {
-                for n in names {
-                    if self.names.contains_key(n) {
-                        return Err(Error::syntax(format!("`{n}` is imported and cannot be declared `global`"), s.span));
-                    }
-                }
-                Ok(())
-            }
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Pass => Ok(()),
         }
     }

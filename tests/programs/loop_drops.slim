@@ -10,7 +10,7 @@ impl Drop for Noisy:
     def __drop__(self) -> ():
         print("drop", self.name)
 
-def main() -> ():
+def run() -> ():
     rc_auto(False)
     i = 0
     while i < 3:
@@ -26,5 +26,7 @@ def main() -> ():
         y = Noisy::new("again " + str(k))
     print("after range, freed", rc_run())
 
-main()
-print("end, freed", rc_run())
+
+def main() -> ():
+    run()
+    print("end, freed", rc_run())

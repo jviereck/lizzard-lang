@@ -1,5 +1,5 @@
-  File "err_send_old_syntax.slim", line 5
-    c: Counter<+local> = Counter { n: 0 }
-               ^
+  File "err_send_old_syntax.slim", line 7
+        c: Counter<+local> = Counter { n: 0 }
+                   ^
 SyntaxError: `+ local` was removed: as in Rust, a type is `Send` or not (a struct is not `Send` when a field is not), and `any + Send` restricts an erased type to `Send` values
 [exit 1]

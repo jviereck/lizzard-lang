@@ -47,28 +47,30 @@ struct AppError:
 
 impl Exception for AppError
 
-p = Point::new(3.0, 4.0)
-print(p.norm2(), p.shifted(1.0).x, Point::origin().norm2())
-q = Pair::of(1, "one")
-r = q.flip()
-print(r.first, r.second)
-s = Pair::<int, str>::of(2, "two").with_first([1.5])
-print(s.first, s.second)
-t: Pair<str, bool> = Pair::of("t", True)
-print(t.first, t.second)
-make = Point::new                    # an associated function as a value
-print(make(1.0, 1.0).norm2())
-
 def scope() -> ():
     n = Noisy { name: "a" }
     print("in scope", n.name)
-scope()
 
-try:
-    raise Done
-except Done:
-    print("caught Done")
-try:
-    raise AppError { msg: "bad thing", code: 7 }
-except AppError as e:
-    print("caught", e.msg, e.code)
+
+def main() -> ():
+    p = Point::new(3.0, 4.0)
+    print(p.norm2(), p.shifted(1.0).x, Point::origin().norm2())
+    q = Pair::of(1, "one")
+    r = q.flip()
+    print(r.first, r.second)
+    s = Pair::<int, str>::of(2, "two").with_first([1.5])
+    print(s.first, s.second)
+    t: Pair<str, bool> = Pair::of("t", True)
+    print(t.first, t.second)
+    make = Point::new                    # an associated function as a value
+    print(make(1.0, 1.0).norm2())
+    scope()
+
+    try:
+        raise Done
+    except Done:
+        print("caught Done")
+    try:
+        raise AppError { msg: "bad thing", code: 7 }
+    except AppError as e:
+        print("caught", e.msg, e.code)

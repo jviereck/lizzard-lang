@@ -25,6 +25,8 @@ pub mod value;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
+use object::{Body, Obj};
+
 pub use code::Code;
 pub use interp::{Thread, Vm};
 pub use value::Value;
@@ -61,14 +63,30 @@ pub fn new_vm_with(global_names: Vec<String>, natives: &[(String, Value)]) -> Ar
     })
 }
 
-/// Runs a module's code on the current thread. On an uncaught exception the
-/// formatted traceback is returned.
-pub fn run_module(th: &mut Thread, code: &Arc<Code>) -> Result<(), String> {
+/// Runs a program on the current thread: its module code, which defines its
+/// items, then its `main` (the compiler checks that there is one), given
+/// `args` if it takes them. Returns the exit status (`main`'s `int` result,
+/// or 0), or the formatted traceback of an uncaught exception.
+pub fn run_main(th: &mut Thread, code: &Arc<Code>, args: &[String]) -> Result<i64, String> {
     let mut regs = vec![Value::UNINIT; code.nregs as usize];
-    match interp::run_code(th, code, &mut regs, std::ptr::null()) {
+    let r = interp::run_code(th, code, &mut regs, std::ptr::null()).and_then(|v| {
+        v.decref();
+        let main = th.vm.global_names.iter().position(|n| n == "main").map(|i| Value(th.vm.globals[i].load(std::sync::atomic::Ordering::Acquire)));
+        let Some(Body::Function(f)) = main.and_then(|m| m.body()) else {
+            return Err(th.raise("NameError", "the program has no `main` function"));
+        };
+        let argv = (!f.code.params.is_empty()).then(|| {
+            Obj::list(rtype::list_of(rtype::str_()), args.iter().map(|a| Value::str(a.as_str())).collect())
+        });
+        let r = helpers::call_simple(th, main.unwrap(), None, argv.as_slice());
+        argv.into_iter().for_each(|a| a.decref());
+        r
+    });
+    match r {
         Ok(v) => {
+            let status = v.as_int().unwrap_or(0);
             v.decref();
-            Ok(())
+            Ok(status)
         }
         Err(_) => {
             let msg = th.format_exception(&code.filename);

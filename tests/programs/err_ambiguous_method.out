@@ -1,5 +1,5 @@
-  File "err_ambiguous_method.slim", line 19
-    print(p.area())
-                ^
+  File "err_ambiguous_method.slim", line 21
+        print(p.area())
+                    ^
 TypeError: `area` is ambiguous for `Plot`: `Land::area` or `Shape::area`; call it as `Land::area(x)`
 [exit 1]

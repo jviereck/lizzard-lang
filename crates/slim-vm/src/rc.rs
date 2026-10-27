@@ -71,8 +71,10 @@ impl RcState {
     }
 }
 
-impl Drop for RcState {
-    fn drop(&mut self) {
+impl RcState {
+    /// Leaves the epoch system: unregisters the thread (so it no longer
+    /// holds back the horizon) and hands its queues to the orphan queue.
+    fn hand_off(&mut self) {
         THREADS.lock().unwrap().retain(|r| !Arc::ptr_eq(r, &self.rec));
         let mut o = ORPHANS.lock().unwrap();
         o.pending.extend(self.pending.drain(..).map(|(e, p)| (e, p as usize)));
@@ -82,8 +84,22 @@ impl Drop for RcState {
     }
 }
 
+impl Drop for RcState {
+    fn drop(&mut self) {
+        self.hand_off();
+    }
+}
+
 thread_local! {
     static RC: RefCell<RcState> = RefCell::new(RcState::new());
+}
+
+/// A spawned thread's last step: hands its queues to the orphan queue
+/// before it reports that it finished. (The thread-local state is only
+/// dropped later, when the OS thread exits, which shutdown cannot wait for.)
+/// The thread must not touch slim values afterwards.
+pub(crate) fn thread_exit() {
+    RC.with(|rc| rc.borrow_mut().hand_off());
 }
 
 pub(crate) fn note_alloc() {

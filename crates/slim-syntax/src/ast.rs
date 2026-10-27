@@ -41,7 +41,6 @@ pub enum StmtKind {
     Continue,
     Pass,
     Raise { exc: Option<Expr>, cause: Option<Expr> },
-    Global(Vec<String>),
     /// `import module [as alias]`
     Import { module: String, alias: Option<String> },
     /// `from module import name [as alias], ...`

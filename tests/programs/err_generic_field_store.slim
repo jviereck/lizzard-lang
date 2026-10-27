@@ -7,7 +7,9 @@ impl<T> Cell<T>:
     def set(self, v: any) -> ():
         self.value <- v++
 
-c = Cell { value: "text" }
-c.set("more")
-print(c.value)
-c.set(42)
+
+def main() -> ():
+    c = Cell { value: "text" }
+    c.set("more")
+    print(c.value)
+    c.set(42)

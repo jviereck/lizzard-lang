@@ -1,5 +1,5 @@
-  File "err_struct_lit_missing.slim", line 5
-    a = A { x: 1 }
-          ^
+  File "err_struct_lit_missing.slim", line 7
+        a = A { x: 1 }
+              ^
 TypeError: missing field `y` in `A { .. }`
 [exit 1]

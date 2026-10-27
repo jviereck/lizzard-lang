@@ -6,4 +6,6 @@ def work(x: any) -> ():
 def run<T>(x: T + keep) -> Thread:
     spawn(work, x)
 
-run(1).join()
+
+def main() -> ():
+    run(1).join()

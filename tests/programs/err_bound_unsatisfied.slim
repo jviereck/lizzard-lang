@@ -9,6 +9,8 @@ impl<T: Ord> SortedBag<T>:
         self.items.append(x)
         self.items <- sorted(self.items)
 
-ok = SortedBag::<int>::new()
-ok.add(3)
-bad = SortedBag::<list<int>>::new()
+
+def main() -> ():
+    ok = SortedBag::<int>::new()
+    ok.add(3)
+    bad = SortedBag::<list<int>>::new()

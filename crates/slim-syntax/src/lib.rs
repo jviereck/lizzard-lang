@@ -23,8 +23,12 @@ impl Error {
         Error::new("SyntaxError", msg, span)
     }
 
-    /// Renders the error with the offending source line.
+    /// Renders the error with the offending source line (just the file for
+    /// an error of the whole program, at line 0).
     pub fn render(&self, file: &str, src: &str) -> String {
+        if self.span.line == 0 {
+            return format!("  File \"{file}\"\n{}: {}", self.kind, self.msg);
+        }
         let line = src.lines().nth(self.span.line.saturating_sub(1) as usize).unwrap_or("");
         let caret = " ".repeat(self.span.col.saturating_sub(1) as usize);
         format!(

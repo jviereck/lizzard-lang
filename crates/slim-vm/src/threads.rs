@@ -170,6 +170,8 @@ pub fn spawn(th: &mut Thread, args: &[Value]) -> VResult<Value> {
         // orphan queue.
         t.rc_run(None);
         t.rc_free_local();
+        drop(t);
+        rc::thread_exit();
         let (n, cv) = &RUNNING;
         *n.lock().unwrap() -= 1;
         cv.notify_all();

@@ -28,7 +28,7 @@ fn library(name: &str) -> String {
 /// Runs `script` with `slim`; returns stdout+stderr and the exit code.
 fn slim(script: &Path, slim_path: Option<&Path>) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slim"));
-    cmd.arg(script).arg("--rc-audit").env("SLIM_POISON", "1").env_remove("SLIM_PATH");
+    cmd.arg("--rc-audit").arg(script).env("SLIM_POISON", "1").env_remove("SLIM_PATH");
     if let Some(p) = slim_path {
         cmd.env("SLIM_PATH", p);
     }

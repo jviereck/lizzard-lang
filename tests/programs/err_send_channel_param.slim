@@ -6,4 +6,6 @@ impl<T> Pool<T>:
     def new() -> Self:
         Pool { jobs: Channel() }
 
-p = Pool::<int>::new()
+
+def main() -> ():
+    p = Pool::<int>::new()

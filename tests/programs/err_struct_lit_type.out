@@ -1,5 +1,5 @@
-  File "err_struct_lit_type.slim", line 4
-    a = A { x: "one" }
-            ^
+  File "err_struct_lit_type.slim", line 6
+        a = A { x: "one" }
+                ^
 TypeError: field `x` of `A` expects `int`, got `str`
 [exit 1]

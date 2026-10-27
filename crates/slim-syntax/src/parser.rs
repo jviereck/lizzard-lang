@@ -212,14 +212,7 @@ impl Parser {
                 }
                 Ok((mk(StmtKind::FromImport { module, names }), false))
             }
-            Tok::Global => {
-                self.advance();
-                let mut names = vec![self.name("name")?.0];
-                while self.eat(&Tok::Comma) {
-                    names.push(self.name("name")?.0);
-                }
-                Ok((mk(StmtKind::Global(names)), false))
-            }
+            Tok::Global => Err(Error::syntax("slim has no module variables, so no `global`: pass values as arguments, or keep them in a struct", self.span())),
             Tok::Del => {
                 self.advance();
                 let mut targets = vec![self.expr()?];

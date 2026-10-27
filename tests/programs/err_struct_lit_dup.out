@@ -1,5 +1,5 @@
-  File "err_struct_lit_dup.slim", line 4
-    a = A { x: 1, x: 2 }
-                  ^
+  File "err_struct_lit_dup.slim", line 6
+        a = A { x: 1, x: 2 }
+                      ^
 SyntaxError: field `x` is given twice
 [exit 1]

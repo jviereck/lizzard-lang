@@ -46,21 +46,23 @@ def values(bs: list<Box<int>>) -> list<int>:
         out.append(b.value)
     out
 
-print((5).describe(), [1, 2, 3].describe(), (7).shout())
-print(Describe::describe(8), show(9), show(["a"]))
-b = Box { value: 4 }
-f = Box { value: 1.5 }
-print(b.describe(), b.shout(), b.doubled(), f.doubled())
-print(values(sorted([Box { value: 3 }, Box { value: 1 }, Box { value: 2 }])))
-print(Box { value: 1 } < Box { value: 2 }, Box { value: "b" } < Box { value: "a" })
-p = Box { value: Plain { n: 1 } }
-print(isinstance(b, Ord), isinstance(p, Ord), isinstance(b, Describe), isinstance(f, Describe))
-print(isinstance(5, Describe), isinstance("five", Describe), isinstance([1.5], Describe))
-try:
-    untyped(p) < untyped(p)
-except TypeError as e:
-    print("TypeError:", e)
-try:
-    show(untyped(f))
-except TypeError as e:
-    print("TypeError:", e)
+
+def main() -> ():
+    print((5).describe(), [1, 2, 3].describe(), (7).shout())
+    print(Describe::describe(8), show(9), show(["a"]))
+    b = Box { value: 4 }
+    f = Box { value: 1.5 }
+    print(b.describe(), b.shout(), b.doubled(), f.doubled())
+    print(values(sorted([Box { value: 3 }, Box { value: 1 }, Box { value: 2 }])))
+    print(Box { value: 1 } < Box { value: 2 }, Box { value: "b" } < Box { value: "a" })
+    p = Box { value: Plain { n: 1 } }
+    print(isinstance(b, Ord), isinstance(p, Ord), isinstance(b, Describe), isinstance(f, Describe))
+    print(isinstance(5, Describe), isinstance("five", Describe), isinstance([1.5], Describe))
+    try:
+        untyped(p) < untyped(p)
+    except TypeError as e:
+        print("TypeError:", e)
+    try:
+        show(untyped(f))
+    except TypeError as e:
+        print("TypeError:", e)

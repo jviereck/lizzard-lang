@@ -11,5 +11,7 @@ struct Plain:
 def smallest<T: Ord>(xs: list<T>) -> T:
     sorted(xs)[0]
 
-smallest([Box { value: 2 }, Box { value: 1 }])
-smallest([Box { value: Plain { n: 1 } }])
+
+def main() -> ():
+    smallest([Box { value: 2 }, Box { value: 1 }])
+    smallest([Box { value: Plain { n: 1 } }])

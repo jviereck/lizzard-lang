@@ -1,5 +1,5 @@
-  File "err_impl_specialized_missing.slim", line 11
-    Box { value: "s" }.d()
-                        ^
+  File "err_impl_specialized_missing.slim", line 13
+        Box { value: "s" }.d()
+                            ^
 AttributeError: `Box<str>` has no method `d`
 [exit 1]

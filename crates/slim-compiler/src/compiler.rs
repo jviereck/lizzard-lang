@@ -719,7 +719,49 @@ fn native_sig(f: &FnSpec, classes: &NativeNames) -> Sig {
 }
 
 /// Compiles a module that may import the native modules `natives`.
+/// Checks the top level of a program: only items (functions, structs,
+/// traits, impls, imports), and a `main` entry point taking nothing or the
+/// arguments (`args: list<str>`) and returning `()` or an exit status `int`.
+fn check_program(module: &Module) -> R<()> {
+    let mut main = None;
+    for s in &module.body.stmts {
+        match &s.kind {
+            StmtKind::Def(f) => {
+                if f.name == "main" {
+                    main = Some(f);
+                }
+            }
+            StmtKind::Struct(_) | StmtKind::Trait(_) | StmtKind::Impl(_) | StmtKind::Import { .. } | StmtKind::FromImport { .. } | StmtKind::Pass => {}
+            // A docstring.
+            StmtKind::Expr(Expr { kind: ExprKind::Str(_), .. }) => {}
+            _ => return Err(syn_err("statements must be inside a function: the program starts at `main` (`def main() -> ():`)", s.span)),
+        }
+    }
+    let Some(f) = main else { return Err(name_err("the program has no `main` function: define `def main() -> ():`", Span::default())) };
+    let named = |t: &TypeExpr, n: &str, args: &[&str]| {
+        matches!(t, TypeExpr::Named(m, a, _) if m == n && a.len() == args.len() && a.iter().zip(args).all(|(x, y)| matches!(x, TypeExpr::Named(xn, xa, _) if xn == y && xa.is_empty())))
+    };
+    if !f.tparams.is_empty() {
+        return Err(type_err("`main` cannot be generic", f.span));
+    }
+    match f.params.as_slice() {
+        [] => {}
+        [p] if !p.keep && p.ty.as_ref().is_some_and(|t| named(t, "list", &["str"])) => {}
+        _ => return Err(type_err("`main` takes no parameters or the program's arguments: `def main(args: list<str>)`", f.span)),
+    }
+    match &f.ret {
+        Some(TypeExpr::Unit(_)) => {}
+        Some(t) if named(t, "int", &[]) => {}
+        _ => return Err(type_err("`main` must return `()` or an exit status `int`", f.span)),
+    }
+    if f.body.as_ref().is_some_and(scan::has_yield) {
+        return Err(type_err("`main` cannot be a generator", f.span));
+    }
+    Ok(())
+}
+
 pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpec]) -> R<(Arc<Code>, Vec<String>)> {
+    check_program(module)?;
     let mut module = module.clone();
     let used = crate::imports::resolve(&mut module, natives)?;
     let module = &module;
@@ -730,27 +772,10 @@ pub fn compile_module_with(module: &Module, filename: &str, natives: &[ModuleSpe
         }
     }
     let builtin_names: HashSet<String> = globals.iter().cloned().collect();
+    // The program's items: functions, structs, traits, associated functions.
     let mut module_vars = Vec::new();
     scan::assigned_names(&module.body, &mut module_vars);
-    let mut decls = HashSet::new();
-    for s in &module.body.stmts {
-        match &s.kind {
-            StmtKind::Def(f) => {
-                if let Some(b) = &f.body {
-                    scan::global_decls(b, &mut decls);
-                }
-            }
-            StmtKind::Impl(i) => {
-                for m in &i.methods {
-                    if let Some(b) = &m.body {
-                        scan::global_decls(b, &mut decls);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for n in module_vars.iter().chain(decls.iter()) {
+    for n in &module_vars {
         if !globals.contains(n) {
             globals.push(n.clone());
         }
@@ -1556,7 +1581,6 @@ struct FnCtx<'m> {
     captures: Vec<(String, Ty)>,
     state: Option<State>,
     is_module: bool,
-    global_decls: HashSet<String>,
     owned_pool: Vec<Reg>,
     owned_used: usize,
     borrow_pool: Vec<Reg>,
@@ -1573,8 +1597,6 @@ struct FnCtx<'m> {
     moved_log: Vec<String>,
     class_name: Option<String>,
     handler_exc: Vec<Reg>,
-    /// Module-level annotations: name -> (static type, runtime descriptor).
-    module_decl_table: HashMap<String, (Ty, TypeDesc)>,
     /// Static types of call argument registers (for `Some(x)` typing).
     reg_ty: HashMap<Reg, Ty>,
     /// The type the context expects of the expression being compiled next
@@ -1627,7 +1649,6 @@ impl<'m> FnCtx<'m> {
             captures: Vec::new(),
             state: None,
             is_module,
-            global_decls: HashSet::new(),
             owned_pool: Vec::new(),
             owned_used: 0,
             borrow_pool: Vec::new(),
@@ -1644,7 +1665,6 @@ impl<'m> FnCtx<'m> {
             moved_log: Vec::new(),
             class_name: None,
             handler_exc: Vec::new(),
-            module_decl_table: HashMap::new(),
             reg_ty: HashMap::new(),
             expect: None,
             yield_tys: Vec::new(),
@@ -2068,9 +2088,6 @@ impl<'m> FnCtx<'m> {
     /// Checks that a local (or module variable) may be used here.
     fn check_use(&mut self, name: &str, reg: Option<Reg>, span: Span) -> R<()> {
         let Some(v) = self.st(name).cloned() else {
-            if self.is_module && self.m.module_vars.contains(name) {
-                return Err(name_err(format!("`{name}` is used before it is assigned"), span));
-            }
             return Ok(());
         };
         match v.st {
@@ -2186,16 +2203,8 @@ impl<'m> FnCtx<'m> {
                     return Err(syn_err("only simple names can be annotated", target.span));
                 };
                 let (ty, d) = self.resolve_type(ann)?;
-                if self.is_module && self.may_be_local(&ty) {
-                    return Err(type_err(
-                        format!("module variable `{n}` cannot have type `{}`, which is not `Send` (module variables are shared between threads)", ty.name()),
-                        ann.span(),
-                    ));
-                }
                 if let Some(l) = self.locals.get_mut(n) {
                     l.decl = Some((ty.clone(), d.clone()));
-                } else if self.is_module {
-                    self.module_decl_table.insert(n.clone(), (ty.clone(), d.clone()));
                 }
                 match value {
                     Some(v) => self.assign(target, v, s.span, false),
@@ -2217,17 +2226,6 @@ impl<'m> FnCtx<'m> {
             StmtKind::Raise { exc, cause } => self.raise_stmt(exc.as_ref(), cause.as_ref(), s.span),
             // Resolved before compiling (see `imports`).
             StmtKind::Import { .. } | StmtKind::FromImport { .. } => Ok(()),
-            StmtKind::Global(names) => {
-                if self.is_module {
-                    return Err(syn_err("`global` is only meaningful inside a function", s.span));
-                }
-                for n in names {
-                    if self.locals.contains_key(n) && !self.global_decls.contains(n) {
-                        return Err(syn_err(format!("`{n}` is assigned before its `global` declaration"), s.span));
-                    }
-                }
-                Ok(())
-            }
             StmtKind::Del(targets) => {
                 for t in targets {
                     self.del_target(t)?;
@@ -2470,9 +2468,6 @@ impl<'m> FnCtx<'m> {
         }
         if self.m.funcs.contains_key(n) {
             return Ty::StaticFn;
-        }
-        if let Some((t, _)) = self.module_decl_table.get(n) {
-            return t.as_value();
         }
         Ty::Unknown
     }
@@ -3622,10 +3617,7 @@ impl<'m> FnCtx<'m> {
     /// declared variable, a field of a typed local, or an element of one.
     fn target_ty(&self, t: &Expr) -> Option<Ty> {
         match &t.kind {
-            ExprKind::Name(n) => match self.locals.get(n) {
-                Some(l) => l.decl.as_ref().map(|d| d.0.clone()),
-                None => self.module_decl_table.get(n).map(|d| d.0.clone()),
-            },
+            ExprKind::Name(n) => self.locals.get(n).and_then(|l| l.decl.as_ref().map(|d| d.0.clone())),
             ExprKind::Attr(o, f) => match &o.kind {
                 ExprKind::Name(b) => self.field_ty(&self.local_ty(b), f, Span::default()).ok().filter(|t| *t != Ty::Unknown),
                 _ => None,
@@ -3695,19 +3687,16 @@ impl<'m> FnCtx<'m> {
         }
     }
 
-    /// Binds an owned temporary to a local or module variable.
+    /// Binds an owned temporary to a local.
     fn bind(&mut self, n: &str, v: Res, span: Span) -> R<()> {
         if self.captures.iter().any(|(c, _)| c == n) {
             return Err(syn_err(format!("cannot assign to captured variable `{n}`"), span));
         }
-        let decl = if let Some(l) = self.locals.get(n) {
-            if l.kind == LocalKind::Borrowed {
-                return Err(own_err(format!("cannot assign to borrowed parameter `{n}` (declare it `+ keep` to own it)"), span));
-            }
-            l.decl.clone()
-        } else {
-            self.module_decl_table.get(n).cloned()
-        };
+        let l = &self.locals[n];
+        if l.kind == LocalKind::Borrowed {
+            return Err(own_err(format!("cannot assign to borrowed parameter `{n}` (declare it `+ keep` to own it)"), span));
+        }
+        let decl = l.decl.clone();
         if let Some((dty, _)) = &decl {
             if !self.compatible(dty, &v.ty) {
                 return Err(type_err(self.explain(dty, &v.ty, format!("`{n}` is declared `{}` but assigned a `{}`", dty.name(), v.ty.name())), span));
@@ -3717,25 +3706,6 @@ impl<'m> FnCtx<'m> {
             Some((dty, _)) => dty.as_value(),
             None => v.ty.clone(),
         };
-        if self.is_module || (!self.locals.contains_key(n) && self.global_decls.contains(n)) {
-            if self.may_be_local(&v.ty) {
-                return Err(type_err(
-                    format!("cannot store `{}`, which is not `Send`, in module variable `{n}` (module variables are shared between threads)", v.ty.name()),
-                    span,
-                ));
-            }
-            let idx = self.m.gindex[n];
-            if let Some((_, d)) = &decl {
-                let ti = self.type_idx(d.clone());
-                let w = self.name_idx(&format!("variable `{n}`"));
-                self.emit(Instr::CheckType { reg: v.reg, ty: ti, what: w });
-            }
-            self.emit(Instr::StoreGlobal { idx, src: v.reg });
-            if self.is_module {
-                self.set_var(n, St::Live, ty);
-            }
-            return Ok(());
-        }
         let reg = self.locals[n].reg;
         if let Some((_, d)) = &decl {
             let ti = self.type_idx(d.clone());
@@ -5433,7 +5403,6 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     ctx.captures = captures.to_vec();
     let body = f.body.as_ref().unwrap();
     ctx.is_generator = scan::has_yield(body);
-    scan::global_decls(body, &mut ctx.global_decls);
     let mut state = State::new();
     let mut params = Vec::new();
     let mut checks = Vec::new();
@@ -5540,7 +5509,7 @@ pub fn compile_function(m: &ModInfo, f: &FuncDef, owner: Owner, captures: &[(Str
     let mut local_names = Vec::new();
     scan::assigned_names(body, &mut local_names);
     for n in local_names {
-        if ctx.locals.contains_key(&n) || ctx.global_decls.contains(&n) {
+        if ctx.locals.contains_key(&n) {
             continue;
         }
         let reg = ctx.new_reg(true, Some(n.clone()));

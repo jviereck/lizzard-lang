@@ -1,7 +1,7 @@
 more
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_generic_field_store.slim", line 13, in <module>
+  File "err_generic_field_store.slim", line 15, in main
   File "err_generic_field_store.slim", line 8, in Cell.set
 TypeError: field `Cell.value` expected `str`, got `int`
 [exit 1]

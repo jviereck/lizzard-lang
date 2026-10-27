@@ -108,33 +108,6 @@ fn expr_assigned(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-/// `global` declarations in a function body.
-pub fn global_decls(b: &Block, out: &mut HashSet<String>) {
-    for s in &b.stmts {
-        match &s.kind {
-            StmtKind::Global(names) => out.extend(names.iter().cloned()),
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => global_decls(body, out),
-            StmtKind::Expr(e) | StmtKind::Assign { value: e, .. } | StmtKind::Return(Some(e)) => {
-                if let ExprKind::If { branches, else_ } = &e.kind {
-                    for (_, b) in branches {
-                        global_decls(b, out);
-                    }
-                    if let Some(b) = else_ {
-                        global_decls(b, out);
-                    }
-                }
-                if let ExprKind::Try(t) = &e.kind {
-                    global_decls(&t.body, out);
-                    for h in &t.handlers {
-                        global_decls(&h.body, out);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Whether a function body yields (not counting nested functions).
 pub fn has_yield(b: &Block) -> bool {
     let mut found = false;

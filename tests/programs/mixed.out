@@ -13,10 +13,10 @@ got hi
 5
 big
 40
-pending: 6
+pending: 7
 dropping a
 dropping b
-freed: 7
+freed: 8
 pending: 0
 rc-audit: ok
 [exit 0]

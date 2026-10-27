@@ -1,0 +1,5 @@
+  File "err_main_signature.slim", line 2
+    def main(n: int) -> ():
+    ^
+TypeError: `main` takes no parameters or the program's arguments: `def main(args: list<str>)`
+[exit 1]

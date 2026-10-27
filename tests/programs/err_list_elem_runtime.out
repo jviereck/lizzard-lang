@@ -1,6 +1,6 @@
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_list_elem_runtime.slim", line 4, in <module>
+  File "err_list_elem_runtime.slim", line 7, in main
   File "err_list_elem_runtime.slim", line 3, in f
 TypeError: cannot store `int` in `list<str>`
 [exit 1]

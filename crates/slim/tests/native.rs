@@ -200,75 +200,87 @@ fn native_bindings() {
     // Scalars, strings, options, conversions.
     let l = ok(r#"
 from util import log, add, half, small, shout, maybe, squares, total
-log(str(add(2, 3)))
-log(str(half(5)))
-log(shout("hi"))
-log(str(maybe(None)) + " " + str(maybe(4)))
-xs = squares(4)
-xs.append(16)
-log(str(xs))
-log(str(total([1.5, 2.5])))
-log(str(small(100)))
+
+
+def main() -> ():
+    log(str(add(2, 3)))
+    log(str(half(5)))
+    log(shout("hi"))
+    log(str(maybe(None)) + " " + str(maybe(4)))
+    xs = squares(4)
+    xs.append(16)
+    log(str(xs))
+    log(str(total([1.5, 2.5])))
+    log(str(small(100)))
 "#);
     assert_eq!(l, ["5", "2.5", "HI", "None 5", "[0, 1, 4, 9, 16]", "4.0", "200"]);
 
     // `import m` and qualified names.
-    let l = ok("import util\nutil.log(str(util.add(1, 1)))\n");
+    let l = ok("import util\ndef main() -> ():\n    util.log(str(util.add(1, 1)))\n");
     assert_eq!(l, ["2"]);
 
     // Static argument checks use the Rust signature.
-    let e = err("from util import add\nadd(1, \"x\")\n");
+    let e = err("from util import add\ndef main() -> ():\n    add(1, \"x\")\n");
     assert!(e.contains("argument `#2` expects `int`, got `str`"), "{e}");
-    let e = err("from util import scale\nxs = [1, 2]\nscale(xs, 2.0)\n");
+    let e = err("from util import scale\ndef main() -> ():\n    xs = [1, 2]\n    scale(xs, 2.0)\n");
     assert!(e.contains("expects `list<float>`, got `list<int>`"), "{e}");
-    let e = err("import nope\n");
+    let e = err("import nope\ndef main() -> ():\n    pass\n");
     assert!(e.contains("no module named `nope`"), "{e}");
 
     // Range checks raise OverflowError; the runtime check covers `any`.
-    let e = err("from util import small\ndef u(x: any) -> any:\n    x++\nsmall(u(300))\n");
+    let e = err("from util import small\ndef u(x: any) -> any:\n    x++\ndef main() -> ():\n    small(u(300))\n");
     assert!(e.contains("OverflowError: argument 1 of small(): 300 does not fit in u8"), "{e}");
 
     // Typed handles read and write in place.
     let l = ok(r#"
 from util import log, scale, tally, fill
-xs = [1.0, 2.0]
-scale(xs, 3.0)
-log(str(xs))
-d: dict<str, int> = {}
-tally(d, "a")
-tally(d, "a")
-log(str(d))
-a = array(f32, 3)
-fill(a, 0.5)
-log(str(a))
+
+
+def main() -> ():
+    xs = [1.0, 2.0]
+    scale(xs, 3.0)
+    log(str(xs))
+    d: dict<str, int> = {}
+    tally(d, "a")
+    tally(d, "a")
+    log(str(d))
+    a = array(f32, 3)
+    fill(a, 0.5)
+    log(str(a))
 "#);
     assert_eq!(l, ["[3.0, 6.0]", "{'a': 2}", "array(f32, [0.5, 0.5, 0.5])"]);
 
     // `Result` errors and panics become exceptions.
     let l = ok(r#"
 from util import log, checked_div, boom
-try:
-    checked_div(1, 0)
-except ZeroDivisionError as e:
-    log("caught " + str(e))
-try:
-    boom()
-except RuntimeError as e:
-    log(str(e))
+
+
+def main() -> ():
+    try:
+        checked_div(1, 0)
+    except ZeroDivisionError as e:
+        log("caught " + str(e))
+    try:
+        boom()
+    except RuntimeError as e:
+        log(str(e))
 "#);
     assert_eq!(l, ["caught checked_div by zero", "native panic in boom(): kaboom"]);
 
     // Callbacks; exceptions raised by them pass through the native unchanged.
     let l = ok(r#"
 from util import log, apply, work_offline
-log(str(apply(|x: int| x * 10, 4)))
 def bad(x: int) -> int:
     raise ValueError("from slim")
-try:
-    apply(bad, 1)
-except ValueError as e:
-    log("callback: " + str(e))
-log(str(work_offline(5)))
+
+
+def main() -> ():
+    log(str(apply(|x: int| x * 10, 4)))
+    try:
+        apply(bad, 1)
+    except ValueError as e:
+        log("callback: " + str(e))
+    log(str(work_offline(5)))
 "#);
     assert_eq!(l, ["40", "callback: from slim", "10"]);
 
@@ -276,18 +288,21 @@ log(str(work_offline(5)))
     let l = ok(r#"
 from util import log
 from geom import Point, origin, dist2
-p = Point(3.0, 4.0)
-log(str(p.norm2()))
-p.shift(1.0)
-log(str(p))
-log(str(dist2(p, origin())))
 def far(q: Point) -> bool:
     q.norm2() > 10.0
-log(str(far(p)))
-log(str(isinstance(p, Point)))
+
+
+def main() -> ():
+    p = Point(3.0, 4.0)
+    log(str(p.norm2()))
+    p.shift(1.0)
+    log(str(p))
+    log(str(dist2(p, origin())))
+    log(str(far(p)))
+    log(str(isinstance(p, Point)))
 "#);
     assert_eq!(l, ["25.0", "Point(4, 4)", "32.0", "True", "True"]);
-    let e = err("from geom import Point\np = Point(1.0, 2.0)\np.nope()\n");
+    let e = err("from geom import Point\ndef main() -> ():\n    p = Point(1.0, 2.0)\n    p.nope()\n");
     assert!(e.contains("has no method `nope`"), "{e}");
 
     // Send + Sync: shared calls from many threads.
@@ -297,13 +312,16 @@ from geom import Hits
 def work(h: Hits, n: int) -> ():
     for i in range(n):
         h.hit()
-h = Hits()
-ts: list<Thread> = []
-for i in range(4):
-    ts.append(spawn(work, h++, 500))
-for t in ts:
-    t.join()
-log(str(h.count()))
+
+
+def main() -> ():
+    h = Hits()
+    ts: list<Thread> = []
+    for i in range(4):
+        ts.append(spawn(work, h++, 500))
+    for t in ts:
+        t.join()
+    log(str(h.count()))
 "#);
     assert_eq!(l, ["2000"]);
 
@@ -311,14 +329,18 @@ log(str(h.count()))
     let l = ok(r#"
 from util import log
 from geom import Acc
-a = Acc()
-log(str(a.add(2)))
-log(str(a.add_via(|| 5)))
-try:
-    a.add_via(|| a.get())
-except BorrowError as e:
-    log("BorrowError: " + str(e))
-log(str(a.get()))
+
+
+def main() -> ():
+    a = Acc()
+    log(str(a.add(2)))
+    log(str(a.add_via(|| 5)))
+    b = a++
+    try:
+        a.add_via(|| b.get())
+    except BorrowError as e:
+        log("BorrowError: " + str(e))
+    log(str(a.get()))
 "#);
     assert_eq!(l, ["2", "7", "BorrowError: `Acc` object is in use by a call that needs it exclusively", "7"]);
 
@@ -329,13 +351,16 @@ from geom import Locked
 def work(a: Locked) -> ():
     for i in range(300):
         a.add(1)
-a = Locked()
-ts: list<Thread> = []
-for i in range(4):
-    ts.append(spawn(work, a++))
-for t in ts:
-    t.join()
-log(str(a.get()))
+
+
+def main() -> ():
+    a = Locked()
+    ts: list<Thread> = []
+    for i in range(4):
+        ts.append(spawn(work, a++))
+    for t in ts:
+        t.join()
+    log(str(a.get()))
 "#);
     assert_eq!(l, ["1200"]);
 
@@ -352,13 +377,10 @@ def main() -> ():
     cells: list<Cell> = [Cell(5)]
     log(str(cells[0].get()))
     log(str(apply(|x: int| c.get() + x, 10)))
-main()
 "#);
     assert_eq!(l, ["2", "5", "12"]);
-    let e = err("from geom import Cell\ndef show(x: Cell) -> int:\n    x.get()\ndef main() -> ():\n    spawn(show, Cell(1))\nmain()\n");
+    let e = err("from geom import Cell\ndef show(x: Cell) -> int:\n    x.get()\ndef main() -> ():\n    spawn(show, Cell(1))\n");
     assert!(e.contains("spawn(): argument 1 is not `Send` (`geom.Cell`) and cannot be sent to another thread"), "{e}");
-    let e = err("from geom import Cell\nshared = Cell(1)\n");
-    assert!(e.contains("cannot store `geom.Cell`, which is not `Send`, in module variable `shared`"), "{e}");
 
     // Generic classes: each instantiation is its own Rust class.
     let l = ok(r#"
@@ -379,7 +401,6 @@ def main() -> ():
     c = countdown(3)
     log(str(c.pop()) + " " + str(c.len()))
     log(str(s))
-main()
 "#);
     assert_eq!(l, ["2 2 1", "a None", "Point(1, 2)", "True False", "1 2", "<Stack<int> object>"]);
 
@@ -398,20 +419,19 @@ def main() -> ():
         make(1.5)
     except TypeError as e:
         log(str(e))
-main()
 "#);
     assert_eq!(l, ["1", "x", "`Stack<float>` is not available: `Stack` supports `Stack<int>`, `Stack<str>`, `Stack<Point>`"]);
 
     // Statically known: checked at compile time.
-    let e = err("from geom import Stack\ns = Stack::<float>()\n");
+    let e = err("from geom import Stack\ndef main() -> ():\n    s = Stack::<float>()\n");
     assert!(e.contains("`geom.Stack<float>` is not available: `geom.Stack` supports `geom.Stack<int>`, `geom.Stack<str>`, `geom.Stack<geom.Point>`"), "{e}");
-    let e = err("from geom import Stack\ndef f(s: Stack<bool>) -> ():\n    s.len()\n");
+    let e = err("from geom import Stack\ndef f(s: Stack<bool>) -> ():\n    s.len()\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`geom.Stack<bool>` is not available"), "{e}");
-    let e = err("from geom import Stack\ns = Stack::<int>()\ns.push(\"x\")\n");
+    let e = err("from geom import Stack\ndef main() -> ():\n    s = Stack::<int>()\n    s.push(\"x\")\n");
     assert!(e.contains("argument `#1` expects `int`, got `str`"), "{e}");
-    let e = err("from geom import Stack\ns = Stack()\n");
+    let e = err("from geom import Stack\ndef main() -> ():\n    s = Stack()\n");
     assert!(e.contains("cannot infer the type arguments of `geom.Stack`"), "{e}");
-    let e = err("from geom import Stack\ns = Stack::<int>()\ns.nope()\n");
+    let e = err("from geom import Stack\ndef main() -> ():\n    s = Stack::<int>()\n    s.nope()\n");
     assert!(e.contains("has no method `nope`"), "{e}");
 
     // `Send` follows the instantiation: `Stack<int>` crosses threads,
@@ -430,10 +450,9 @@ def main() -> ():
     for t in ts:
         t.join()
     log(str(s.len()))
-main()
 "#);
     assert_eq!(l, ["400"]);
-    let e = err("from geom import Stack, Point\ndef show(s: Stack<Point>) -> int:\n    s.len()\ndef main() -> ():\n    spawn(show, Stack::<Point>())\nmain()\n");
+    let e = err("from geom import Stack, Point\ndef show(s: Stack<Point>) -> int:\n    s.len()\ndef main() -> ():\n    spawn(show, Stack::<Point>())\n");
     assert!(e.contains("is not `Send` (`geom.Stack<geom.Point>`)"), "{e}");
     // Native traits: a Rust trait implemented by a Rust class and a struct;
     // a program's trait implemented for a Rust class; builtin traits.
@@ -487,7 +506,6 @@ def main() -> ():
     st = Stack::<int>()
     st.push(5)
     log(str(size(st)) + " " + str(size(tri(1.0))))
-main()
 "#);
     assert_eq!(
         l,
@@ -508,24 +526,23 @@ def main() -> ():
         area_of(untyped(5))
     except TypeError as e:
         log("TypeError")
-main()
 "#);
     assert_eq!(l, ["0.0", "TypeError"]);
 
-    let e = err("from geom import Shape\nstruct Sq\nimpl Shape for Sq:\n    def area(self) -> float:\n        1.0\n");
+    let e = err("from geom import Shape\nstruct Sq\nimpl Shape for Sq:\n    def area(self) -> float:\n        1.0\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`impl geom.Shape for Sq`: `Sq` does not define required method `scale`"), "{e}");
-    let e = err("from geom import Point\ntrait D:\n    def area(self) -> float: ...\nimpl D for Point\n");
+    let e = err("from geom import Point\ntrait D:\n    def area(self) -> float: ...\nimpl D for Point\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`impl D for geom.Point`: `geom.Point` does not define required method `area`"), "{e}");
-    let e = err("from geom import Point\ntrait D:\n    def x(self) -> int: ...\nimpl D for Point\n");
+    let e = err("from geom import Point\ntrait D:\n    def x(self) -> int: ...\nimpl D for Point\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`geom.Point.x` is `() -> float`, but `D` needs `() -> int`"), "{e}");
-    let e = err("from geom import Polygon\nimpl Polygon:\n    def f(self) -> int:\n        1\n");
+    let e = err("from geom import Polygon\nimpl Polygon:\n    def f(self) -> int:\n        1\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`geom.Polygon` is a native class: its methods are defined in Rust"), "{e}");
-    let e = err("from geom import Shape, Point\nimpl Shape for Point\n");
+    let e = err("from geom import Shape, Point\nimpl Shape for Point\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`geom.Shape` is a native trait"), "{e}");
-    let e = err("from geom import Polygon\ntrait D:\n    def area(self) -> float: ...\ndef f() -> ():\n    impl D for Polygon\n");
+    let e = err("from geom import Polygon\ntrait D:\n    def area(self) -> float: ...\ndef f() -> ():\n    impl D for Polygon\ndef main() -> ():\n    pass\n");
     assert!(e.contains("must be at module level"), "{e}");
     // Items are order-independent: an impl may come before its trait.
-    let l = ok("from util import log\nfrom geom import Polygon\nimpl D for Polygon\nlog(Polygon().d())\ntrait D:\n    def area(self) -> float: ...\n    def d(self) -> str:\n        str(self.area())\n");
+    let l = ok("from util import log\nfrom geom import Polygon\nimpl D for Polygon\ntrait D:\n    def area(self) -> float: ...\n    def d(self) -> str:\n        str(self.area())\ndef main() -> ():\n    log(Polygon().d())\n");
     assert_eq!(l, ["0.0"]);
     // A program's traits for native classes, with bodies; for every
     // instantiation of a generic one, or a single one.
@@ -569,16 +586,15 @@ def main() -> ():
     log(str(s.count()) + " " + str(Count::count(t)) + " " + t.top() + " " + str(total([s++, s++])))
     t.push("x")
     log(t.top() + " " + str(isinstance(s, Count)) + " " + str(isinstance(s, Top)) + " " + str(isinstance(t, Top)))
-main()
 "#);
     assert_eq!(l, ["polygon of area 6.0, 6.0", "2 0 empty 4", "x True False True"]);
-    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl<T> C for Stack<T>:\n    def c(self) -> int:\n        1\nimpl C for Stack<int>:\n    def c(self) -> int:\n        2\n");
+    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl<T> C for Stack<T>:\n    def c(self) -> int:\n        1\nimpl C for Stack<int>:\n    def c(self) -> int:\n        2\ndef main() -> ():\n    pass\n");
     assert!(e.contains("conflicting implementations of `C`: `impl C for geom.Stack<int>` overlaps `impl C for geom.Stack<T>`"), "{e}");
-    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl C for Stack<float>:\n    def c(self) -> int:\n        1\n");
+    let e = err("from geom import Stack\ntrait C:\n    def c(self) -> int: ...\nimpl C for Stack<float>:\n    def c(self) -> int:\n        1\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`geom.Stack<float>` is not available"), "{e}");
-    let e = err("from geom import Polygon\nimpl Len for Polygon\n");
+    let e = err("from geom import Polygon\nimpl Len for Polygon\ndef main() -> ():\n    pass\n");
     assert!(e.contains("`impl Len for geom.Polygon`: both are foreign"), "{e}");
 
-    let e = err("from geom import Stack, Point\ndef untyped(x):\n    x++\ndef main() -> ():\n    xs: list<any + Send> = []\n    xs.append(untyped(Stack::<Point>()))\nmain()\n");
+    let e = err("from geom import Stack, Point\ndef untyped(x):\n    x++\ndef main() -> ():\n    xs: list<any + Send> = []\n    xs.append(untyped(Stack::<Point>()))\n");
     assert!(e.contains("cannot store `Stack<Point>`, which is not `Send`, in `list<any + Send>`"), "{e}");
 }

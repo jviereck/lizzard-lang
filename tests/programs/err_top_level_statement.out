@@ -1,0 +1,5 @@
+  File "err_top_level_statement.slim", line 5
+    print("not allowed")
+    ^
+SyntaxError: statements must be inside a function: the program starts at `main` (`def main() -> ():`)
+[exit 1]

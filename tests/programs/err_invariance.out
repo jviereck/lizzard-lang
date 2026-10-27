@@ -1,5 +1,5 @@
-  File "err_invariance.slim", line 6
-    print(mean(ints))
-               ^
+  File "err_invariance.slim", line 8
+        print(mean(ints))
+                   ^
 TypeError: argument `xs` expects `list<float>`, got `list<int>`
 [exit 1]

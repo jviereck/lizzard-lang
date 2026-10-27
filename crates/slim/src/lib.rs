@@ -7,7 +7,8 @@
 //!         a.to_vec().iter().zip(b.to_vec()).map(|(x, y)| x * y).sum()
 //!     });
 //! });
-//! rt.run_source("from geom import dot\nprint(dot([1.0, 2.0], [3.0, 4.0]))\n", "main.slim").unwrap();
+//! let src = "from geom import dot\n\ndef main() -> ():\n    print(dot([1.0, 2.0], [3.0, 4.0]))\n";
+//! rt.run_source(src, "main.slim").unwrap();
 //! ```
 //!
 //! Native modules come from two places:
@@ -38,12 +39,14 @@ pub struct Runtime {
     pub rc_audit: bool,
     /// Directories searched for extension libraries, after the program's own.
     pub search_path: Vec<PathBuf>,
+    /// The arguments passed to `main(args: list<str>)`.
+    pub args: Vec<String>,
 }
 
 impl Default for Runtime {
     fn default() -> Runtime {
         let search_path = std::env::var_os("SLIM_PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-        Runtime { modules: Vec::new(), rc_audit: false, search_path }
+        Runtime { modules: Vec::new(), rc_audit: false, search_path, args: Vec::new() }
     }
 }
 
@@ -102,12 +105,14 @@ impl Runtime {
     }
 
     /// Runs a program on the current thread (which needs a large stack for
-    /// deep recursion). Returns a rendered diagnostic or traceback on error.
-    pub fn run_source(&self, src: &str, filename: &str) -> Result<(), String> {
+    /// deep recursion): its `main`, with [`Runtime::args`]. Returns the exit
+    /// status (`main`'s `int` result, or 0), or a rendered diagnostic or
+    /// traceback on error.
+    pub fn run_source(&self, src: &str, filename: &str) -> Result<i64, String> {
         let p = self.compile(src, filename)?;
         let vm = slim_vm::new_vm_with(p.globals, &p.natives);
         let mut th = slim_vm::Thread::new(vm);
-        let result = slim_vm::run_module(&mut th, &p.code);
+        let result = slim_vm::run_main(&mut th, &p.code, &self.args);
         let _ = std::io::Write::flush(&mut std::io::stdout());
         slim_vm::shutdown(&mut th);
         if self.rc_audit {
@@ -122,7 +127,7 @@ impl Runtime {
     }
 
     /// Runs a program file (see `run_source`).
-    pub fn run_file(&self, path: &str) -> Result<(), String> {
+    pub fn run_file(&self, path: &str) -> Result<i64, String> {
         let src = std::fs::read_to_string(path).map_err(|e| format!("slim: cannot read {path}: {e}"))?;
         self.run_source(&src, path)
     }

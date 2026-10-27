@@ -1,7 +1,9 @@
 def area(w: int, h: int) -> int:
     w * h
-
-print(area(2, 3))
 def untyped(x):
     x++
-print(area(2, untyped("3")))
+
+
+def main() -> ():
+    print(area(2, 3))
+    print(area(2, untyped("3")))

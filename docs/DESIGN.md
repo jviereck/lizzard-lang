@@ -49,12 +49,6 @@ impl Log for Service:
             print(old)
         self.count += 1                          # copy types use plain `=`
 
-s = Service::new(Console {})                     # fresh object moved into keep param
-name = "svc"
-t = name++                                       # new reference; `name` still usable
-u = name                                         # move; `name` dead from here on
-label = s.last++.some_or("none")                 # no unwrap(); some_or consumes its receiver
-
 def classify(n: int) -> str:
     if n > 100:
         return "huge"                            # early return still allowed
@@ -64,12 +58,19 @@ def classify(n: int) -> str:
         "small"
     size                                         # last line = implicit return
 
-double = |x: int| x * 2
-report = |n: int| {
-    if n > 10:
-        print("big")
-    n                                            # lambda block value
-}
+def main(args: list<str>) -> int:                # the entry point (or `main() -> ()`)
+    s = Service::new(Console {})                 # fresh object moved into keep param
+    name = "svc"
+    t = name++                                   # new reference; `name` still usable
+    u = name                                     # move; `name` dead from here on
+    label = s.last++.some_or("none")             # no unwrap(); some_or consumes its receiver
+    double = |x: int| x * 2
+    report = |n: int| {
+        if n > 10:
+            print("big")
+        n                                        # lambda block value
+    }
+    len(args)                                    # the exit status
 ```
 - **Copy types:** `int`, `bigint`, `float`, `bool`, plus `None` and `()`. They are always copied and never touch reference counts.
   - `int` is a 64-bit integer, and overflow raises `OverflowError`.
@@ -96,6 +97,10 @@ report = |n: int| {
   - Inside the block the lexer pushes a nested indentation context. The first non-blank line after `{` sets the base indent, the usual INDENT/DEDENT rules apply relative to it, and `}` ends the context.
   - Parameters follow the same rules as functions: borrowed by default, with `+ keep` allowed. Captures move move-type values in (`++` a value first to keep it) and copy copy-type values.
   - A lambda is itself a move-type object.
+- **Programs start at `main`, as in Rust.** The top level holds only items: functions, structs, traits, impls and imports (a docstring is allowed). Any other statement there is a compile error, and there are no module variables (nor `global`): state lives in `main`'s locals and is passed on. Items are defined before `main` runs, in any order.
+  - `main` takes nothing or the program's arguments, `def main(args: list<str>)` (`slim prog.slim a b` passes `["a", "b"]`), and returns `()` or an `int` exit status (its low 8 bits, as the OS keeps them). It cannot be generic or a generator.
+  - A program without `main` is a compile error. An exception escaping `main` prints the traceback and exits with status 1.
+  - Embedders set the arguments with `Runtime::args`; `run_source` returns the exit status.
 - **Mandatory struct typing.**
   - Every field is declared in the `struct` with a type.
   - Every method annotates all its parameters except `self`, plus its return type.
@@ -346,6 +351,7 @@ pub trait Backend {
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
 10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`. **10e:** trait-qualified methods (`Trait::m(x)`). **10f:** impls for builtin types, native classes, specialized and conditional targets (orphan rule, coherence, registered impls).
 11. **Extension modules:** a stable C ABI (`slim-abi`), the binding API as an interpreter-independent crate (`slim-ext`), and loading `cdylib` modules at `import`.
+12. **`main` entry point:** items only at the top level, no module variables or `global`, `main(args: list<str>) -> int` optional forms; spawned threads hand their reclamation queues off before they report completion.
 
 ### Phase B: the derived JIT (later)
 11. **Spike, then the JIT backend.**
@@ -437,13 +443,13 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - A lambda or nested `def` is `function + Send` when every capture is `Send`, and `function` otherwise. The same holds for a bound method and its receiver. Module-level `def`s are `Send`.
     - A generator declared `-> Iterator<T> + Send` cannot hold a value that isn't `Send` (a live variable or a capture) across a `yield`. A plain `-> Iterator<T>` may hold anything.
     - `X + Send` needs `Send` arguments (`Iterator<Counter> + Send` is an error for a non-`Send` `Counter`). On non-erased types `+ Send` is an error, since they are `Send` by what they contain.
-  - **`T: Send`.** An unbounded type parameter may not be `Send`. Spawning a `T`, `Channel<T>`, a module variable of type `T`, and storing a `T` as `any + Send` all need `T: Send`.
-  - **Crossings need `Send`:** `spawn` arguments, the spawned function and its return type, channel items, module variables (like Rust statics), and a thread's result and escaping exception. These are checked statically wherever the types are known.
+  - **`T: Send`.** An unbounded type parameter may not be `Send`. Spawning a `T`, `Channel<T>`, and storing a `T` as `any + Send` all need `T: Send`.
+  - **Crossings need `Send`:** `spawn` arguments, the spawned function and its return type, channel items, and a thread's result and escaping exception. These are checked statically wherever the types are known.
   - **Runtime.** The rc word's bit 60 is set at creation from the object's type, or for closures, bound methods and generators from what they hold, and never changes. It backstops values whose static type is unknown (such as the result of calling a `function` value):
     - `has_type` rejects a local value for an erased `+ Send` type;
     - `spawn` checks its arguments and function;
     - `join` checks the thread's result and exception;
-    - module variable stores and channel sends are checked;
+    - channel sends are checked;
     - a `+ Send` generator checks its owned registers at creation and at each `yield`.
   - **Freeing.** A local object only reaches zero on its own thread. When a thread exits, its queued local objects are freed on that thread without waiting for a grace period: no other thread can reach them. So destructors of non-`Send` Rust values always run on their owner thread.
 - **Rust bindings (10).** `crates/slim` is a library plus the CLI binary. `slim::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding API lives in `crates/slim-ext` and reaches the interpreter only through the C ABI of `crates/slim-abi` (milestone 11); the interpreter's side is `crates/slim-vm/src/native.rs` and `ext.rs`.

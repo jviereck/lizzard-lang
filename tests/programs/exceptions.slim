@@ -7,27 +7,12 @@ impl Exception for AppError
 def fail(code: int) -> int:
     raise AppError { msg: "app failed", code }
 
-try:
-    fail(7)
-except AppError as e:
-    print("AppError", e.code, e.msg)
-
-# exception groups are traits
-for k in ["a", "z"]:
-    try:
-        d = {"a": 1}
-        print(d[k])
-    except LookupError as e:
-        print("lookup failed:", e)
-
 # finally with return
 def f() -> str:
     try:
         return "from try"
     finally:
         print("cleanup")
-
-print(f())
 
 # nested handlers and re-raise
 def g() -> ():
@@ -40,37 +25,54 @@ def g() -> ():
     except ArithmeticError as e:
         print("outer caught:", repr(e))
 
-g()
 
-# try as an expression, else clause
-v = try:
-    int("42")
-except ValueError:
-    0
-else:
-    print("no error")
-    100
-print(v)
-
-# raise from
-try:
+def main() -> ():
     try:
-        int("x")
-    except ValueError as e:
-        raise RuntimeError("bad config") from e
-except RuntimeError as e:
-    print("RuntimeError:", e)
+        fail(7)
+    except AppError as e:
+        print("AppError", e.code, e.msg)
 
-# except tuple and bare except
-for i in range(3):
+    # exception groups are traits
+    for k in ["a", "z"]:
+        try:
+            d = {"a": 1}
+            print(d[k])
+        except LookupError as e:
+            print("lookup failed:", e)
+
+    print(f())
+
+    g()
+
+    # try as an expression, else clause
+    v = try:
+        int("42")
+    except ValueError:
+        0
+    else:
+        print("no error")
+        100
+    print(v)
+
+    # raise from
     try:
-        if i == 0:
-            raise KeyError("k")
-        elif i == 1:
-            raise TypeError("t")
-        else:
-            raise IndexError("i")
-    except (KeyError, TypeError) as e:
-        print("tuple handler:", repr(e))
-    except:
-        print("bare handler")
+        try:
+            int("x")
+        except ValueError as e:
+            raise RuntimeError("bad config") from e
+    except RuntimeError as e:
+        print("RuntimeError:", e)
+
+    # except tuple and bare except
+    for i in range(3):
+        try:
+            if i == 0:
+                raise KeyError("k")
+            elif i == 1:
+                raise TypeError("t")
+            else:
+                raise IndexError("i")
+        except (KeyError, TypeError) as e:
+            print("tuple handler:", repr(e))
+        except:
+            print("bare handler")

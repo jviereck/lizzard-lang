@@ -81,11 +81,13 @@ def drain(s: Source<int>) -> list<int>:
         out.append(x)
     out
 
-shapes: list<Shape + Send> = [Square::new(2.0), Rect { w: 1.0, h: 3.0 }]
-print(total([Square::new(1.0), Rect { w: 2.0, h: 2.0 }]))
-for s in shapes:
-    print(s.describe(), s.twice().area())
-print(biggest([Square::new(3.0), Square::new(1.0), Square::new(2.0)]))
-print(pull(Repeat { value: "hi" }).some_or("none"))
-print(drain(Countdown { n: 3 }))
-print(isinstance(shapes[0], Shape), isinstance(shapes[0], Source))
+
+def main() -> ():
+    shapes: list<Shape + Send> = [Square::new(2.0), Rect { w: 1.0, h: 3.0 }]
+    print(total([Square::new(1.0), Rect { w: 2.0, h: 2.0 }]))
+    for s in shapes:
+        print(s.describe(), s.twice().area())
+    print(biggest([Square::new(3.0), Square::new(1.0), Square::new(2.0)]))
+    print(pull(Repeat { value: "hi" }).some_or("none"))
+    print(drain(Countdown { n: 3 }))
+    print(isinstance(shapes[0], Shape), isinstance(shapes[0], Source))

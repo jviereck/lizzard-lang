@@ -1,29 +1,8 @@
 from geom import dot, Counter, Polygon, Shape, Stack
 
-print("dot:", dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
-try:
-    dot([1.0], [1.0, 2.0])
-except ValueError as e:
-    print("error:", e)
-
 def count(c: Counter, n: int) -> ():
     for i in range(n):
         c.inc()
-
-c = Counter(0)
-threads: list<Thread> = []
-for i in range(4):
-    threads.append(spawn(count, c++, 1000))
-for t in threads:
-    t.join()
-print("counter:", c.get())
-
-square = Polygon()
-square.add(0.0, 0.0)
-square.add(2.0, 0.0)
-square.add(2.0, 2.0)
-square.add(0.0, 2.0)
-print(square, "area:", square.area(), "points:", len(square))
 
 # `Shape` is defined in Rust; slim structs implement it too.
 struct Circle:
@@ -41,17 +20,6 @@ trait Describe:
 
 impl Describe for Polygon
 
-# Module variables are shared between threads, so their values must be `Send`.
-shapes: list<Shape + Send> = [square++, Circle { r: 1.0 }]
-for s in shapes:
-    print("shape area:", s.area())
-print(square.describe())
-
-words: Stack<str> = Stack()
-words.push("hello")
-words.push("slim")
-print("stack:", words.len(), words.pop().some_or(""))
-
 # Type arguments known only at runtime pick the Rust class then;
 # `Stack::<float>()` written directly is a compile error.
 def stack_of<T>(x: T + keep) -> Stack<T>:
@@ -59,8 +27,42 @@ def stack_of<T>(x: T + keep) -> Stack<T>:
     s.push(x)
     s
 
-print("stack:", stack_of(42).len())
-try:
-    stack_of(1.5)
-except TypeError as e:
-    print("error:", e)
+
+def main() -> ():
+    print("dot:", dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
+    try:
+        dot([1.0], [1.0, 2.0])
+    except ValueError as e:
+        print("error:", e)
+
+    c = Counter(0)
+    threads: list<Thread> = []
+    for i in range(4):
+        threads.append(spawn(count, c++, 1000))
+    for t in threads:
+        t.join()
+    print("counter:", c.get())
+
+    square = Polygon()
+    square.add(0.0, 0.0)
+    square.add(2.0, 0.0)
+    square.add(2.0, 2.0)
+    square.add(0.0, 2.0)
+    print(square, "area:", square.area(), "points:", len(square))
+
+    # Any `Shape`, Rust or slim.
+    shapes: list<Shape> = [square++, Circle { r: 1.0 }]
+    for s in shapes:
+        print("shape area:", s.area())
+    print(square.describe())
+
+    words: Stack<str> = Stack()
+    words.push("hello")
+    words.push("slim")
+    print("stack:", words.len(), words.pop().some_or(""))
+
+    print("stack:", stack_of(42).len())
+    try:
+        stack_of(1.5)
+    except TypeError as e:
+        print("error:", e)

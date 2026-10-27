@@ -9,8 +9,12 @@ fn main() {
     let mut rt = Runtime::new();
     rt.module("geom", geom::build);
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../geom_ext/geom.slim");
-    if let Err(e) = rt.run_file(script) {
-        eprintln!("{e}");
-        std::process::exit(1);
+    match rt.run_file(script) {
+        // `main`'s exit status (its low 8 bits, as the OS keeps them).
+        Ok(status) => std::process::exit(status as u8 as i32),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 }

@@ -24,22 +24,10 @@ impl Stack:
             return self.head.value
         -1
 
-st = Stack::new()
-for i in range(5):
-    st.push(i * 10)
-print(st.size, st.peek())
-
 def risky(n: int) -> int:
     if n == 0:
         raise ValueError("zero!")
     100 // n
-
-r = try:
-    risky(0)
-except ValueError as e:
-    print("caught:", e)
-    -1
-print("r =", r)
 
 def lookup(d: dict, k: str) -> str:
     try:
@@ -49,8 +37,6 @@ def lookup(d: dict, k: str) -> str:
     finally:
         print("finally runs")
 
-print(lookup({"a": "A"}, "a"), lookup({"a": "A"}, "b"))
-
 def gen(n: int):
     i = 0
     while i < n:
@@ -58,22 +44,6 @@ def gen(n: int):
         if got is not None:
             print("got", got)
         i += 1
-
-for x in gen(3):
-    print("gen", x)
-
-g = gen(3)
-print(next(g))
-print(g.send("hi"))
-
-add = |a: int, b: int| a + b
-print(add(2, 3))
-report = |n: int| {
-    if n > 10:
-        print("big")
-    n * 2
-}
-print(report(20))
 
 struct Res:
     name: str
@@ -85,12 +55,44 @@ impl Res:
 impl Drop for Res:
     def __drop__(self) -> ():
         print("dropping", self.name)
-
-rc_auto(False)
 def make() -> ():
     a = Res::new("a")
     b = Res::new("b")
-make()
-print("pending:", rc_pending())
-print("freed:", rc_run())
-print("pending:", rc_pending())
+
+
+def main() -> ():
+    st = Stack::new()
+    for i in range(5):
+        st.push(i * 10)
+    print(st.size, st.peek())
+
+    r = try:
+        risky(0)
+    except ValueError as e:
+        print("caught:", e)
+        -1
+    print("r =", r)
+
+    print(lookup({"a": "A"}, "a"), lookup({"a": "A"}, "b"))
+
+    for x in gen(3):
+        print("gen", x)
+
+    g = gen(3)
+    print(next(g))
+    print(g.send("hi"))
+
+    add = |a: int, b: int| a + b
+    print(add(2, 3))
+    report = |n: int| {
+        if n > 10:
+            print("big")
+        n * 2
+    }
+    print(report(20))
+
+    rc_auto(False)
+    make()
+    print("pending:", rc_pending())
+    print("freed:", rc_run())
+    print("pending:", rc_pending())

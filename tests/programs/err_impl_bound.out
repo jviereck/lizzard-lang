@@ -1,5 +1,5 @@
-  File "err_impl_bound.slim", line 15
-    smallest([Box { value: Plain { n: 1 } }])
-            ^
+  File "err_impl_bound.slim", line 17
+        smallest([Box { value: Plain { n: 1 } }])
+                ^
 TypeError: `Box<Plain>` does not implement `Ord` (required by `T` of `smallest()`)
 [exit 1]
