@@ -381,6 +381,30 @@ impl Obj {
         Value(p as u64)
     }
 
+    /// Sets the value of `v` to `f` if it is a float that the caller holds
+    /// the only reference to (floats are immutable to programs, and no one
+    /// else can observe the change); false otherwise.
+    pub(crate) fn reuse_float(v: Value, f: f64) -> bool {
+        if !v.is_ptr() {
+            return false;
+        }
+        let p = v.0 as *mut Obj;
+        // SAFETY: `v` is a live object (the caller owns a reference).
+        let w = unsafe { &(*p).rc }.load(Ordering::Acquire);
+        if w & (IMMORTAL | QUEUED | REVIVED) != 0 || w & !FLAGS != 1 {
+            return false;
+        }
+        // SAFETY: the count is 1 and it is the caller's, so no other
+        // reference (in any thread) can read the body meanwhile.
+        match unsafe { &mut *std::ptr::addr_of_mut!((*p).body) } {
+            Body::Float(x) => {
+                *x = f;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Destroys an object whose count reached zero and whose children were
     /// released, keeping its memory for reuse.
     ///

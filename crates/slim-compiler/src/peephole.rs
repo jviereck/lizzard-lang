@@ -135,6 +135,7 @@ fn with_dst(i: Instr, tmp: Reg, dst: Reg) -> Option<Instr> {
         LoadImm { dst: d, bits } if d == tmp => LoadImm { dst, bits },
         LoadConst { dst: d, idx } if d == tmp => LoadConst { dst, idx },
         Dup { dst: d, src } if d == tmp => Dup { dst, src },
+        BoxF { dst: d, src } if d == tmp => BoxF { dst, src },
         Add { dst: d, a, b } if d == tmp => Add { dst, a, b },
         Sub { dst: d, a, b } if d == tmp => Sub { dst, a, b },
         Mul { dst: d, a, b } if d == tmp => Mul { dst, a, b },

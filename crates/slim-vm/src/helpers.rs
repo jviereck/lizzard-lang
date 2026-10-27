@@ -1258,7 +1258,10 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
         raise_dead(th, frame, recv as Reg);
         return RAISED;
     }
-    let found = find_method(th, r, mname);
+    let found = match r.as_instance().and_then(|inst| cached_method(frame, inst, mname)) {
+        Some(m) => Ok(m),
+        None => find_method(th, r, mname),
+    };
     if let (true, Ok(m)) = (al.fast, &found) {
         if let Some(status) = call_fast(th, frame, *m, Some(r), al, dst) {
             return status;
@@ -1716,11 +1719,47 @@ pub extern "C" fn f_check_type(th: &mut Thread, frame: &mut Frame, reg: u32, ty:
 
 // ---------------------------------------------------------------- fields
 
-fn field_slot(th: &mut Thread, obj: Value, name: &str) -> VResult<(&'static Instance, usize)> {
+/// The slot of field `name` of `inst`, through the inline cache of the
+/// current instruction.
+#[inline]
+fn cached_field(frame: &Frame, inst: &Instance, name: &str) -> Option<usize> {
+    let class = inst.class();
+    let ic = &frame.code().ics[frame.cur_pc as usize];
+    let tag = (class.id as u64 + 1) << 32;
+    let k = ic.load(Ordering::Relaxed);
+    if k & !0xFFFF_FFFF == tag {
+        return Some(k as u32 as usize);
+    }
+    let i = class.field_index(name)?;
+    ic.store(tag | i as u64, Ordering::Relaxed);
+    Some(i)
+}
+
+/// The inherent method `name` of `inst`'s class, through the inline cache
+/// of the current instruction (`find_method` looks inherent methods up
+/// first, so this is its result whenever it is `Some`).
+#[inline]
+fn cached_method(frame: &Frame, inst: &Instance, name: &str) -> Option<Value> {
+    const PTR: u64 = (1 << 48) - 1;
+    let class = inst.class();
+    let ic = &frame.code().ics[frame.cur_pc as usize];
+    let tag = (class.id as u64 + 1) << 48;
+    let k = ic.load(Ordering::Relaxed);
+    if k != 0 && k & !PTR == tag {
+        return Some(Value(k & PTR));
+    }
+    let m = *class.methods.get(name)?;
+    if class.id < 0xFFFF && m.0 & !PTR == 0 {
+        ic.store(tag | m.0, Ordering::Relaxed);
+    }
+    Some(m)
+}
+
+fn field_slot(th: &mut Thread, frame: &Frame, obj: Value, name: &str) -> VResult<(&'static Instance, usize)> {
     let Some(inst) = obj.as_instance() else {
         return Err(no_attribute(th, obj, name));
     };
-    match inst.class().field_index(name) {
+    match cached_field(frame, inst, name) {
         Some(i) => Ok((inst, i)),
         None => Err(th.raise("AttributeError", format!("'{}' object has no field '{name}'", inst.class().name))),
     }
@@ -1735,7 +1774,7 @@ pub extern "C" fn f_load_field(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     }
     if let Some(inst) = o.as_instance() {
         let class = inst.class();
-        if let Some(i) = class.field_index(n) {
+        if let Some(i) = cached_field(frame, inst, n) {
             let v = inst.get_borrowed(i);
             if v == Value::UNINIT {
                 th.raise("AttributeError", format!("field `{n}` of '{}' is not initialized yet", class.name));
@@ -1752,6 +1791,77 @@ pub extern "C" fn f_load_field(th: &mut Thread, frame: &mut Frame, dst: u32, obj
         return OK;
     }
     no_attribute(th, o, n);
+    RAISED
+}
+
+pub extern "C" fn f_load_field_f(th: &mut Thread, frame: &mut Frame, dst: u32, obj: u32, name: u32, _: u32) -> u32 {
+    let o = frame.reg(obj as Reg);
+    let n = &frame.code().names[name as usize];
+    if o.is_dead() {
+        raise_dead(th, frame, obj as Reg);
+        return RAISED;
+    }
+    let r = (|| {
+        let (inst, i) = field_slot(th, frame, o, n)?;
+        let raw = inst.slots[i].load(Ordering::Acquire);
+        match inst.class().fields[i].kind {
+            SlotKind::RawFloat => Ok(raw),
+            SlotKind::RawInt => Ok((raw as i64 as f64).to_bits()),
+            SlotKind::Value => raw_float(th, Value(raw)),
+        }
+    })();
+    match r {
+        Ok(bits) => {
+            frame.set(dst as Reg, Value(bits));
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
+/// The f64 bits of an int or float value.
+fn raw_float(th: &mut Thread, v: Value) -> VResult<u64> {
+    if let Some(i) = v.as_small_int() {
+        return Ok((i as f64).to_bits());
+    }
+    match v.body() {
+        Some(Body::Float(f)) => Ok(f.to_bits()),
+        Some(Body::Int(i)) => Ok((*i as f64).to_bits()),
+        _ => Err(th.raise("TypeError", format!("expected a float, got `{}`", types::value_type_name(v)))),
+    }
+}
+
+pub extern "C" fn f_unbox_f(th: &mut Thread, frame: &mut Frame, dst: u32, src: u32, _: u32, _: u32) -> u32 {
+    let v = frame.reg(src as Reg);
+    if v.is_dead() {
+        raise_dead(th, frame, src as Reg);
+        return RAISED;
+    }
+    match raw_float(th, v) {
+        Ok(bits) => {
+            frame.set(dst as Reg, Value(bits));
+            OK
+        }
+        Err(Raised) => RAISED,
+    }
+}
+
+pub extern "C" fn f_store_raw_f(_th: &mut Thread, frame: &mut Frame, dst: u32, src: u32, _: u32, _: u32) -> u32 {
+    let old = frame.reg(dst as Reg);
+    let f = f64::from_bits(frame.reg(src as Reg).0);
+    if !Obj::reuse_float(old, f) {
+        old.decref();
+        frame.set(dst as Reg, Value::float(f));
+    }
+    OK
+}
+
+pub extern "C" fn box_f(_th: &mut Thread, raw: Value) -> Value {
+    Value::float(f64::from_bits(raw.0))
+}
+
+pub extern "C" fn f_float_div_zero(th: &mut Thread, _frame: &mut Frame, _: u32, _: u32, _: u32, _: u32) -> u32 {
+    th.raise("ZeroDivisionError", "division by zero");
     RAISED
 }
 
@@ -1806,7 +1916,7 @@ pub extern "C" fn f_store_field(th: &mut Thread, frame: &mut Frame, obj: u32, na
     let v = frame.reg(src as Reg);
     let n = &frame.code().names[name as usize];
     let r = (|| {
-        let (inst, i) = field_slot(th, o, n)?;
+        let (inst, i) = field_slot(th, frame, o, n)?;
         check_store(th, inst, i, v, mode)?;
         frame.set(src as Reg, Value::MOVED);
         let kind = inst.class().fields[i].kind;
@@ -1825,7 +1935,7 @@ pub extern "C" fn f_swap_field(th: &mut Thread, frame: &mut Frame, dst: u32, obj
     let v = frame.reg(src as Reg);
     let n = &frame.code().names[name as usize];
     let r = (|| {
-        let (inst, i) = field_slot(th, o, n)?;
+        let (inst, i) = field_slot(th, frame, o, n)?;
         check_store(th, inst, i, v, StoreMode::Move)?;
         let kind = inst.class().fields[i].kind;
         if kind == SlotKind::Value && inst.slots[i].load(Ordering::Acquire) == Value::UNINIT.0 {
@@ -2108,13 +2218,24 @@ pub extern "C" fn f_build_struct(th: &mut Thread, frame: &mut Frame, dst: u32, a
         Ok(t) => t,
         Err(Raised) => return RAISED,
     };
-    let vals = take_args(frame, args);
+    let mut vals = take_args(frame, args);
     let Ctor::Class(cls) = t.ctor else { unreachable!("struct type") };
     let c = cls.as_class().expect("struct class");
     let slots: Vec<AtomicU64> = c.fields.iter().map(|f| AtomicU64::new(if f.kind == SlotKind::Value { Value::UNINIT.0 } else { 0 })).collect();
     let inst = Obj::alloc(Body::Instance(Instance { class: cls, ty: t.value(), slots: slots.into_boxed_slice() }));
     let i = inst.as_instance().unwrap();
-    let mut it = vals.into_iter().enumerate();
+    // Raw floats go straight into float slots (boxed for any other slot).
+    for (k, a) in frame.code().arglists[args as usize].args.iter().enumerate() {
+        if a.raw {
+            if c.fields[k].kind == SlotKind::RawFloat {
+                i.slots[k].store(vals[k].0, Ordering::Release);
+                vals[k] = Value::UNINIT;
+            } else {
+                vals[k] = Value::float(f64::from_bits(vals[k].0));
+            }
+        }
+    }
+    let mut it = vals.into_iter().enumerate().filter(|(_, v)| *v != Value::UNINIT);
     while let Some((k, v)) = it.next() {
         let stored = check_store(th, i, k, v, StoreMode::Move).and_then(|_| to_slot(th, v, c.fields[k].kind));
         match stored {

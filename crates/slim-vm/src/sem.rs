@@ -7,7 +7,7 @@
 use crate::backend::{Backend, Cond, Flow};
 use crate::code::Reg;
 use crate::helpers as h;
-use crate::ops::{BinKind, StoreMode, UnKind};
+use crate::ops::{BinKind, FOp, StoreMode, UnKind};
 use crate::value::Value;
 
 pub fn nop<B: Backend>(_b: &mut B) -> Flow<()> {
@@ -479,4 +479,54 @@ pub fn get_iter<B: Backend>(b: &mut B, dst: Reg, src: Reg) -> Flow<()> {
 
 pub fn for_iter<B: Backend>(b: &mut B, dst: Reg, iter: Reg, end: u32) -> Flow<()> {
     b.frame_op(h::f_for_iter, dst as u32, iter as u32, end, 0)
+}
+
+// ---------------------------------------------------------------- raw floats
+//
+// Float arithmetic trees compile to raw f64 registers (non-owned, never seen
+// as values): leaves are unboxed once and only the result is boxed.
+
+pub fn load_field_f<B: Backend>(b: &mut B, dst: Reg, obj: Reg, name: u32) -> Flow<()> {
+    b.frame_op(h::f_load_field_f, dst as u32, obj as u32, name, 0)
+}
+
+pub fn load_raw_f<B: Backend>(b: &mut B, dst: Reg, lo: u32, hi: u32) -> Flow<()> {
+    let v = b.imm((hi as u64) << 32 | lo as u64);
+    b.set_reg(dst, v);
+    Ok(())
+}
+
+pub fn unbox_f<B: Backend>(b: &mut B, dst: Reg, src: Reg) -> Flow<()> {
+    b.frame_op(h::f_unbox_f, dst as u32, src as u32, 0, 0)
+}
+
+pub fn box_f<B: Backend>(b: &mut B, dst: Reg, src: Reg) -> Flow<()> {
+    let v = b.reg(src);
+    let r = b.helper1(h::box_f, v)?;
+    b.set_reg(dst, r);
+    Ok(())
+}
+
+pub fn farith<B: Backend>(b: &mut B, dst: Reg, op: FOp, a: Reg, bb: Reg) -> Flow<()> {
+    let x = b.reg(a);
+    let y = b.reg(bb);
+    let r = if op == FOp::Div {
+        let z = b.fzero(y);
+        b.if_v(
+            z,
+            |b| {
+                b.frame_op(h::f_float_div_zero, 0, 0, 0, 0)?;
+                Ok(x)
+            },
+            |b| Ok(b.fbin(op, x, y)),
+        )?
+    } else {
+        b.fbin(op, x, y)
+    };
+    b.set_reg(dst, r);
+    Ok(())
+}
+
+pub fn store_raw_f<B: Backend>(b: &mut B, dst: Reg, src: Reg) -> Flow<()> {
+    b.frame_op(h::f_store_raw_f, dst as u32, src as u32, 0, 0)
 }

@@ -65,6 +65,10 @@ pub trait Backend {
     fn add_word(&mut self, a: Self::V, k: i64) -> Self::V;
     fn sar(&mut self, a: Self::V, n: u8) -> Self::V;
     fn cmp(&mut self, c: Cond, a: Self::V, b: Self::V) -> Self::B;
+    /// `a op b` on raw f64 bits.
+    fn fbin(&mut self, op: crate::ops::FOp, a: Self::V, b: Self::V) -> Self::V;
+    /// The raw f64 `v` is zero (either sign).
+    fn fzero(&mut self, v: Self::V) -> Self::B;
     fn bool_value(&mut self, c: Self::B) -> Self::V;
 
     fn if_v(

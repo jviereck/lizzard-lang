@@ -1,6 +1,7 @@
 //! Compiled code objects.
 
 use std::fmt;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 use crate::ops::Instr;
@@ -138,11 +139,13 @@ pub struct Arg {
     pub root: Option<Reg>,
     /// Module variable slot this borrowed argument was loaded from, or u32::MAX.
     pub global: u32,
+    /// `reg` holds raw f64 bits for a `float` field (`BuildStruct`).
+    pub raw: bool,
 }
 
 impl Arg {
     pub fn new(reg: Reg, owned: bool, local: bool, root: Option<Reg>) -> Arg {
-        Arg { reg, owned, local, root, global: u32::MAX }
+        Arg { reg, owned, local, root, global: u32::MAX, raw: false }
     }
 }
 
@@ -249,6 +252,10 @@ pub struct Code {
     /// Runtime type values of `types`, filled in on first use (for types
     /// that do not mention type parameters).
     pub type_cache: Box<[OnceLock<Value>]>,
+    /// Inline caches, one per instruction (0 = empty): field accesses keep
+    /// `(class id + 1) << 32 | slot`, method calls `(class id + 1) << 48 |
+    /// method`. Classes are immutable, so an entry never goes stale.
+    pub ics: Box<[AtomicU64]>,
     /// Hidden leading parameters (after `self`) that hold type arguments.
     pub tparams: Vec<TypeParamInfo>,
     /// Item type of a generator function (`-> Iterator<T>`).

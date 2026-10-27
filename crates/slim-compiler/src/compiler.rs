@@ -16,7 +16,7 @@ use slim_vm::code::{
 };
 use slim_vm::native::{FnSpec, ModuleSpec, NType};
 use slim_vm::object::{Body, Obj};
-use slim_vm::ops::{BinKind, Instr, StoreMode, UnKind};
+use slim_vm::ops::{BinKind, FOp, Instr, StoreMode, UnKind};
 use slim_vm::Value;
 
 use crate::scan;
@@ -1565,6 +1565,9 @@ struct FnCtx<'m> {
     instrs: Vec<Instr>,
     /// See `Code::entry`.
     entry: u32,
+    /// The expression being compiled is assigned to a float local (see
+    /// `float_local_dest`); taken by the next `binary`.
+    raw_dest: bool,
     lines: Vec<u32>,
     consts: Vec<Value>,
     names: Vec<String>,
@@ -1635,6 +1638,7 @@ impl<'m> FnCtx<'m> {
             name,
             instrs: Vec::new(),
             entry: 0,
+            raw_dest: false,
             lines: Vec::new(),
             consts: Vec::new(),
             names: Vec::new(),
@@ -1701,6 +1705,7 @@ impl<'m> FnCtx<'m> {
             self.type_idx(d)
         });
         let type_cache = (0..self.types.len()).map(|_| std::sync::OnceLock::new()).collect();
+        let ics = (0..self.instrs.len()).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
         Code {
             name: self.name,
             filename: self.m.filename.clone(),
@@ -1718,6 +1723,7 @@ impl<'m> FnCtx<'m> {
             trait_calls: self.trait_calls,
             types: self.types,
             type_cache,
+            ics,
             tparams: self.code_tparams,
             yield_ty,
             codes: self.codes,
@@ -1752,6 +1758,20 @@ impl<'m> FnCtx<'m> {
             Instr::ForIter { end, .. } => *end = target,
             other => panic!("cannot patch {other:?}"),
         }
+    }
+
+    /// Some jump or handler goes to `pc`.
+    fn is_target(&self, pc: u32) -> bool {
+        self.exc_table.iter().any(|e| e.start == pc || e.end == pc || e.handler == pc)
+            || self.instrs.iter().any(|i| match *i {
+                Instr::Jump { target }
+                | Instr::Loop { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::MatchException { target, .. } => target == pc,
+                Instr::ForIter { end, .. } => end == pc,
+                _ => false,
+            })
     }
 
     fn jump(&mut self) -> usize {
@@ -2728,36 +2748,7 @@ impl<'m> FnCtx<'m> {
                 self.discard(&r);
                 Ok(owned(dst, ty))
             }
-            ExprKind::Binary(op, a, b) => {
-                let x = self.expr(a)?;
-                let y = self.expr(b)?;
-                let pty = self.param_binop(*op, &x.ty, &y.ty, e.span)?;
-                let dst = self.tmp_owned();
-                let ins = match op {
-                    BinOp::Add => Instr::Add { dst, a: x.reg, b: y.reg },
-                    BinOp::Sub => Instr::Sub { dst, a: x.reg, b: y.reg },
-                    BinOp::Mul => Instr::Mul { dst, a: x.reg, b: y.reg },
-                    _ => {
-                        let k = match op {
-                            BinOp::Div => BinKind::Div,
-                            BinOp::FloorDiv => BinKind::FloorDiv,
-                            BinOp::Mod => BinKind::Mod,
-                            BinOp::Pow => BinKind::Pow,
-                            BinOp::BitAnd => BinKind::BitAnd,
-                            BinOp::BitOr => BinKind::BitOr,
-                            BinOp::BitXor => BinKind::BitXor,
-                            BinOp::Shl => BinKind::Shl,
-                            _ => BinKind::Shr,
-                        };
-                        Instr::Binary { dst, op: k, a: x.reg, b: y.reg }
-                    }
-                };
-                self.emit(ins);
-                let ty = pty.unwrap_or_else(|| binop_ty(*op, &x.ty, &y.ty));
-                self.discard(&y);
-                self.discard(&x);
-                Ok(owned(dst, ty))
-            }
+            ExprKind::Binary(op, a, b) => self.binary(*op, a, b, e.span),
             ExprKind::Compare(..) | ExprKind::And(..) | ExprKind::Or(..) => {
                 let dst = self.tmp_owned();
                 let f = self.cond_jump(e, false)?;
@@ -2912,8 +2903,167 @@ impl<'m> FnCtx<'m> {
         }
     }
 
+    /// `x = <float arithmetic>` to a float local that already holds a box:
+    /// the result is computed raw (`bind` then reuses the box).
+    fn float_local_dest(&self, target: &Expr, value: &Expr) -> bool {
+        match (&target.kind, &value.kind) {
+            (ExprKind::Name(n), ExprKind::Binary(op, ..)) => {
+                float_op(*op).is_some() && self.locals.contains_key(n) && self.st(n).is_some_and(|v| v.ty == Ty::Float && !matches!(v.st, St::Uninit | St::Moved))
+            }
+            _ => false,
+        }
+    }
+
+    /// `a op b`.
+    fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr, span: Span) -> R<Res> {
+        let owned = |reg, ty| Res { reg, own: Own::Owned, ty, root: None, desc: "value".into() };
+        let raw_dest = std::mem::take(&mut self.raw_dest);
+        if let Some(fop) = float_op(op) {
+            // A float arithmetic tree: raw f64 temporaries, one box.
+            let x = self.arith(a)?;
+            let y = self.arith(b)?;
+            if (raw_dest || x.is_raw() || y.is_raw()) && self.float_pair(&x, &y) {
+                let r = self.farith(fop, x, y)?;
+                let dst = self.tmp_owned();
+                self.emit(Instr::BoxF { dst, src: r });
+                return Ok(owned(dst, Ty::Float));
+            }
+            let x = self.arith_value(x)?;
+            let y = self.arith_value(y)?;
+            return self.binop(op, x, y, span);
+        }
+        let x = self.expr(a)?;
+        let y = self.expr(b)?;
+        self.binop(op, x, y, span)
+    }
+
+
+    /// `x op y` on values.
+    fn binop(&mut self, op: BinOp, x: Res, y: Res, span: Span) -> R<Res> {
+        let owned = |reg, ty| Res { reg, own: Own::Owned, ty, root: None, desc: "value".into() };
+        let pty = self.param_binop(op, &x.ty, &y.ty, span)?;
+        let dst = self.tmp_owned();
+        let ins = match op {
+            BinOp::Add => Instr::Add { dst, a: x.reg, b: y.reg },
+            BinOp::Sub => Instr::Sub { dst, a: x.reg, b: y.reg },
+            BinOp::Mul => Instr::Mul { dst, a: x.reg, b: y.reg },
+            _ => {
+                let k = match op {
+                    BinOp::Div => BinKind::Div,
+                    BinOp::FloorDiv => BinKind::FloorDiv,
+                    BinOp::Mod => BinKind::Mod,
+                    BinOp::Pow => BinKind::Pow,
+                    BinOp::BitAnd => BinKind::BitAnd,
+                    BinOp::BitOr => BinKind::BitOr,
+                    BinOp::BitXor => BinKind::BitXor,
+                    BinOp::Shl => BinKind::Shl,
+                    _ => BinKind::Shr,
+                };
+                Instr::Binary { dst, op: k, a: x.reg, b: y.reg }
+            }
+        };
+        self.emit(ins);
+        let ty = pty.unwrap_or_else(|| binop_ty(op, &x.ty, &y.ty));
+        self.discard(&y);
+        self.discard(&x);
+        Ok(owned(dst, ty))
+    }
+
+    /// Compiles an operand of float arithmetic: raw when it is itself a
+    /// float arithmetic node or a `float` field, a literal is left for the
+    /// parent to load either way.
+    fn arith<'e>(&mut self, e: &'e Expr) -> R<Arith<'e>> {
+        match &e.kind {
+            ExprKind::Float(_) => Ok(Arith::Lit(e)),
+            ExprKind::Binary(op, a, b) if float_op(*op).is_some() => {
+                let x = self.arith(a)?;
+                let y = self.arith(b)?;
+                if self.float_pair(&x, &y) {
+                    return Ok(Arith::Raw(self.farith(float_op(*op).unwrap(), x, y)?));
+                }
+                let x = self.arith_value(x)?;
+                let y = self.arith_value(y)?;
+                Ok(Arith::Val(self.binop(*op, x, y, e.span)?))
+            }
+            ExprKind::Attr(obj, name) => {
+                let o = self.expr(obj)?;
+                let raw_field = match o.ty.peel() {
+                    Ty::Instance(c, _) => self.m.classes.get(c).is_some_and(|ci| !ci.native && ci.fields.iter().any(|(n, t, _)| n == name && *t == Ty::Float)),
+                    _ => false,
+                };
+                if raw_field {
+                    let dst = self.tmp_borrow();
+                    let n = self.name_idx(name);
+                    self.emit(Instr::LoadFieldF { dst, obj: o.reg, name: n });
+                    if o.own == Own::Owned {
+                        self.stmt_drops.push(o.reg);
+                    }
+                    return Ok(Arith::Raw(dst));
+                }
+                Ok(Arith::Val(self.attr_of(o, obj, name, e.span)?))
+            }
+            _ => Ok(Arith::Val(self.expr(e)?)),
+        }
+    }
+
+    /// Both operands are numbers and at least one is a float: the result is a float.
+    fn float_pair(&self, x: &Arith, y: &Arith) -> bool {
+        let t = |a: &Arith| match a {
+            Arith::Val(r) => r.ty.peel().clone(),
+            _ => Ty::Float,
+        };
+        let (a, b) = (t(x), t(y));
+        matches!((&a, &b), (Ty::Float | Ty::Int, Ty::Float | Ty::Int)) && (a == Ty::Float || b == Ty::Float)
+    }
+
+    /// The raw register of an operand.
+    fn raw(&mut self, a: Arith) -> Reg {
+        match a {
+            Arith::Raw(r) => r,
+            Arith::Lit(e) => {
+                let ExprKind::Float(f) = e.kind else { unreachable!() };
+                let dst = self.tmp_borrow();
+                let bits = f.to_bits();
+                self.emit(Instr::LoadRawF { dst, lo: bits as u32, hi: (bits >> 32) as u32 });
+                dst
+            }
+            Arith::Val(r) => {
+                let dst = self.tmp_borrow();
+                self.emit(Instr::UnboxF { dst, src: r.reg });
+                self.discard(&r);
+                dst
+            }
+        }
+    }
+
+    /// An operand as a value (boxing a raw one).
+    fn arith_value(&mut self, a: Arith) -> R<Res> {
+        match a {
+            Arith::Val(r) => Ok(r),
+            Arith::Lit(e) => self.expr(e),
+            Arith::Raw(r) => {
+                let dst = self.tmp_owned();
+                self.emit(Instr::BoxF { dst, src: r });
+                Ok(Res { reg: dst, own: Own::Owned, ty: Ty::Float, root: None, desc: "value".into() })
+            }
+        }
+    }
+
+    fn farith(&mut self, op: FOp, x: Arith, y: Arith) -> R<Reg> {
+        let a = self.raw(x);
+        let b = self.raw(y);
+        let dst = self.tmp_borrow();
+        self.emit(Instr::FArith { dst, op, a, b });
+        Ok(dst)
+    }
+
     fn attr_expr(&mut self, obj: &Expr, name: &str, span: Span) -> R<Res> {
         let o = self.expr(obj)?;
+        self.attr_of(o, obj, name, span)
+    }
+
+    /// `o.name`, `o` being the compiled `obj`.
+    fn attr_of(&mut self, o: Res, obj: &Expr, name: &str, span: Span) -> R<Res> {
         self.option_check(&o, &format!("accessing `.{name}`"), span)?;
         let mut ty = Ty::Unknown;
         if let Ty::Instance(c, args) = &o.ty {
@@ -3545,6 +3695,7 @@ impl<'m> FnCtx<'m> {
     // ------------------------------------------------------------ assignment
 
     fn assign(&mut self, target: &Expr, value: &Expr, span: Span, _is_move: bool) -> R<()> {
+        self.raw_dest = self.float_local_dest(target, value);
         match &target.kind {
             ExprKind::Name(_) | ExprKind::Tuple(_) => {
                 let expect = self.target_ty(target);
@@ -3718,10 +3869,21 @@ impl<'m> FnCtx<'m> {
             self.emit(Instr::CheckType { reg: v.reg, ty: ti, what: w });
         }
         let prev = self.st(n).map(|x| x.st).unwrap_or(St::Uninit);
-        if !matches!(prev, St::Uninit | St::Moved) {
-            self.emit(Instr::Drop { reg });
+        let reassign = !matches!(prev, St::Uninit | St::Moved);
+        match self.instrs.last() {
+            // `x = <float arithmetic>`: the raw result replaces the old box.
+            Some(&Instr::BoxF { dst, src }) if reassign && dst == v.reg && v.ty == Ty::Float && !self.is_target(self.here()) => {
+                self.instrs.pop();
+                self.lines.pop();
+                self.emit(Instr::StoreRawF { dst: reg, src });
+            }
+            _ => {
+                if reassign {
+                    self.emit(Instr::Drop { reg });
+                }
+                self.emit(Instr::Mov { dst: reg, src: v.reg });
+            }
         }
-        self.emit(Instr::Mov { dst: reg, src: v.reg });
         self.set_var(n, St::Live, ty);
         self.unnarrow(n, None);
         Ok(())
@@ -3731,6 +3893,7 @@ impl<'m> FnCtx<'m> {
         let bin = Expr { kind: ExprKind::Binary(op, Box::new(target.clone()), Box::new(value.clone())), span };
         match &target.kind {
             ExprKind::Name(_) => {
+                self.raw_dest = self.float_local_dest(target, &bin);
                 let r = self.expr(&bin)?;
                 self.assign_owned(target, r, span)
             }
@@ -4066,14 +4229,24 @@ impl<'m> FnCtx<'m> {
             t.subst(&|p| tps.iter().position(|x| x.name == p).map(|i| known[i].clone().unwrap_or(Ty::Unknown)))
         };
         // Values in source order, owned (moved in).
-        let mut vals: Vec<(usize, Res, Span)> = Vec::new();
+        let mut vals: Vec<(usize, Res, Span, bool)> = Vec::new();
         for (f, v, fspan) in fields {
             let k = decl.iter().position(|(n, _)| n == f).unwrap();
             let pre = sub(&known, &decl[k].1);
             self.expect = (pre != Ty::Unknown).then_some(pre);
-            let r = self.expr_owned(v, &format!("field `{f}`"))?;
+            let mut r = self.expr_owned(v, &format!("field `{f}`"))?;
             self.unify(&decl[k].1, &r.ty, &tps, &mut known);
-            vals.push((k, r, *fspan));
+            // A float result for a `float` field is stored raw, unboxed.
+            let mut raw = false;
+            if let Some(&Instr::BoxF { dst, src }) = self.instrs.last() {
+                if dst == r.reg && decl[k].1 == Ty::Float && !self.is_target(self.here()) {
+                    self.instrs.pop();
+                    self.lines.pop();
+                    r.reg = src;
+                    raw = true;
+                }
+            }
+            vals.push((k, r, *fspan, raw));
         }
         if known.iter().any(|k| k.is_none()) {
             let names: Vec<&str> = tps.iter().map(|t| t.name.as_str()).collect();
@@ -4082,7 +4255,7 @@ impl<'m> FnCtx<'m> {
                 span,
             ));
         }
-        for (k, r, fspan) in &vals {
+        for (k, r, fspan, _) in &vals {
             let fty = sub(&known, &decl[*k].1);
             if !self.compatible(&fty, &r.ty) {
                 let f = &decl[*k].0;
@@ -4094,8 +4267,8 @@ impl<'m> FnCtx<'m> {
         let Some(d) = self.ty_desc(&t) else {
             return Err(type_err(format!("cannot build `{}` here", t.name()), span));
         };
-        vals.sort_by_key(|(k, _, _)| *k);
-        let args = vals.iter().map(|(_, r, _)| Arg::new(r.reg, true, false, None)).collect();
+        vals.sort_by_key(|(k, _, _, _)| *k);
+        let args = vals.iter().map(|(_, r, _, raw)| Arg { raw: *raw, ..Arg::new(r.reg, !raw, false, None) }).collect();
         let ti = self.type_idx(d);
         let al = self.arglist(ArgList { args, pins: false, fast: false });
         let dst = self.tmp_owned();
@@ -5387,6 +5560,30 @@ fn callee_name(f: &Expr) -> String {
     match &f.kind {
         ExprKind::Name(n) => format!("{n}()"),
         _ => "function".into(),
+    }
+}
+
+/// An operand of float arithmetic (see `FnCtx::arith`).
+enum Arith<'e> {
+    Val(Res),
+    /// A register holding raw f64 bits (non-owned, never used as a value).
+    Raw(Reg),
+    Lit(&'e Expr),
+}
+
+impl Arith<'_> {
+    fn is_raw(&self) -> bool {
+        matches!(self, Arith::Raw(_))
+    }
+}
+
+fn float_op(op: BinOp) -> Option<FOp> {
+    match op {
+        BinOp::Add => Some(FOp::Add),
+        BinOp::Sub => Some(FOp::Sub),
+        BinOp::Mul => Some(FOp::Mul),
+        BinOp::Div => Some(FOp::Div),
+        _ => None,
     }
 }
 

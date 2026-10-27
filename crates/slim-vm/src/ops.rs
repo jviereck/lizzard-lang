@@ -20,6 +20,16 @@ pub enum BinKind {
     Shr,
 }
 
+/// Arithmetic on raw `f64` registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum UnKind {
@@ -156,6 +166,19 @@ opcodes! {
 
     /// dst = borrow of obj.name
     LoadField { dst: Reg, obj: Reg, name: u32 } => sem::load_field;
+    /// dst = raw f64 of field `name` (a `float` field: no box).
+    LoadFieldF { dst: Reg, obj: Reg, name: u32 } => sem::load_field_f;
+    /// dst = raw f64 bits `hi:lo` (a float literal in raw arithmetic).
+    LoadRawF { dst: Reg, lo: u32, hi: u32 } => sem::load_raw_f;
+    /// dst = raw f64 of the int or float `src`.
+    UnboxF { dst: Reg, src: Reg } => sem::unbox_f;
+    /// dst = a new float from the raw f64 `src` (owned).
+    BoxF { dst: Reg, src: Reg } => sem::box_f;
+    /// Assigns the raw f64 `src` to the float local `dst`, overwriting its
+    /// box in place when the local holds the only reference.
+    StoreRawF { dst: Reg, src: Reg } => sem::store_raw_f;
+    /// dst = a op b on raw f64 registers (`/` by zero raises).
+    FArith { dst: Reg, op: FOp, a: Reg, b: Reg } => sem::farith;
     StoreField { obj: Reg, name: u32, src: Reg, mode: StoreMode } => sem::store_field;
     /// dst = old obj.name (owned); obj.name = src (moved in)
     SwapField { dst: Reg, obj: Reg, name: u32, src: Reg } => sem::swap_field;

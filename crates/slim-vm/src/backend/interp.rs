@@ -89,6 +89,24 @@ impl Backend for Interp<'_> {
     }
 
     #[inline(always)]
+    fn fbin(&mut self, op: crate::ops::FOp, a: Value, b: Value) -> Value {
+        use crate::ops::FOp;
+        let (x, y) = (f64::from_bits(a.0), f64::from_bits(b.0));
+        let r = match op {
+            FOp::Add => x + y,
+            FOp::Sub => x - y,
+            FOp::Mul => x * y,
+            FOp::Div => x / y,
+        };
+        Value(r.to_bits())
+    }
+
+    #[inline(always)]
+    fn fzero(&mut self, v: Value) -> bool {
+        f64::from_bits(v.0) == 0.0
+    }
+
+    #[inline(always)]
     fn cmp(&mut self, c: Cond, a: Value, b: Value) -> bool {
         let (a, b) = (a.0 as i64, b.0 as i64);
         match c {
