@@ -53,6 +53,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub use slim_abi as abi;
@@ -97,19 +98,46 @@ impl Value {
         self.0 == api().none
     }
 
+    // Scalars are read and made inline, from the interpreter's
+    // `ValueLayout` (like CPython's macros); the rest goes through calls.
+
+    fn is_ptr(self, l: &abi::ValueLayout) -> bool {
+        self.0 & l.ptr_mask == 0 && self.0 != 0
+    }
+
+    /// The payload of a boxed scalar of kind `kind`, at `offset`.
+    fn boxed<T: Copy>(self, l: &abi::ValueLayout, kind: u64, offset: usize) -> Option<T> {
+        if !self.is_ptr(l) {
+            return None;
+        }
+        // SAFETY: a live object's first word is its (atomic) header, and a
+        // boxed scalar's payload is immutable (see `ValueLayout`).
+        unsafe {
+            let header = (*(self.0 as *const AtomicU64)).load(Ordering::Relaxed);
+            (header & l.kind_mask == kind).then(|| *((self.0 as usize + offset) as *const T))
+        }
+    }
+
     fn as_int(self) -> Option<i64> {
-        let mut i = 0;
-        unsafe { (api().as_int)(self.0, &mut i) }.then_some(i)
+        let l = &api().layout;
+        if self.0 & l.small_int_mask == l.small_int_tag {
+            return Some((self.0 as i64) >> l.small_int_shift);
+        }
+        self.boxed(l, l.kind_int, l.int_offset)
     }
 
     fn as_float(self) -> Option<f64> {
-        let mut f = 0.0;
-        unsafe { (api().as_float)(self.0, &mut f) }.then_some(f)
+        let l = &api().layout;
+        self.boxed(l, l.kind_float, l.float_offset)
     }
 
     fn as_bool(self) -> Option<bool> {
-        let mut b = false;
-        unsafe { (api().as_bool)(self.0, &mut b) }.then_some(b)
+        let a = api();
+        match self.0 {
+            v if v == a.true_ => Some(true),
+            v if v == a.false_ => Some(false),
+            _ => None,
+        }
     }
 
     fn as_str(&self) -> Option<&str> {
@@ -123,7 +151,12 @@ impl Value {
     }
 
     fn int(i: i64) -> Value {
-        Value(unsafe { (api().int_new)(i) })
+        let a = api();
+        let l = &a.layout;
+        if (l.small_int_min..=l.small_int_max).contains(&i) {
+            return Value(((i << l.small_int_shift) as u64) | l.small_int_tag);
+        }
+        Value(unsafe { (a.int_new)(i) })
     }
 
     fn float(f: f64) -> Value {
@@ -131,7 +164,8 @@ impl Value {
     }
 
     fn bool(b: bool) -> Value {
-        Value(unsafe { (api().bool_new)(b) })
+        let a = api();
+        Value(if b { a.true_ } else { a.false_ })
     }
 
     fn str(s: &str) -> Value {
@@ -139,17 +173,24 @@ impl Value {
     }
 
     fn incref(self) {
-        unsafe { (api().incref)(self.0) }
+        let a = api();
+        if self.is_ptr(&a.layout) {
+            unsafe { (a.incref)(self.0) }
+        }
     }
 
     fn decref(self) {
-        unsafe { (api().decref)(self.0) }
+        let a = api();
+        if self.is_ptr(&a.layout) {
+            unsafe { (a.decref)(self.0) }
+        }
     }
 }
 
 /// Writes up to `cap` borrowed values; the interpreter returns their number.
 fn snapshot(f: impl Fn(*mut RawValue, usize) -> usize) -> Vec<Value> {
-    let mut buf: Vec<RawValue> = Vec::new();
+    // Room for small containers, which then take a single call.
+    let mut buf: Vec<RawValue> = Vec::with_capacity(16);
     loop {
         let n = f(buf.as_mut_ptr(), buf.capacity());
         if n <= buf.capacity() {
@@ -438,12 +479,51 @@ impl<T: IntoSlim> IntoSlim for Result<T, SlimError> {
     }
 }
 
-/// The value of a list or dict, checked against its exact runtime type.
-fn typed_container(v: Value, t: &NType) -> Result<(), SlimError> {
-    if unsafe { (api().has_type)(v.0, t.rt()) } {
+/// A hasher for `TypeId`s, which are hashes already.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(8) ^ *b as u64;
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 ^= n;
+    }
+}
+
+/// The runtime type of the slim type of Rust type `id` (`ntype` gives it),
+/// cached per thread so that conversions neither rebuild nor hash the
+/// `NType`. Types with classes are not cached (a class may be registered
+/// again).
+fn rt_of(id: TypeId, ntype: fn() -> NType) -> RawValue {
+    type Cache = HashMap<TypeId, Option<RawValue>, std::hash::BuildHasherDefault<IdHasher>>;
+    thread_local!(static CACHE: RefCell<Cache> = RefCell::default());
+    if let Some(Some(t)) = CACHE.with(|c| c.borrow().get(&id).copied()) {
+        return t;
+    }
+    let nt = ntype();
+    let t = nt.rt();
+    CACHE.with(|c| c.borrow_mut().insert(id, (!nt.has_class()).then_some(t)));
+    t
+}
+
+/// The runtime type of `T`'s slim type.
+fn rt<T: SlimType + 'static>() -> RawValue {
+    rt_of(TypeId::of::<T>(), T::ntype)
+}
+
+/// The value of a list or dict, checked against the exact runtime type of `T`.
+fn typed_container<T: SlimType + 'static>(v: Value) -> Result<(), SlimError> {
+    if unsafe { (api().has_type)(v.0, rt::<T>()) } {
         Ok(())
     } else {
-        Err(expected(t.clone(), v))
+        Err(expected(T::ntype(), v))
     }
 }
 
@@ -457,23 +537,23 @@ impl<T: SlimType> SlimType for Vec<T> {
     }
 }
 
-impl<T: FromSlim> FromSlim for Vec<T> {
+impl<T: FromSlim + 'static> FromSlim for Vec<T> {
     /// Copies a `list<T>` (O(n)); `ListRef<T>` reads it in place.
     fn from_slim(v: Value) -> Result<Self, SlimError> {
-        typed_container(v, &<Self as SlimType>::ntype())?;
+        typed_container::<Self>(v)?;
         list_snapshot(v).into_iter().map(T::from_slim).collect()
     }
 }
 
-/// A new list of type `t` taking `items`.
-fn new_list(t: &NType, items: Vec<Value>) -> Result<Value, SlimError> {
+/// A new list of runtime type `ty` taking `items`.
+fn new_list(ty: RawValue, items: Vec<Value>) -> Result<Value, SlimError> {
     let mut out = 0;
-    let e = unsafe { (api().list_new)(t.rt(), items.as_ptr() as *const RawValue, items.len(), &mut out) };
+    let e = unsafe { (api().list_new)(ty, items.as_ptr() as *const RawValue, items.len(), &mut out) };
     SlimError::check(e)?;
     Ok(Value(out))
 }
 
-impl<T: IntoSlim> IntoSlim for Vec<T> {
+impl<T: IntoSlim + 'static> IntoSlim for Vec<T> {
     fn ntype() -> NType {
         NType::List(Box::new(T::ntype()))
     }
@@ -488,7 +568,7 @@ impl<T: IntoSlim> IntoSlim for Vec<T> {
                 }
             }
         }
-        new_list(&<Self as IntoSlim>::ntype(), items)
+        new_list(rt_of(TypeId::of::<Self>(), <Self as IntoSlim>::ntype), items)
     }
 }
 
@@ -620,10 +700,10 @@ impl<T> Clone for ListRef<T> {
     }
 }
 
-impl<T: FromSlim + IntoSlim> ListRef<T> {
+impl<T: FromSlim + IntoSlim + 'static> ListRef<T> {
     /// A new, empty `list<T>`.
     pub fn new() -> ListRef<T> {
-        let v = new_list(&<Self as SlimType>::ntype(), Vec::new()).expect("empty list");
+        let v = new_list(rt::<Self>(), Vec::new()).expect("empty list");
         ListRef { h: Handle::owned(v), _t: PhantomData }
     }
 
@@ -659,7 +739,7 @@ impl<T: FromSlim + IntoSlim> ListRef<T> {
     }
 }
 
-impl<T: FromSlim + IntoSlim> Default for ListRef<T> {
+impl<T: FromSlim + IntoSlim + 'static> Default for ListRef<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -671,9 +751,9 @@ impl<T: SlimType> SlimType for ListRef<T> {
     }
 }
 
-impl<T: SlimType> FromSlim for ListRef<T> {
+impl<T: SlimType + 'static> FromSlim for ListRef<T> {
     fn from_slim(v: Value) -> Result<Self, SlimError> {
-        typed_container(v, &<Self as SlimType>::ntype())?;
+        typed_container::<Self>(v)?;
         Ok(ListRef { h: Handle::borrow(v), _t: PhantomData })
     }
 }
@@ -741,9 +821,9 @@ impl<K: SlimType, V: SlimType> SlimType for DictRef<K, V> {
     }
 }
 
-impl<K: SlimType, V: SlimType> FromSlim for DictRef<K, V> {
+impl<K: SlimType + 'static, V: SlimType + 'static> FromSlim for DictRef<K, V> {
     fn from_slim(v: Value) -> Result<Self, SlimError> {
-        typed_container(v, &<Self as SlimType>::ntype())?;
+        typed_container::<Self>(v)?;
         Ok(DictRef { h: Handle::borrow(v), _t: PhantomData })
     }
 }

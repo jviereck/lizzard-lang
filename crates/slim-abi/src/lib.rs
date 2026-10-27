@@ -24,13 +24,46 @@
 
 use std::ffi::c_void;
 
-/// Bumped on every incompatible change of [`SlimApi`] or the descriptors.
-pub const ABI_VERSION: u32 = 1;
+/// Bumped on every incompatible change of [`SlimApi`], [`ValueLayout`] or
+/// the descriptors.
+pub const ABI_VERSION: u32 = 2;
 
 /// A slim value: opaque bits. Each function says whether it borrows or
 /// takes (consumes) a value it is given, and whether a value it returns is
 /// owned (the caller must `decref` it) or borrowed.
 pub type RawValue = u64;
+
+/// How scalars are encoded, so an extension can read them (and make the
+/// immediate ones) without calling into the interpreter, like the macros of
+/// CPython's C API. Everything else stays opaque.
+///
+/// - **Immediates:** `v & small_int_mask == small_int_tag` is a small int,
+///   whose value is `(v as i64) >> small_int_shift`; an int in
+///   `small_int_min..=small_int_max` is encoded as
+///   `((i << small_int_shift) as u64) | small_int_tag`. `None`, `()`,
+///   `False` and `True` are the constants of [`SlimApi`].
+/// - **Heap objects:** `v & ptr_mask == 0 && v != 0` is a pointer to an
+///   object whose first word (read atomically: other threads update it) has
+///   `kind_mask` bits equal to `kind_int` for a full-width `int` and to
+///   `kind_float` for a `float`. Its `i64` or `f64` is at `int_offset` or
+///   `float_offset` bytes from the pointer, and never changes.
+/// - Values are borrowed for the duration of a call, as everywhere: reading
+///   one is only valid while it is live.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ValueLayout {
+    pub small_int_mask: u64,
+    pub small_int_tag: u64,
+    pub small_int_shift: u32,
+    pub small_int_min: i64,
+    pub small_int_max: i64,
+    pub ptr_mask: u64,
+    pub kind_mask: u64,
+    pub kind_int: u64,
+    pub kind_float: u64,
+    pub int_offset: usize,
+    pub float_offset: usize,
+}
 
 /// A borrowed UTF-8 string.
 #[repr(C)]
@@ -205,8 +238,13 @@ pub struct SlimApi {
     pub size: usize,
     pub none: RawValue,
     pub unit: RawValue,
+    pub false_: RawValue,
+    pub true_: RawValue,
+    pub layout: ValueLayout,
 
     // ---- values
+    /// Counted references; only heap objects have counts, so immediates
+    /// need no call (`layout.ptr_mask`).
     pub incref: unsafe extern "C" fn(v: RawValue),
     pub decref: unsafe extern "C" fn(v: RawValue),
     /// A moved-out or deleted value.

@@ -215,6 +215,19 @@ def main() -> ():
 "#);
     assert_eq!(l, ["5", "2.5", "HI", "None 5", "[0, 1, 4, 9, 16]", "4.0", "200"]);
 
+    // Ints beyond the 63-bit immediates are boxed; both are read and made
+    // inline from the ABI's value layout, as are floats and bools.
+    let l = ok(r#"
+from util import log, add, half
+def main() -> ():
+    big = 4611686018427387903
+    log(str(add(big, 1)))
+    log(str(add(-big - 1, -1)))
+    log(str(add(add(big, 1), -1) == big))
+    log(str(half(1.0e300)))
+"#);
+    assert_eq!(l, ["4611686018427387904", "-4611686018427387905", "True", "5e299"]);
+
     // `import m` and qualified names.
     let l = ok("import util\ndef main() -> ():\n    util.log(str(util.add(1, 1)))\n");
     assert_eq!(l, ["2"]);

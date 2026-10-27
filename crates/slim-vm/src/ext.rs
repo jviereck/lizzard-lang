@@ -9,8 +9,9 @@
 
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 
-use slim_abi::{write_str, ClassDesc, Ctx, FnDesc, HostErr, MethodSig, RawValue, Scalar, SlimApi, Str, StrOut, ABI_VERSION};
+use slim_abi::{write_str, ClassDesc, Ctx, FnDesc, HostErr, MethodSig, RawValue, Scalar, SlimApi, Str, StrOut, ValueLayout, ABI_VERSION};
 
 use crate::array::Scalar as Num;
 use crate::interp::Thread;
@@ -21,7 +22,36 @@ use crate::value::Value;
 
 /// The function table given to extensions.
 pub fn api() -> &'static SlimApi {
-    &API
+    static API: OnceLock<SlimApi> = OnceLock::new();
+    API.get_or_init(table)
+}
+
+/// How this build encodes scalars (see `ValueLayout`). The payload offsets
+/// depend on the compiler's layout of `Body`, so they are measured on probe
+/// objects.
+fn layout() -> ValueLayout {
+    fn offset(v: Value) -> usize {
+        let o = v.obj().expect("probe object");
+        let p = match &o.body {
+            Body::Int(i) => i as *const i64 as usize,
+            Body::Float(f) => f as *const f64 as usize,
+            _ => unreachable!(),
+        };
+        p - o as *const Obj as usize
+    }
+    ValueLayout {
+        small_int_mask: 1,
+        small_int_tag: 1,
+        small_int_shift: 1,
+        small_int_min: crate::value::SMALL_INT_MIN,
+        small_int_max: crate::value::SMALL_INT_MAX,
+        ptr_mask: 7,
+        kind_mask: crate::object::KIND_MASK,
+        kind_int: crate::object::KIND_INT,
+        kind_float: crate::object::KIND_FLOAT,
+        int_offset: offset(Obj::alloc_immortal(Body::Int(i64::MAX))),
+        float_offset: offset(Obj::alloc_immortal(Body::Float(0.0))),
+    }
 }
 
 /// Takes a module built through [`api`] (`module_new`).
@@ -437,58 +467,63 @@ unsafe extern "C" fn module_generic(m: *mut c_void, name: Str, tparams: *const S
     })
 }
 
-static API: SlimApi = SlimApi {
-    version: ABI_VERSION,
-    size: std::mem::size_of::<SlimApi>(),
-    none: Value::NONE.0,
-    unit: Value::UNIT.0,
-    incref,
-    decref,
-    is_dead,
-    int_new,
-    float_new,
-    bool_new,
-    str_new,
-    as_int,
-    as_float,
-    as_bool,
-    as_str,
-    is_function,
-    type_name,
-    display,
-    type_from_desc,
-    type_display,
-    has_type,
-    list_new,
-    list_len,
-    list_get,
-    list_snapshot,
-    list_push,
-    list_set,
-    dict_len,
-    dict_get,
-    dict_insert,
-    dict_keys,
-    array_elem,
-    array_len,
-    array_get,
-    array_set,
-    err_read,
-    err_free,
-    err_raise,
-    raise,
-    call,
-    offline,
-    online,
-    class_key_new,
-    obj_new,
-    obj_key,
-    obj_enter,
-    obj_leave,
-    module_new,
-    module_free,
-    module_function,
-    module_trait,
-    module_class,
-    module_generic,
-};
+fn table() -> SlimApi {
+    SlimApi {
+        version: ABI_VERSION,
+        size: std::mem::size_of::<SlimApi>(),
+        none: Value::NONE.0,
+        unit: Value::UNIT.0,
+        false_: Value::FALSE.0,
+        true_: Value::TRUE.0,
+        layout: layout(),
+        incref,
+        decref,
+        is_dead,
+        int_new,
+        float_new,
+        bool_new,
+        str_new,
+        as_int,
+        as_float,
+        as_bool,
+        as_str,
+        is_function,
+        type_name,
+        display,
+        type_from_desc,
+        type_display,
+        has_type,
+        list_new,
+        list_len,
+        list_get,
+        list_snapshot,
+        list_push,
+        list_set,
+        dict_len,
+        dict_get,
+        dict_insert,
+        dict_keys,
+        array_elem,
+        array_len,
+        array_get,
+        array_set,
+        err_read,
+        err_free,
+        err_raise,
+        raise,
+        call,
+        offline,
+        online,
+        class_key_new,
+        obj_new,
+        obj_key,
+        obj_enter,
+        obj_leave,
+        module_new,
+        module_free,
+        module_function,
+        module_trait,
+        module_class,
+        module_generic,
+    }
+}

@@ -21,7 +21,21 @@ const QUEUED: u64 = 1 << 61;
 /// only be referenced from that thread's frames and from other local
 /// objects. Set at creation and never changed.
 const LOCAL: u64 = 1 << 60;
-const FLAGS: u64 = IMMORTAL | REVIVED | QUEUED | LOCAL;
+/// What a boxed scalar holds (`Body::Int`, `Body::Float`), so extensions
+/// can read it inline (the ABI's `ValueLayout`). Set at creation and never
+/// changed.
+pub const KIND_MASK: u64 = 3 << 58;
+pub const KIND_INT: u64 = 1 << 58;
+pub const KIND_FLOAT: u64 = 2 << 58;
+const FLAGS: u64 = IMMORTAL | REVIVED | QUEUED | LOCAL | KIND_MASK;
+
+fn kind_bits(body: &Body) -> u64 {
+    match body {
+        Body::Int(_) => KIND_INT,
+        Body::Float(_) => KIND_FLOAT,
+        _ => 0,
+    }
+}
 /// Count word of a freed object in poison mode (`SLIM_POISON=1`, debug builds).
 #[cfg(debug_assertions)]
 const POISONED: u64 = 0x0BAD_F00D_DEAD_0000;
@@ -283,7 +297,7 @@ impl Obj {
     }
 
     pub fn alloc(body: Body) -> Value {
-        let rc = if body_is_local(&body) { 1 | LOCAL } else { 1 };
+        let rc = if body_is_local(&body) { 1 | LOCAL } else { 1 } | kind_bits(&body);
         let b = Box::new(Obj { rc: AtomicU64::new(rc), body });
         let p = Box::into_raw(b) as u64;
         debug_assert!(p & 7 == 0);
@@ -292,7 +306,7 @@ impl Obj {
     }
 
     pub fn alloc_immortal(body: Body) -> Value {
-        let b = Box::new(Obj { rc: AtomicU64::new(IMMORTAL), body });
+        let b = Box::new(Obj { rc: AtomicU64::new(IMMORTAL | kind_bits(&body)), body });
         Value(Box::into_raw(b) as u64)
     }
 
