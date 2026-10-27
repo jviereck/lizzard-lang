@@ -15,7 +15,7 @@ use crate::code::{Arg, ArgList, ClassSpec, Code, Ctor, Reg, TypeDesc};
 use crate::display;
 use crate::interp::{run_code, run_code_at, Frame, Raised, Thread, VResult};
 use crate::list::ListObj;
-use crate::object::{Body, Class, Field, Function, Instance, Obj, SlotKind, Trait};
+use crate::object::{Body, Builtin, Class, Field, Function, Instance, Obj, SlotKind, Trait};
 use crate::ops::StoreMode;
 use crate::rc;
 use crate::rtype;
@@ -145,10 +145,7 @@ fn arith(
 
 pub extern "C" fn add(th: &mut Thread, a: Value, b: Value) -> Value {
     if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
-        let mut s = String::with_capacity(x.len() + y.len());
-        s.push_str(x);
-        s.push_str(y);
-        return Value::str(s);
+        return Value::str(crate::object::SlimStr::concat(x, y));
     }
     match (a.body(), b.body()) {
         (Some(Body::List(x)), Some(Body::List(y))) => {
@@ -764,7 +761,7 @@ fn take_for_keep(
     args: &[CallArg],
     i: usize,
     recv_reg: Option<Reg>,
-    pname: &str,
+    pname: &dyn Fn() -> String,
     fname: &str,
 ) -> VResult<Value> {
     let a = args[i];
@@ -810,7 +807,8 @@ fn take_for_keep(
     Err(th.raise(
         "OwnershipError",
         format!(
-            "parameter `{pname}` of `{fname}` takes ownership (`keep`), but a borrowed {} was passed; use `++` to pass a new reference",
+            "parameter `{}` of `{fname}` takes ownership (`keep`), but a borrowed {} was passed; use `++` to pass a new reference",
+            pname(),
             a.v.type_name()
         ),
     ))
@@ -857,7 +855,7 @@ pub fn invoke(
             for (i, _) in args.iter().enumerate() {
                 let p = &code.params[i + nself + off];
                 regs[i + nself + off] = if p.keep {
-                    take_for_keep(th, caller.as_deref_mut(), args, i, recv_reg, &p.name, &code.name)?
+                    take_for_keep(th, caller.as_deref_mut(), args, i, recv_reg, &|| p.name.clone(), &code.name)?
                 } else {
                     let v = args[i].v;
                     if v.is_dead() {
@@ -892,22 +890,30 @@ pub fn invoke(
                 };
                 return Err(th.raise("TypeError", msg));
             }
-            let mut vals = Vec::with_capacity(nargs);
+            let mut inline = [Value::UNINIT; INLINE_ARGS + 1];
+            let mut heap = Vec::new();
+            let vals: &mut [Value] = if nargs <= inline.len() {
+                &mut inline[..nargs]
+            } else {
+                heap.resize(nargs, Value::UNINIT);
+                &mut heap
+            };
+            let nself = self_val.is_some() as usize;
             if let Some(s) = self_val {
-                vals.push(s);
+                vals[0] = s;
             }
             for i in 0..args.len() {
-                let pi = i + self_val.is_some() as usize;
-                if b.keep_mask & (1 << pi) != 0 {
-                    vals.push(take_for_keep(th, caller.as_deref_mut(), args, i, recv_reg, &format!("#{pi}"), b.name)?);
+                let pi = i + nself;
+                vals[pi] = if b.keep_mask & (1 << pi) != 0 {
+                    take_for_keep(th, caller.as_deref_mut(), args, i, recv_reg, &|| format!("#{pi}"), b.name)?
                 } else {
                     if args[i].v.is_dead() {
                         return Err(dead_operand(th, args[i].v).unwrap());
                     }
-                    vals.push(args[i].v);
-                }
+                    args[i].v
+                };
             }
-            (b.f)(th, &vals)
+            (b.f)(th, vals)
         }
         Some(Body::Class(c)) => {
             if !c.tparams.is_empty() {
@@ -1115,10 +1121,13 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
     let code = frame.code();
     let al = &code.arglists[args as usize];
     let f = frame.reg(func as Reg);
-    if al.fast {
-        if let Some(status) = call_fast(th, frame, f, None, al, dst) {
-            return status;
-        }
+    let status = match f.body() {
+        Some(Body::Builtin(b)) => call_builtin_fast(th, frame, b, None, al, dst),
+        _ if al.fast => call_fast(th, frame, f, None, al, dst),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return status;
     }
     let cargs = collect_args(frame, &al.args);
     if al.pins {
@@ -1165,6 +1174,60 @@ fn call_fast(th: &mut Thread, frame: &mut Frame, f: Value, recv: Option<Value>, 
         rc::pin();
     }
     let r = run_code_at(th, code, &mut regs[..n], func.captures.as_ptr(), code.entry);
+    if al.pins {
+        rc::unpin();
+    }
+    Some(match r {
+        Ok(v) => {
+            frame.set(dst as Reg, v);
+            OK
+        }
+        Err(Raised) => RAISED,
+    })
+}
+
+/// A call of builtin `b` (with `recv` as its first argument for a method)
+/// taking its arguments straight from the caller's registers. `None` (with
+/// nothing done) when the general path is needed: a wrong argument count, or
+/// a `keep` argument that is neither a copy value nor an owned temporary.
+fn call_builtin_fast(th: &mut Thread, frame: &mut Frame, b: &Builtin, recv: Option<Value>, al: &ArgList, dst: u32) -> Option<u32> {
+    let nself = recv.is_some() as usize;
+    let n = al.args.len() + nself;
+    if n < b.min_args || n > b.max_args || n > INLINE_ARGS + 1 {
+        return None;
+    }
+    let keep = |i: usize| b.keep_mask & (1 << (i + nself)) != 0;
+    for (i, a) in al.args.iter().enumerate() {
+        let v = frame.reg(a.reg);
+        if v.is_dead() {
+            raise_dead(th, frame, a.reg);
+            return Some(RAISED);
+        }
+        // Only copies and owned temporaries are moved in here.
+        if keep(i) && !v.is_copy() && (!a.owned || a.local) {
+            return None;
+        }
+    }
+    let mut vals = [Value::UNINIT; INLINE_ARGS + 1];
+    if let Some(r) = recv {
+        vals[0] = r;
+    }
+    for (i, a) in al.args.iter().enumerate() {
+        let v = frame.reg(a.reg);
+        if keep(i) {
+            if v.is_copy() {
+                v.incref();
+            } else {
+                // An owned temporary moves into the call.
+                frame.set(a.reg, Value::MOVED);
+            }
+        }
+        vals[i + nself] = v;
+    }
+    if al.pins {
+        rc::pin();
+    }
+    let r = (b.f)(th, &vals[..n]);
     if al.pins {
         rc::unpin();
     }
@@ -1258,12 +1321,17 @@ pub extern "C" fn f_call_method(th: &mut Thread, frame: &mut Frame, dst: u32, re
         raise_dead(th, frame, recv as Reg);
         return RAISED;
     }
-    let found = match r.as_instance().and_then(|inst| cached_method(frame, inst, mname)) {
+    let found = match cached_method(frame, r, mname) {
         Some(m) => Ok(m),
         None => find_method(th, r, mname),
     };
-    if let (true, Ok(m)) = (al.fast, &found) {
-        if let Some(status) = call_fast(th, frame, *m, Some(r), al, dst) {
+    if let Ok(m) = &found {
+        let status = match m.body() {
+            Some(Body::Builtin(b)) => call_builtin_fast(th, frame, b, Some(r), al, dst),
+            _ if al.fast => call_fast(th, frame, *m, Some(r), al, dst),
+            _ => None,
+        };
+        if let Some(status) = status {
             return status;
         }
     }
@@ -1346,7 +1414,15 @@ fn no_attribute(th: &mut Thread, v: Value, name: &str) -> Raised {
     th.raise("AttributeError", format!("'{}' object has no attribute '{name}'", v.type_name()))
 }
 
+/// Loop back-edges pass a safepoint (and check the auto-rc threshold) once
+/// every this many iterations: skipping one only delays reclamation.
+const SAFEPOINT_EVERY: u32 = 64;
+
 pub extern "C" fn f_safepoint(th: &mut Thread, _frame: &mut Frame, _: u32, _: u32, _: u32, _: u32) -> u32 {
+    th.ticks = th.ticks.wrapping_sub(1);
+    if !th.ticks.is_multiple_of(SAFEPOINT_EVERY) {
+        return OK;
+    }
     if rc::safepoint_pending() > th.rc_threshold && th.rc_auto {
         th.rc_run(Some(th.rc_threshold));
     }
@@ -1735,22 +1811,35 @@ fn cached_field(frame: &Frame, inst: &Instance, name: &str) -> Option<usize> {
     Some(i)
 }
 
-/// The inherent method `name` of `inst`'s class, through the inline cache
-/// of the current instruction (`find_method` looks inherent methods up
-/// first, so this is its result whenever it is `Some`).
+/// The inherent method `name` of `recv` (a struct's method or a builtin
+/// type's), through the inline cache of the current instruction.
+/// `find_method` looks inherent methods up first, so this is its result
+/// whenever it is `Some`.
 #[inline]
-fn cached_method(frame: &Frame, inst: &Instance, name: &str) -> Option<Value> {
+fn cached_method(frame: &Frame, recv: Value, name: &str) -> Option<Value> {
     const PTR: u64 = (1 << 48) - 1;
-    let class = inst.class();
+    // Tags: a class id + 1 (below `BUILTIN`), or `BUILTIN` + a builtin type.
+    const BUILTIN: u64 = 0xFF00;
+    let (tag, class) = match recv.body()? {
+        Body::Instance(i) => (i.class().id as u64 + 1, Some(i.class())),
+        Body::Str(_) => (BUILTIN, None),
+        Body::List(_) => (BUILTIN + 1, None),
+        Body::Dict(_) => (BUILTIN + 2, None),
+        Body::Tuple(_) => (BUILTIN + 3, None),
+        Body::Array(_) => (BUILTIN + 4, None),
+        _ => return None,
+    };
     let ic = &frame.code().ics[frame.cur_pc as usize];
-    let tag = (class.id as u64 + 1) << 48;
     let k = ic.load(Ordering::Relaxed);
-    if k != 0 && k & !PTR == tag {
+    if k != 0 && k >> 48 == tag {
         return Some(Value(k & PTR));
     }
-    let m = *class.methods.get(name)?;
-    if class.id < 0xFFFF && m.0 & !PTR == 0 {
-        ic.store(tag | m.0, Ordering::Relaxed);
+    let m = match class {
+        Some(c) => *c.methods.get(name)?,
+        None => crate::builtins::type_method(recv, name)?,
+    };
+    if (class.is_none() || tag < BUILTIN) && m.0 & !PTR == 0 {
+        ic.store(tag << 48 | m.0, Ordering::Relaxed);
     }
     Some(m)
 }
@@ -2387,10 +2476,14 @@ pub extern "C" fn f_get_iter(th: &mut Thread, frame: &mut Frame, dst: u32, src: 
     }
 }
 
-pub extern "C" fn f_for_iter(th: &mut Thread, frame: &mut Frame, dst: u32, iter: u32, end: u32, _: u32) -> u32 {
+/// `ForIter` (`set` = 0) and `ForIterSet` (`set` = 1, releasing dst's value).
+pub extern "C" fn f_for_iter(th: &mut Thread, frame: &mut Frame, dst: u32, iter: u32, end: u32, set: u32) -> u32 {
     let it = frame.reg(iter as Reg);
     match crate::builtins::iter_next(th, it) {
         Ok(Some(v)) => {
+            if set != 0 {
+                frame.reg(dst as Reg).decref();
+            }
             frame.set(dst as Reg, v);
             OK
         }

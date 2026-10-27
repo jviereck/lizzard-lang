@@ -69,6 +69,8 @@ pub struct Thread {
     pub depth: u32,
     pub rc_auto: bool,
     pub rc_threshold: usize,
+    /// Loop back-edges taken (see `helpers::f_safepoint`).
+    pub ticks: u32,
     /// Traceback of the exception most recently caught (for bare `raise`).
     pub handled_tb: Vec<(String, u32)>,
 }
@@ -120,7 +122,7 @@ impl Frame {
 
 impl Thread {
     pub fn new(vm: Arc<Vm>) -> Thread {
-        Thread { vm, exc: None, depth: 0, rc_auto: true, rc_threshold: 10_000, handled_tb: Vec::new() }
+        Thread { vm, exc: None, depth: 0, rc_auto: true, rc_threshold: 10_000, handled_tb: Vec::new(), ticks: 0 }
     }
 
     /// Raises a builtin exception with a message.

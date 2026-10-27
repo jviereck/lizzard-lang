@@ -62,7 +62,7 @@ pub enum Body {
     Int(i64),
     Float(f64),
     BigInt(BigInt),
-    Str(Box<str>),
+    Str(SlimStr),
     Tuple(Box<[Value]>),
     List(crate::list::ListObj),
     Function(Function),
@@ -91,6 +91,106 @@ pub enum Body {
     NativeClass(Box<crate::native::NativeClass>),
     /// An instance of a Rust class.
     Native(Box<crate::native::NativeObj>),
+}
+
+/// A string body: up to `SlimStr::INLINE` bytes stored inside the object
+/// (one allocation, from the object free list), longer strings on the heap.
+pub enum SlimStr {
+    Inline { len: u8, buf: [u8; SlimStr::INLINE] },
+    Heap(Box<str>),
+}
+
+impl SlimStr {
+    pub const INLINE: usize = 30;
+
+    pub fn new(s: &str) -> SlimStr {
+        SlimStr::concat(s, "")
+    }
+
+    /// `a + b`, without an intermediate string.
+    pub fn concat(a: &str, b: &str) -> SlimStr {
+        let n = a.len() + b.len();
+        if n <= SlimStr::INLINE {
+            let mut buf = [0u8; SlimStr::INLINE];
+            buf[..a.len()].copy_from_slice(a.as_bytes());
+            buf[a.len()..n].copy_from_slice(b.as_bytes());
+            SlimStr::Inline { len: n as u8, buf }
+        } else {
+            let mut s = String::with_capacity(n);
+            s.push_str(a);
+            s.push_str(b);
+            SlimStr::Heap(s.into_boxed_str())
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match self {
+            // SAFETY: built from the bytes of a `str` (whole characters).
+            SlimStr::Inline { len, buf } => unsafe { std::str::from_utf8_unchecked(&buf[..*len as usize]) },
+            SlimStr::Heap(s) => s,
+        }
+    }
+}
+
+impl std::ops::Deref for SlimStr {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for SlimStr {
+    fn from(s: &str) -> SlimStr {
+        SlimStr::new(s)
+    }
+}
+
+impl From<String> for SlimStr {
+    fn from(s: String) -> SlimStr {
+        if s.len() <= SlimStr::INLINE {
+            SlimStr::new(&s)
+        } else {
+            SlimStr::Heap(s.into_boxed_str())
+        }
+    }
+}
+
+impl From<Box<str>> for SlimStr {
+    fn from(s: Box<str>) -> SlimStr {
+        if s.len() <= SlimStr::INLINE {
+            SlimStr::new(&s)
+        } else {
+            SlimStr::Heap(s)
+        }
+    }
+}
+
+impl PartialEq for SlimStr {
+    fn eq(&self, o: &SlimStr) -> bool {
+        self.as_str() == o.as_str()
+    }
+}
+
+impl Eq for SlimStr {}
+
+impl PartialOrd for SlimStr {
+    fn partial_cmp(&self, o: &SlimStr) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for SlimStr {
+    fn cmp(&self, o: &SlimStr) -> std::cmp::Ordering {
+        self.as_str().cmp(o.as_str())
+    }
+}
+
+impl std::hash::Hash for SlimStr {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.as_str().hash(h)
+    }
 }
 
 // Every object has the size of the largest body: rare or large bodies are
@@ -271,7 +371,7 @@ fn body_is_local(body: &Body) -> bool {
         Body::Generator(g) => ty_local(g.ty),
         Body::Iter(it) => {
             ty_local(it.ty)
-                || match &*it.k.lock().unwrap_or_else(|e| e.into_inner()) {
+                || match &*it.k.lock() {
                     crate::builtins::IterKind::List { list, .. } => list.is_local(),
                     crate::builtins::IterKind::Items { items } => items.as_slice().iter().any(|v| v.is_local()),
                     crate::builtins::IterKind::Object { obj } => obj.is_local(),
@@ -553,7 +653,7 @@ impl Obj {
                     v.decref();
                 }
             }
-            Body::Iter(it) => it.k.get_mut().unwrap_or_else(|e| e.into_inner()).release(),
+            Body::Iter(it) => it.k.get_mut().release(),
             Body::Generator(g) => g.release(),
             Body::Thread(t) => t.release(),
             Body::Channel(c) => c.release(),
@@ -572,13 +672,13 @@ impl Obj {
 }
 
 impl Value {
-    pub fn str(s: impl Into<Box<str>>) -> Value {
+    pub fn str(s: impl Into<SlimStr>) -> Value {
         Obj::alloc(Body::Str(s.into()))
     }
 
     pub fn as_str(self) -> Option<&'static str> {
         match self.body() {
-            Some(Body::Str(s)) => Some(s),
+            Some(Body::Str(s)) => Some(s.as_str()),
             _ => None,
         }
     }

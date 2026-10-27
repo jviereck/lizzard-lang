@@ -20,6 +20,18 @@ pub enum BinKind {
     Shr,
 }
 
+/// The comparison of a `CmpJump`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CmpKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
 /// Arithmetic on raw `f64` registers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -122,6 +134,9 @@ opcodes! {
     In { dst: Reg, a: Reg, b: Reg } => sem::contains;
     NotIn { dst: Reg, a: Reg, b: Reg } => sem::not_contains;
 
+    /// dst = a <op> b, then jumps to `target` if dst's truth equals
+    /// `jump_if` (a comparison fused with its conditional jump).
+    CmpJump { dst: Reg, op: CmpKind, a: Reg, b: Reg, target: u32, jump_if: bool } => sem::cmp_jump;
     Jump { target: u32 } => sem::jump;
     /// Loop back-edge: a safepoint, then a jump.
     Loop { target: u32 } => sem::loop_;
@@ -213,6 +228,9 @@ opcodes! {
     GetIter { dst: Reg, src: Reg } => sem::get_iter;
     /// dst = next(iter) or jump to `end` when exhausted
     ForIter { dst: Reg, iter: Reg, end: u32 } => sem::for_iter;
+    /// Like `ForIter`, into a loop variable: the next item replaces (and
+    /// releases) dst's value.
+    ForIterSet { dst: Reg, iter: Reg, end: u32 } => sem::for_iter_set;
 
     Nop {} => sem::nop;
 }

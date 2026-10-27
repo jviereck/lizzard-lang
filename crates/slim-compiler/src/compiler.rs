@@ -1768,8 +1768,9 @@ impl<'m> FnCtx<'m> {
                 | Instr::Loop { target }
                 | Instr::JumpIfFalse { target, .. }
                 | Instr::JumpIfTrue { target, .. }
-                | Instr::MatchException { target, .. } => target == pc,
-                Instr::ForIter { end, .. } => end == pc,
+                | Instr::MatchException { target, .. }
+                | Instr::CmpJump { target, .. } => target == pc,
+                Instr::ForIter { end, .. } | Instr::ForIterSet { end, .. } => end == pc,
                 _ => false,
             })
     }
@@ -2216,7 +2217,10 @@ impl<'m> FnCtx<'m> {
                     ExprKind::Ellipsis => {}
                     _ => {
                         let r = self.expr(e)?;
-                        self.discard(&r);
+                        // A `()` result is an immediate: nothing to release.
+                        if r.ty != Ty::Unit {
+                            self.discard(&r);
+                        }
                     }
                 }
                 Ok(())
@@ -5011,6 +5015,8 @@ impl<'m> FnCtx<'m> {
             (Some(s), _, _) => s.ret.as_value(),
             (None, "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join", Ty::Str) => Ty::Str,
             (None, "split", Ty::Str) => Ty::list(Ty::Str),
+            (None, "append" | "insert" | "extend" | "clear" | "reverse" | "sort", Ty::List(_)) => Ty::Unit,
+            (None, "clear", Ty::Dict(..)) => Ty::Unit,
             (None, "keys", Ty::Dict(k, _)) => Ty::List(k.clone()),
             (None, "values", Ty::Dict(_, v)) => Ty::List(v.clone()),
             (None, "items", Ty::Dict(k, v)) => Ty::list(Ty::Tuple(Some(vec![(**k).clone(), (**v).clone()]))),

@@ -52,8 +52,9 @@ impl Table {
     /// Entry number holding `k`, if any.
     fn find(&self, k: Value, h: u64) -> Option<usize> {
         let mask = self.index.len() - 1;
-        let mut i = h as usize & mask;
+        let mut p = Probe::new(h, mask);
         loop {
+            let i = p.slot;
             let ix = self.index[i].load(Ordering::Acquire);
             if ix == EMPTY {
                 return None;
@@ -61,11 +62,11 @@ impl Table {
             let e = &self.entries[ix as usize];
             if e.hash.load(Ordering::Relaxed) == h {
                 let key = Value(e.key.load(Ordering::Acquire));
-                if key != Value::UNINIT && values_eq(key, k) {
+                if key != Value::UNINIT && (key == k || values_eq(key, k)) {
                     return Some(ix as usize);
                 }
             }
-            i = (i + 1) & mask;
+            p.next(mask);
         }
     }
 
@@ -77,11 +78,11 @@ impl Table {
         e.key.store(k.0, Ordering::Relaxed);
         e.value.store(v.0, Ordering::Relaxed);
         let mask = self.index.len() - 1;
-        let mut i = h as usize & mask;
-        while self.index[i].load(Ordering::Relaxed) != EMPTY {
-            i = (i + 1) & mask;
+        let mut p = Probe::new(h, mask);
+        while self.index[p.slot].load(Ordering::Relaxed) != EMPTY {
+            p.next(mask);
         }
-        self.index[i].store(ix as u32, Ordering::Release);
+        self.index[p.slot].store(ix as u32, Ordering::Release);
         self.used.store(ix + 1, Ordering::Release);
     }
 
@@ -98,6 +99,27 @@ impl Table {
 
 /// # Safety
 /// `p` came from `Box::into_raw(Box<Table>)` and is not used afterwards.
+/// CPython's probe sequence: starts at the low bits of the hash, then
+/// mixes in the higher bits, so that identity hashes of ints (which keep
+/// keys used in order close together in memory) do not cluster.
+struct Probe {
+    slot: usize,
+    perturb: u64,
+}
+
+impl Probe {
+    #[inline]
+    fn new(h: u64, mask: usize) -> Probe {
+        Probe { slot: h as usize & mask, perturb: h }
+    }
+
+    #[inline]
+    fn next(&mut self, mask: usize) {
+        self.perturb >>= 5;
+        self.slot = (self.slot.wrapping_mul(5).wrapping_add(1).wrapping_add(self.perturb as usize)) & mask;
+    }
+}
+
 unsafe fn free_table(p: usize) {
     drop(Box::from_raw(p as *mut Table));
 }
@@ -136,21 +158,76 @@ impl Drop for Unlock<'_> {
 }
 
 /// Hash of a key, or `None` if the value is not hashable (lists, dicts).
+/// A fast, non-cryptographic hasher for strings and other keys (FxHash's
+/// word step, finished with splitmix64's mixer). Ints hash to themselves,
+/// as in CPython. Neither resists deliberately colliding keys.
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.write_u64(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, x: u8) {
+        self.write_u64(x as u64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, x: i64) {
+        self.write_u64(x as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        mix(self.0)
+    }
+}
+
+#[inline]
+fn mix(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 pub fn hash_value(v: Value) -> Option<u64> {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(i) = v.as_small_int() {
+        return Some(i as u64);
+    }
+    let mut h = FastHasher(0);
     if let Some(i) = v.as_int() {
-        i.hash(&mut h);
-        return Some(h.finish());
+        return Some(i as u64);
     }
     if let Some(b) = v.as_bool() {
-        (b as i64).hash(&mut h);
-        return Some(h.finish());
+        return Some(b as u64);
     }
     match v.body() {
         None => v.0.hash(&mut h),
         Some(Body::Float(f)) => {
             if f.fract() == 0.0 && f.abs() < 9.2e18 {
-                (*f as i64).hash(&mut h);
+                // Equal to an int key: the same hash.
+                return Some(*f as i64 as u64);
             } else {
                 f.to_bits().hash(&mut h);
             }

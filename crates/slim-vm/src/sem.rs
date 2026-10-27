@@ -7,7 +7,7 @@
 use crate::backend::{Backend, Cond, Flow};
 use crate::code::Reg;
 use crate::helpers as h;
-use crate::ops::{BinKind, FOp, StoreMode, UnKind};
+use crate::ops::{BinKind, CmpKind, FOp, StoreMode, UnKind};
 use crate::value::Value;
 
 pub fn nop<B: Backend>(_b: &mut B) -> Flow<()> {
@@ -481,6 +481,10 @@ pub fn for_iter<B: Backend>(b: &mut B, dst: Reg, iter: Reg, end: u32) -> Flow<()
     b.frame_op(h::f_for_iter, dst as u32, iter as u32, end, 0)
 }
 
+pub fn for_iter_set<B: Backend>(b: &mut B, dst: Reg, iter: Reg, end: u32) -> Flow<()> {
+    b.frame_op(h::f_for_iter, dst as u32, iter as u32, end, 1)
+}
+
 // ---------------------------------------------------------------- raw floats
 //
 // Float arithmetic trees compile to raw f64 registers (non-owned, never seen
@@ -529,4 +533,20 @@ pub fn farith<B: Backend>(b: &mut B, dst: Reg, op: FOp, a: Reg, bb: Reg) -> Flow
 
 pub fn store_raw_f<B: Backend>(b: &mut B, dst: Reg, src: Reg) -> Flow<()> {
     b.frame_op(h::f_store_raw_f, dst as u32, src as u32, 0, 0)
+}
+
+pub fn cmp_jump<B: Backend>(b: &mut B, dst: Reg, op: CmpKind, x: Reg, y: Reg, target: u32, jump_if: bool) -> Flow<()> {
+    match op {
+        CmpKind::Lt => lt(b, dst, x, y)?,
+        CmpKind::Le => le(b, dst, x, y)?,
+        CmpKind::Gt => gt(b, dst, x, y)?,
+        CmpKind::Ge => ge(b, dst, x, y)?,
+        CmpKind::Eq => eq(b, dst, x, y)?,
+        CmpKind::Ne => ne(b, dst, x, y)?,
+    }
+    if jump_if {
+        jump_if_true(b, dst, target)
+    } else {
+        jump_if_false(b, dst, target)
+    }
 }

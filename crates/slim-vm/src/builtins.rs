@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::cell::UnsafeCell;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -42,7 +44,63 @@ pub enum IterKind {
 pub struct IterObj {
     /// `Iterator<T>`, `T` being the item type.
     pub ty: Value,
-    pub k: Mutex<IterKind>,
+    pub k: SpinLock<IterKind>,
+}
+
+/// A lock for iterator state: never held across user code, and iterators
+/// are rarely shared, so a spin lock is cheaper than a mutex.
+pub struct SpinLock<T> {
+    locked: AtomicBool,
+    v: UnsafeCell<T>,
+}
+
+// SAFETY: access to `v` is serialized by `locked`.
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+pub struct SpinGuard<'a, T>(&'a SpinLock<T>);
+
+impl<T> SpinLock<T> {
+    pub fn new(v: T) -> SpinLock<T> {
+        SpinLock { locked: AtomicBool::new(false), v: UnsafeCell::new(v) }
+    }
+
+    pub fn lock(&self) -> SpinGuard<'_, T> {
+        let mut spins = 0u32;
+        while self.locked.compare_exchange_weak(false, true, AtomicOrdering::Acquire, AtomicOrdering::Relaxed).is_err() {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        SpinGuard(self)
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.v.get_mut()
+    }
+}
+
+impl<T> std::ops::Deref for SpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard holds the lock.
+        unsafe { &*self.0.v.get() }
+    }
+}
+
+impl<T> std::ops::DerefMut for SpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: the guard holds the lock.
+        unsafe { &mut *self.0.v.get() }
+    }
+}
+
+impl<T> Drop for SpinGuard<'_, T> {
+    fn drop(&mut self) {
+        self.0.locked.store(false, AtomicOrdering::Release);
+    }
 }
 
 impl IterKind {
@@ -57,7 +115,7 @@ impl IterKind {
 }
 
 fn new_iter(item: Value, k: IterKind) -> Value {
-    Obj::alloc(Body::Iter(Box::new(IterObj { ty: rtype::iterator_of(item), k: Mutex::new(k) })))
+    Obj::alloc(Body::Iter(Box::new(IterObj { ty: rtype::iterator_of(item), k: SpinLock::new(k) })))
 }
 
 fn items_iter(item: Value, items: Vec<Value>) -> Value {
@@ -130,7 +188,7 @@ fn clear_exception(th: &mut Thread) {
 pub fn iter_next(th: &mut Thread, it: Value) -> VResult<Option<Value>> {
     match it.body() {
         Some(Body::Iter(m)) => {
-            let mut k = m.k.lock().unwrap();
+            let mut k = m.k.lock();
             match &mut *k {
                 IterKind::List { list, idx } => {
                     let Some(Body::List(l)) = list.body() else { unreachable!() };
@@ -359,7 +417,17 @@ fn b_str(_th: &mut Thread, args: &[Value]) -> VResult<Value> {
             v.incref();
             Ok(*v)
         }
-        Some(v) => Ok(Value::str(display::to_str(*v))),
+        Some(v) => match v.as_int() {
+            Some(i) => {
+                // Formatted on the stack: one exact-size allocation.
+                let mut buf = [0u8; 20];
+                let mut w = &mut buf[..];
+                let _ = std::io::Write::write_fmt(&mut w, format_args!("{i}"));
+                let n = 20 - w.len();
+                Ok(Value::str(std::str::from_utf8(&buf[..n]).unwrap()))
+            }
+            None => Ok(Value::str(display::to_str(*v))),
+        },
     }
 }
 
