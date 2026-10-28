@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/slim-abi", "crates/slim-ext", "crates/slim-syntax", "crates/slim-vm", "crates/slim-compiler", "crates/slim", "examples/embed_geom", "examples/geom_ext"]
+members = ["crates/slim-abi", "crates/slim-ext", "crates/slim-syntax", "crates/slim-vm", "crates/slim-compiler", "crates/slim", "crates/slim-py-front", "crates/slim-py", "examples/embed_geom", "examples/geom_ext"]
 
 [workspace.package]
 version = "0.1.0"

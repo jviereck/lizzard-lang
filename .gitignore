@@ -1,1 +1,4 @@
 target/
+.venv-*/
+__pycache__/
+crates/slim-py/python/slim/*.so

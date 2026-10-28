@@ -1,0 +1,10 @@
+[package]
+name = "slim-py-front"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.8" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.8" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.8" }
+ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.16.8" }
