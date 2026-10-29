@@ -1817,26 +1817,69 @@ pub fn collect_vars(t: &Ty, out: &mut Vec<TvId>) {
     }
 }
 
-pub const EXCEPTIONS: &[&str] = &[
-    "BaseException",
-    "Exception",
-    "ArithmeticError",
-    "AssertionError",
-    "AttributeError",
-    "LookupError",
-    "NotImplementedError",
-    "ValueError",
-    "TypeError",
-    "IndexError",
-    "KeyError",
-    "RuntimeError",
-    "StopIteration",
-    "ZeroDivisionError",
-    "OverflowError",
+/// The builtin exception classes the checker knows, with their bases.
+const EXCEPTION_TREE: &[(&str, &str)] = &[
+    ("BaseException", ""),
+    ("Exception", "BaseException"),
+    ("SystemExit", "BaseException"),
+    ("KeyboardInterrupt", "BaseException"),
+    ("GeneratorExit", "BaseException"),
+    ("ArithmeticError", "Exception"),
+    ("ZeroDivisionError", "ArithmeticError"),
+    ("OverflowError", "ArithmeticError"),
+    ("FloatingPointError", "ArithmeticError"),
+    ("AssertionError", "Exception"),
+    ("AttributeError", "Exception"),
+    ("BufferError", "Exception"),
+    ("EOFError", "Exception"),
+    ("ImportError", "Exception"),
+    ("ModuleNotFoundError", "ImportError"),
+    ("LookupError", "Exception"),
+    ("IndexError", "LookupError"),
+    ("KeyError", "LookupError"),
+    ("MemoryError", "Exception"),
+    ("NameError", "Exception"),
+    ("UnboundLocalError", "NameError"),
+    ("OSError", "Exception"),
+    ("FileNotFoundError", "OSError"),
+    ("FileExistsError", "OSError"),
+    ("PermissionError", "OSError"),
+    ("IsADirectoryError", "OSError"),
+    ("NotADirectoryError", "OSError"),
+    ("TimeoutError", "OSError"),
+    ("ConnectionError", "OSError"),
+    ("ReferenceError", "Exception"),
+    ("RuntimeError", "Exception"),
+    ("NotImplementedError", "RuntimeError"),
+    ("RecursionError", "RuntimeError"),
+    ("StopIteration", "Exception"),
+    ("SyntaxError", "Exception"),
+    ("TypeError", "Exception"),
+    ("ValueError", "Exception"),
+    ("UnicodeError", "ValueError"),
+    ("UnicodeDecodeError", "UnicodeError"),
+    ("UnicodeEncodeError", "UnicodeError"),
+    ("Warning", "Exception"),
+    ("UserWarning", "Warning"),
+    ("DeprecationWarning", "Warning"),
+    ("RuntimeWarning", "Warning"),
 ];
 
+pub fn is_exception_name(n: &str) -> bool {
+    EXCEPTION_TREE.iter().any(|(e, _)| *e == n)
+}
+
 fn exc_sub(a: &str, b: &str) -> bool {
-    a == b || b == "BaseException" || (b == "Exception" && a != "BaseException")
+    let mut cur = a;
+    loop {
+        if cur == b {
+            return true;
+        }
+        match EXCEPTION_TREE.iter().find(|(e, _)| *e == cur) {
+            Some((_, p)) if !p.is_empty() => cur = p,
+            _ => return false,
+        }
+    }
 }
 
 fn builtin_sym(name: &str) -> Sym {
@@ -1849,7 +1892,7 @@ fn builtin_sym(name: &str) -> Sym {
         "tuple" => Sym::Builtin(Ty::TupleVar(Box::new(Ty::Any))),
         "type" => Sym::Builtin(Ty::Type(Box::new(Ty::Any))),
         "None" => Sym::Builtin(Ty::None),
-        n if EXCEPTIONS.contains(&n) => Sym::Builtin(Ty::Exc(n.to_string())),
+        n if is_exception_name(n) => Sym::Builtin(Ty::Exc(n.to_string())),
         _ => Sym::Any,
     }
 }

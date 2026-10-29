@@ -34,10 +34,32 @@ enum Mismatch {
 }
 
 /// Jumps to patch at the end of a loop.
-#[derive(Default)]
 struct Loop {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+    /// `cleanups.len()` outside the loop: `break` and `continue` run the
+    /// cleanups above it.
+    depth: usize,
+}
+
+/// Code that must run when control leaves a `try`/`with` early (`return`,
+/// `break`, `continue`).
+#[derive(Clone)]
+enum Cleanup {
+    /// A `finally` body.
+    Finally(Vec<Stmt>),
+    /// Leaving an `except` block: restore the previously handled exception.
+    Restore(Reg),
+    /// Leaving a `with` block: call `__exit__(None, None, None)`.
+    WithExit(Reg),
+}
+
+/// A protected range being emitted: its handler, where it (or its current
+/// segment) starts, and `cleanups.len()` when it was opened.
+struct Region {
+    handler: usize,
+    start: u32,
+    depth: usize,
 }
 
 /// What a comprehension produces at its innermost level.
@@ -79,9 +101,14 @@ struct Lower<'a> {
     global_names: Vec<String>,
     /// Names the function assigns anywhere: they are local throughout.
     bound: Vec<String>,
+    handlers: Vec<HandlerIr>,
+    regions: Vec<Region>,
+    cleanups: Vec<Cleanup>,
+    /// The exceptions being handled, innermost last (for a bare `raise`).
+    handled: Vec<Reg>,
 }
 
-const BUILTIN_FNS: &[&str] = &["print", "len"];
+const BUILTIN_FNS: &[&str] = &["print", "len", "type"];
 
 pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
     let file = db.modules[m].file.expect("Lizzard module without file");
@@ -137,6 +164,10 @@ impl<'a> Lower<'a> {
             narrow: HashMap::new(),
             global_names: Vec::new(),
             bound: Vec::new(),
+            handlers: Vec::new(),
+            regions: Vec::new(),
+            cleanups: Vec::new(),
+            handled: Vec::new(),
         }
     }
 
@@ -616,6 +647,10 @@ impl<'a> Lower<'a> {
                 let want = l.show(&l.ret);
                 l.err(off, format!("`{name}` may end without returning a value (declared to return {want})"));
             }
+        } else {
+            // Unreachable when the analysis is right; never run off the end.
+            let none = l.konst(Const::None, Ty::None);
+            l.emit(Instr::Return { src: none.reg });
         }
         let ir = FuncIr {
             name: l.fname,
@@ -628,6 +663,7 @@ impl<'a> Lower<'a> {
             consts: l.consts,
             names: l.names,
             checks: l.checks,
+            handlers: l.handlers,
         };
         self.db.rigid = saved_rigid;
         Some(ir)
@@ -713,6 +749,8 @@ impl<'a> Lower<'a> {
                     let what = if matches!(s, Stmt::Break(_)) { "break" } else { "continue" };
                     return self.err(off, format!("`{what}` outside a loop"));
                 }
+                let depth = self.loops.last().unwrap().depth;
+                self.emit_cleanups(depth);
                 let j = self.emit(Instr::Jump { target: 0 });
                 let l = self.loops.last_mut().unwrap();
                 if matches!(s, Stmt::Break(_)) {
@@ -722,20 +760,33 @@ impl<'a> Lower<'a> {
                 }
             }
             Stmt::Raise(r) => {
-                if r.cause.is_some() {
-                    self.err(off, "`raise ... from` is not supported by Lizzard yet");
-                }
                 let Some(exc) = &r.exc else {
-                    return self.err(off, "a bare `raise` is not supported by Lizzard yet");
+                    match self.handled.last() {
+                        Some(&exc) => {
+                            self.emit(Instr::Reraise { exc });
+                        }
+                        None => self.err(off, "a bare `raise` is only allowed in an `except` block"),
+                    }
+                    return;
                 };
                 let v = self.expr(exc);
                 if !self.is_exception(&v.ty) {
                     let t = self.show(&v.ty);
                     self.err(off, format!("exceptions must derive from BaseException, got {t}"));
                 }
+                let cause = r.cause.as_ref().map(|c| {
+                    let cv = self.expr(c);
+                    if cv.ty != Ty::None && !self.is_exception(&cv.ty) {
+                        let t = self.show(&cv.ty);
+                        self.err(off, format!("an exception cause must derive from BaseException or be None, got {t}"));
+                    }
+                    self.obj(&cv)
+                });
                 let r = self.obj(&v);
-                self.emit(Instr::Raise { exc: r });
+                self.emit(Instr::Raise { exc: r, cause });
             }
+            Stmt::Try(t) => self.try_stmt(t, off),
+            Stmt::With(w) => self.with_stmt(w, off),
             Stmt::Assert(a) => {
                 let (yes, _) = self.cond_narrow(&a.test);
                 let c = self.expr(&a.test);
@@ -751,7 +802,7 @@ impl<'a> Lower<'a> {
                 };
                 let exc = self.reg(Repr::Obj);
                 self.emit(Instr::Call { dst: exc, func: func.reg, args, kwnames: Vec::new() });
-                self.emit(Instr::Raise { exc });
+                self.emit(Instr::Raise { exc, cause: None });
                 let h = self.here();
                 self.patch(ok, h);
                 self.apply_narrow(yes);
@@ -788,6 +839,7 @@ impl<'a> Lower<'a> {
                 };
                 let v = self.coerce(v, &want, off, |l, got, want| format!("`{}` returns {want}, but this returns {got}", l.fname));
                 let r = self.obj(&v);
+                self.emit_cleanups(0);
                 self.emit(Instr::Return { src: r });
             }
             Stmt::Pass(_) => {}
@@ -801,6 +853,287 @@ impl<'a> Lower<'a> {
             Stmt::FunctionDef(_) => self.err(off, "nested functions are not supported by Lizzard yet"),
             _ => self.err(off, "this statement is not supported by Lizzard yet"),
         }
+    }
+
+    // ---- exceptions ----
+
+    fn new_handler(&mut self) -> usize {
+        let exc = self.reg(Repr::Obj);
+        self.handlers.push(HandlerIr { ranges: Vec::new(), target: 0, exc });
+        self.handlers.len() - 1
+    }
+
+    fn open_region(&mut self, handler: usize) {
+        let start = self.here();
+        self.regions.push(Region { handler, start, depth: self.cleanups.len() });
+    }
+
+    fn close_region(&mut self) {
+        let r = self.regions.pop().unwrap();
+        let end = self.here();
+        if end > r.start {
+            self.handlers[r.handler].ranges.push((r.start, end));
+        }
+    }
+
+    /// Emit the cleanups above `depth`, innermost first, for leaving their
+    /// blocks early. Each runs outside the ranges its own block protects.
+    fn emit_cleanups(&mut self, depth: usize) {
+        let saved = self.cleanups.clone();
+        for i in (depth..saved.len()).rev() {
+            let pause = self.here();
+            for r in self.regions.iter().filter(|r| r.depth > i) {
+                if pause > r.start {
+                    self.handlers[r.handler].ranges.push((r.start, pause));
+                }
+            }
+            self.cleanups.truncate(i);
+            match &saved[i] {
+                Cleanup::Finally(body) => self.stmts(body),
+                Cleanup::Restore(prev) => {
+                    self.emit(Instr::SetHandled { src: *prev });
+                }
+                Cleanup::WithExit(exit) => self.call_exit_none(*exit),
+            }
+            let resume = self.here();
+            for r in self.regions.iter_mut().filter(|r| r.depth > i) {
+                r.start = resume;
+            }
+        }
+        self.cleanups = saved;
+    }
+
+    fn call_exit_none(&mut self, exit: Reg) {
+        let none = self.konst(Const::None, Ty::None);
+        let dst = self.reg(Repr::Obj);
+        self.emit(Instr::Call { dst, func: exit, args: vec![none.reg; 3], kwnames: Vec::new() });
+    }
+
+    /// The type an `except` clause catches.
+    fn caught_type(&mut self, e: &Expr) -> Ty {
+        let off: u32 = e.range().start().into();
+        match self.class_types(e) {
+            Some(classes) => {
+                for c in &classes {
+                    if !self.is_exception(c) {
+                        let t = self.show(c);
+                        self.err(off, format!("cannot catch {t}: it does not derive from BaseException"));
+                    }
+                }
+                union(classes)
+            }
+            None => Ty::Any,
+        }
+    }
+
+    fn try_stmt(&mut self, t: &ast::StmtTry, off: u32) {
+        if t.is_star {
+            return self.err(off, "`except*` is not supported by Lizzard yet");
+        }
+        let mut keys = Vec::new();
+        assigned_keys(std::slice::from_ref(&Stmt::Try(t.clone())), &mut keys);
+        for k in &keys {
+            self.invalidate(k);
+        }
+        let fin = (!t.finalbody.is_empty()).then(|| {
+            self.cleanups.push(Cleanup::Finally(t.finalbody.to_vec()));
+            let h = self.new_handler();
+            self.open_region(h);
+            h
+        });
+        let th = (!t.handlers.is_empty()).then(|| {
+            let h = self.new_handler();
+            self.open_region(h);
+            h
+        });
+        self.stmts(&t.body);
+        if th.is_some() {
+            self.close_region();
+        }
+        self.stmts(&t.orelse);
+        let mut to_end = vec![self.emit(Instr::Jump { target: 0 })];
+        if let Some(th) = th {
+            self.handlers[th].target = self.here();
+            let exc = self.handlers[th].exc;
+            let prev = self.reg(Repr::Obj);
+            self.emit(Instr::GetHandled { dst: prev });
+            self.emit(Instr::SetHandled { src: exc });
+            self.cleanups.push(Cleanup::Restore(prev));
+            let ch = self.new_handler();
+            self.open_region(ch);
+            for h in &t.handlers {
+                let ast::ExceptHandler::ExceptHandler(h) = h;
+                self.at(h);
+                let mut skip = None;
+                let ty = match &h.type_ {
+                    Some(te) => {
+                        let ty = self.caught_type(te);
+                        let cls = self.expr(te);
+                        let m = self.reg(Repr::Bool);
+                        self.emit(Instr::ExcMatch { dst: m, exc, cls: cls.reg });
+                        skip = Some(self.emit(Instr::JumpIfFalse { cond: m, target: 0 }));
+                        ty
+                    }
+                    None => Ty::Exc("BaseException".into()),
+                };
+                let before = self.narrow.clone();
+                // `as e` binds a name of the clause's own type; Python deletes
+                // it after the clause.
+                let outer = h.name.as_ref().map(|n| (n.to_string(), self.locals.remove(n.as_str())));
+                if let Some((name, _)) = &outer {
+                    self.invalidate(name);
+                    let reg = self.reg(Repr::Obj);
+                    self.emit(Instr::Move { dst: reg, src: exc });
+                    self.locals.insert(name.clone(), Local { reg, ty, repr: Repr::Obj });
+                }
+                self.handled.push(exc);
+                self.stmts(&h.body);
+                self.handled.pop();
+                if let Some((name, old)) = outer {
+                    let reg = self.locals[&name].reg;
+                    self.emit(Instr::Unbind { reg });
+                    match old {
+                        Some(l) => {
+                            self.emit(Instr::Unbind { reg: l.reg });
+                            self.locals.insert(name, l);
+                        }
+                        None => {
+                            self.locals.remove(&name);
+                        }
+                    }
+                }
+                self.narrow = before;
+                self.emit(Instr::SetHandled { src: prev });
+                to_end.push(self.emit(Instr::Jump { target: 0 }));
+                if let Some(j) = skip {
+                    let h = self.here();
+                    self.patch(j, h);
+                }
+            }
+            self.close_region();
+            self.cleanups.pop();
+            // No clause matched.
+            self.emit(Instr::SetHandled { src: prev });
+            self.emit(Instr::Reraise { exc });
+            // An exception in a clause: restore, and let it propagate.
+            self.handlers[ch].target = self.here();
+            self.emit(Instr::SetHandled { src: prev });
+            let cexc = self.handlers[ch].exc;
+            self.emit(Instr::Reraise { exc: cexc });
+        }
+        let end = self.here();
+        for j in to_end {
+            self.patch(j, end);
+        }
+        if let Some(fh) = fin {
+            self.close_region();
+            self.cleanups.pop();
+            self.stmts(&t.finalbody);
+            let skip = self.emit(Instr::Jump { target: 0 });
+            // The exceptional path: the exception is being handled while the
+            // `finally` body runs (an exception there chains it).
+            self.handlers[fh].target = self.here();
+            let fexc = self.handlers[fh].exc;
+            let prev = self.reg(Repr::Obj);
+            self.emit(Instr::GetHandled { dst: prev });
+            self.emit(Instr::SetHandled { src: fexc });
+            self.cleanups.push(Cleanup::Restore(prev));
+            let rh = self.new_handler();
+            self.open_region(rh);
+            self.stmts(&t.finalbody);
+            self.close_region();
+            self.cleanups.pop();
+            self.emit(Instr::SetHandled { src: prev });
+            self.emit(Instr::Reraise { exc: fexc });
+            self.handlers[rh].target = self.here();
+            self.emit(Instr::SetHandled { src: prev });
+            let rexc = self.handlers[rh].exc;
+            self.emit(Instr::Reraise { exc: rexc });
+            let h = self.here();
+            self.patch(skip, h);
+        }
+        for k in &keys {
+            self.invalidate(k);
+        }
+    }
+
+    fn with_stmt(&mut self, w: &ast::StmtWith, off: u32) {
+        if w.is_async {
+            return self.err(off, "`async with` is not supported by Lizzard yet");
+        }
+        self.with_items(&w.items, &w.body, off);
+    }
+
+    fn with_items(&mut self, items: &[ast::WithItem], body: &[Stmt], off: u32) {
+        let Some((item, rest)) = items.split_first() else {
+            return self.stmts(body);
+        };
+        let mgr = self.expr(&item.context_expr);
+        let mut entered = Ty::Any;
+        if !matches!(mgr.ty, Ty::Any) {
+            match self.dunder(&mgr.ty, "__enter__", &[]) {
+                Some(Ok((t, _, _))) => entered = t,
+                Some(Err(m)) => self.err(off, m),
+                None => {
+                    let t = self.show(&mgr.ty);
+                    self.err(off, format!("{t} does not support the context manager protocol (`__enter__`/`__exit__`)"));
+                }
+            }
+            let any = Ty::Any;
+            if let Some(Err(m)) = self.dunder(&mgr.ty, "__exit__", &[any.clone(), any.clone(), any]) {
+                self.err(off, m);
+            }
+        }
+        let m = self.obj(&mgr);
+        let exit = self.reg(Repr::Obj);
+        let n = self.name("__exit__");
+        self.emit(Instr::LoadSpecial { dst: exit, obj: m, name: n });
+        let enter = self.reg(Repr::Obj);
+        let n = self.name("__enter__");
+        self.emit(Instr::LoadSpecial { dst: enter, obj: m, name: n });
+        let val = self.reg(Repr::Obj);
+        self.emit(Instr::Call { dst: val, func: enter, args: Vec::new(), kwnames: Vec::new() });
+        let v = Val { reg: val, ty: entered, repr: Repr::Obj };
+        self.check(&v, format!("{}.__enter__()", self.src(&item.context_expr)), None);
+        if let Some(t) = &item.optional_vars {
+            self.assign_target(t, v, off);
+        }
+        self.cleanups.push(Cleanup::WithExit(exit));
+        let wh = self.new_handler();
+        self.open_region(wh);
+        self.with_items(rest, body, off);
+        self.close_region();
+        self.cleanups.pop();
+        self.call_exit_none(exit);
+        let skip = self.emit(Instr::Jump { target: 0 });
+        // An exception in the body: `__exit__(type, exc, tb)` may suppress it.
+        self.handlers[wh].target = self.here();
+        let exc = self.handlers[wh].exc;
+        let prev = self.reg(Repr::Obj);
+        self.emit(Instr::GetHandled { dst: prev });
+        self.emit(Instr::SetHandled { src: exc });
+        let rh = self.new_handler();
+        self.open_region(rh);
+        let ty = self.reg(Repr::Obj);
+        self.emit(Instr::TypeOf { dst: ty, src: exc });
+        let tb = self.reg(Repr::Obj);
+        let n = self.name("__traceback__");
+        self.emit(Instr::LoadAttr { dst: tb, obj: exc, name: n });
+        let r = self.reg(Repr::Obj);
+        self.emit(Instr::Call { dst: r, func: exit, args: vec![ty, exc, tb], kwnames: Vec::new() });
+        let b = self.reg(Repr::Bool);
+        self.emit(Instr::Truthy { dst: b, src: r });
+        self.close_region();
+        self.emit(Instr::SetHandled { src: prev });
+        let suppressed = self.emit(Instr::JumpIfTrue { cond: b, target: 0 });
+        self.emit(Instr::Reraise { exc });
+        self.handlers[rh].target = self.here();
+        self.emit(Instr::SetHandled { src: prev });
+        let rexc = self.handlers[rh].exc;
+        self.emit(Instr::Reraise { exc: rexc });
+        let end = self.here();
+        self.patch(skip, end);
+        self.patch(suppressed, end);
     }
 
     fn is_exception(&mut self, t: &Ty) -> bool {
@@ -1260,7 +1593,7 @@ impl<'a> Lower<'a> {
     /// Lower a loop body and patch its `break`s to the loop's end and its
     /// `continue`s to `cont`.
     fn loop_body(&mut self, body: &[Stmt]) -> Loop {
-        self.loops.push(Loop::default());
+        self.loops.push(Loop { breaks: Vec::new(), continues: Vec::new(), depth: self.cleanups.len() });
         self.stmts(body);
         self.loops.pop().unwrap()
     }
@@ -1627,7 +1960,7 @@ impl<'a> Lower<'a> {
             Some(s) => self.sym_value_ty(s),
             None => match name {
                 n if BUILTIN_FNS.contains(&n) => Ty::Func(FuncRef::Builtin(BUILTIN_FNS.iter().find(|b| **b == n).unwrap())),
-                n if EXCEPTIONS.contains(&n) => Ty::Type(Box::new(Ty::Exc(n.to_string()))),
+                n if is_exception_name(n) => Ty::Type(Box::new(Ty::Exc(n.to_string()))),
                 "int" => Ty::Type(Box::new(Ty::Int)),
                 "float" => Ty::Type(Box::new(Ty::Float)),
                 "str" => Ty::Type(Box::new(Ty::Str)),
@@ -1766,12 +2099,12 @@ impl<'a> Lower<'a> {
                     None => Err(format!("{} has no attribute `{name}`", self.show(obj_ty))),
                 }
             }
-            (Ty::Exc(_), _) => match name {
-                "args" => Ok(Ty::TupleVar(Box::new(Ty::Any))),
-                n if is_dunder(n) => Ok(Ty::Any),
-                _ => Err(format!("{} has no attribute `{name}`", self.show(obj_ty))),
-            },
+            // Builtin exceptions' attributes are not declared yet (`errno`,
+            // `filename`, ...): only `args` is typed.
+            (Ty::Exc(_), _) => Ok(if name == "args" { Ty::TupleVar(Box::new(Ty::Any)) } else { Ty::Any }),
             (Ty::Any, _) => Ok(Ty::Any),
+            // `type`'s own attributes of any class (`__name__`, ...).
+            (Ty::Type(_), _) if is_dunder(name) => Ok(Ty::Any),
             (Ty::None, _) => Err(format!("cannot read attribute `{name}` of None")),
             (t, _) => Err(format!("attribute `{name}` of {} is not supported by Lizzard yet", self.show(t))),
         }
@@ -1997,6 +2330,10 @@ impl<'a> Lower<'a> {
     fn call_type(&mut self, fty: Ty, pos: &[Ty], kws: &[(String, Ty)], off: u32, origin: &mut Option<String>, builtin_ctor: &mut bool) -> Ty {
         match fty {
             Ty::Func(FuncRef::Builtin("print")) => Ty::None,
+            Ty::Func(FuncRef::Builtin("type")) if pos.len() == 1 && kws.is_empty() => match &pos[0] {
+                Ty::Any | Ty::Union(_) => Ty::Any,
+                t => Ty::Type(Box::new(self.lookup_ty(t))),
+            },
             Ty::Func(FuncRef::Builtin(n)) => {
                 self.err(off, format!("{n}() is not supported here by Lizzard yet"));
                 Ty::Any
@@ -2828,6 +3165,16 @@ fn always_exits(body: &[Stmt]) -> bool {
                 && i.elif_else_clauses.iter().all(|c| always_exits(&c.body))
         }
         Some(Stmt::While(w)) => matches!(&*w.test, Expr::BooleanLiteral(b) if b.value) && !has_break(&w.body),
+        Some(Stmt::Try(t)) => {
+            always_exits(&t.finalbody)
+                || ((always_exits(&t.body) || always_exits(&t.orelse))
+                    && t.handlers.iter().all(|h| {
+                        let ast::ExceptHandler::ExceptHandler(h) = h;
+                        always_exits(&h.body)
+                    }))
+        }
+        // `__exit__` may suppress an exception, so only a `return` exits.
+        Some(Stmt::With(w)) => matches!(w.body.last(), Some(Stmt::Return(_))) || matches!(w.body.last(), Some(s) if always_exits(std::slice::from_ref(s)) && !matches!(s, Stmt::Raise(_))),
         _ => false,
     }
 }

@@ -250,3 +250,21 @@ fn functions_read_and_write_module_globals() {
         ]
     );
 }
+
+#[test]
+fn exceptions_are_checked() {
+    let d = check(
+        "class NotExc:\n    pass\n\nclass Err(Exception):\n    def __init__(self, code: int) -> None:\n        self.code: int = code\n\ndef f() -> None:\n    raise\n\ndef g() -> int:\n    try:\n        return 1\n    except NotExc:\n        return 2\n    except (KeyError, Err) as e:\n        s: str = e\n        raise ValueError() from 5\n    except Err as e:\n        return e.code\n\ndef h() -> int:\n    try:\n        return 1\n    except ValueError:\n        pass\n\ndef k() -> None:\n    with 3:\n        pass\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "a bare `raise` is only allowed in an `except` block",
+            "cannot catch NotExc: it does not derive from BaseException",
+            "cannot assign KeyError | Err to `s` of type str",
+            "an exception cause must derive from BaseException or be None, got int",
+            "`h` may end without returning a value (declared to return int)",
+            "int does not support the context manager protocol (`__enter__`/`__exit__`)",
+        ]
+    );
+}

@@ -122,7 +122,22 @@ pub enum Instr {
     Jump { target: u32 },
     JumpIfFalse { cond: Reg, target: u32 },
     JumpIfTrue { cond: Reg, target: u32 },
-    Raise { exc: Reg },
+    /// `raise exc` (a class is instantiated), or `raise exc from cause`.
+    Raise { exc: Reg, cause: Option<Reg> },
+    /// Raise a caught exception again, as it is.
+    Reraise { exc: Reg },
+    /// `dst: Bool = isinstance(exc, cls)` for `except cls:`
+    ExcMatch { dst: Reg, exc: Reg, cls: Reg },
+    /// The exception being handled (`sys.exception()`), or None.
+    GetHandled { dst: Reg },
+    /// Set the exception being handled (None clears it).
+    SetHandled { src: Reg },
+    /// Make a register unbound again (`except E as e` ends with `del e`).
+    Unbind { reg: Reg },
+    /// `dst = type(src)`
+    TypeOf { dst: Reg, src: Reg },
+    /// `type(obj).name`, bound to `obj` (how `with` finds `__enter__`).
+    LoadSpecial { dst: Reg, obj: Reg, name: u32 },
     Return { src: Reg },
     I64Const { dst: Reg, value: i64 },
     I64Lt { dst: Reg, a: Reg, b: Reg },
@@ -141,6 +156,17 @@ pub enum Instr {
     F32Bin { dst: Reg, op: BinOp, a: Reg, b: Reg },
     /// Raise `TypeError` unless `reg` passes `checks[check]`.
     Check { reg: Reg, check: u32 },
+}
+
+/// An exception raised by an instruction in one of `ranges` (`start..end`)
+/// is stored in `exc` and execution continues at `target`. Handlers nest,
+/// and an inner one comes after its outer ones: the last that covers the
+/// instruction wins.
+#[derive(Clone, Debug)]
+pub struct HandlerIr {
+    pub ranges: Vec<(u32, u32)>,
+    pub target: u32,
+    pub exc: Reg,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +193,7 @@ pub struct FuncIr {
     pub consts: Vec<Const>,
     pub names: Vec<String>,
     pub checks: Vec<CheckIr>,
+    pub handlers: Vec<HandlerIr>,
 }
 
 #[derive(Clone, Debug, Default)]

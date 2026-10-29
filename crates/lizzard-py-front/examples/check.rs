@@ -29,6 +29,9 @@ fn main() {
             for ch in &f.checks {
                 println!("    check {ch:?}");
             }
+            for h in &f.handlers {
+                println!("    handler {:?} -> {} (exc r{})", h.ranges, h.target, h.exc);
+            }
         }
     }
 }

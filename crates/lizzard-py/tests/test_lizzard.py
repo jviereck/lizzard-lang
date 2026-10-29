@@ -20,6 +20,7 @@ CLASSES = HERE / "programs" / "classes.py"
 CONTAINERS = HERE / "programs" / "containers.py"
 UNIONS = HERE / "programs" / "unions.py"
 GLOBALS = HERE / "programs" / "globals.py"
+EXCEPTIONS = HERE / "programs" / "exceptions.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -159,7 +160,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -249,8 +250,9 @@ class Checker(unittest.TestCase):
                 return a
 
             def h(a) -> None:
-                with a:
-                    pass
+                match a:
+                    case _:
+                        pass
 
             f("x")
             """)

@@ -7,7 +7,8 @@ use pyo3::exceptions::{PyNameError, PyTypeError, PyUnboundLocalError, PyValueErr
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PyString, PyTuple};
+use pyo3::exceptions::PyBaseException;
+use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PyString, PyTuple, PyType};
 use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, Repr};
 
 use crate::array;
@@ -153,6 +154,15 @@ fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec
             Ok(Some(ret)) => return Ok(ret),
             Ok(None) => {}
             Err(e) => {
+                // The innermost handler covering the instruction: regions
+                // nest, and an inner handler is created after its outer one.
+                let at = pc as u32;
+                let handler = ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e));
+                if let Some(h) = handler {
+                    regs[h.exc as usize] = V::O(e.into_value(py).into_bound(py).into_any());
+                    pc = h.target as usize;
+                    continue;
+                }
                 let line = ir.lines.get(pc).copied().unwrap_or(ir.line);
                 let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
                 return Err(e);
@@ -179,6 +189,15 @@ macro_rules! scalar {
             _ => unreachable!("register {} has the wrong representation", $r),
         }
     };
+}
+
+/// The exception `raise x` raises: `x`, or an instance of the class `x`.
+fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let e = if x.is_instance_of::<PyType>() { x.call0()? } else { x.clone() };
+    if !e.is_instance_of::<PyBaseException>() {
+        return Err(PyTypeError::new_err("exceptions must derive from BaseException"));
+    }
+    Ok(e)
 }
 
 /// Execute one instruction; `Some` when the function returns.
@@ -393,9 +412,50 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
                 next = *target as usize;
             }
         }
-        Instr::Raise { exc } => {
-            let e = obj!(regs, *exc).clone();
-            return Err(PyErr::from_value(e));
+        Instr::Raise { exc, cause } => {
+            let e = exception_instance(obj!(regs, *exc))?;
+            if let Some(c) = cause {
+                let c = obj!(regs, *c);
+                let c = if c.is_none() { c.clone() } else { exception_instance(c)? };
+                // Also sets `__suppress_context__`.
+                e.setattr("__cause__", c)?;
+            }
+            // SAFETY: valid objects; `PyErr_SetObject` chains the exception
+            // being handled as `__context__`, as `raise` does.
+            unsafe { ffi::PyErr_SetObject(e.get_type().as_ptr(), e.as_ptr()) };
+            return Err(PyErr::fetch(py));
+        }
+        Instr::Reraise { exc } => return Err(PyErr::from_value(obj!(regs, *exc).clone())),
+        Instr::ExcMatch { dst, exc, cls } => {
+            let m = obj!(regs, *exc).is_instance(obj!(regs, *cls))?;
+            regs[*dst as usize] = V::B(m);
+        }
+        Instr::GetHandled { dst } => {
+            // SAFETY: returns a new reference or NULL.
+            let p = unsafe { ffi::PyErr_GetHandledException() };
+            let v = if p.is_null() { py.None().into_bound(py) } else { unsafe { Bound::from_owned_ptr(py, p) } };
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::SetHandled { src } => {
+            // SAFETY: a valid object (None clears it); the reference is not stolen.
+            unsafe { ffi::PyErr_SetHandledException(obj!(regs, *src).as_ptr()) };
+        }
+        Instr::Unbind { reg } => regs[*reg as usize] = V::Empty,
+        Instr::TypeOf { dst, src } => {
+            let t = obj!(regs, *src).get_type().into_any();
+            regs[*dst as usize] = V::O(t);
+        }
+        Instr::LoadSpecial { dst, obj, name } => {
+            let o = obj!(regs, *obj);
+            let t = o.get_type();
+            let n = f.names[*name as usize].bind(py);
+            let a = t.getattr(n).map_err(|_| PyTypeError::new_err(format!("'{}' object does not support the context manager protocol", t.name().map(|s| s.to_string()).unwrap_or_default())))?;
+            // Bind it like a method lookup does.
+            let v = match a.get_type().getattr("__get__") {
+                Ok(get) => get.call1((&a, o, &t))?,
+                Err(_) => a,
+            };
+            regs[*dst as usize] = V::O(v);
         }
         Instr::Return { src } => return Ok(Some(obj!(regs, *src).clone().unbind())),
         Instr::I64Const { dst, value } => regs[*dst as usize] = V::I(*value),
