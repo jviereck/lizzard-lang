@@ -191,12 +191,13 @@ A first end-to-end slice runs the float32 NumPy example (`examples/numpy_add/add
   - direct float32 element access with a layout check (`array.rs`).
 - **The Python package** (`crates/lizzard-py/python/lizzard`): the import hook, `python -m lizzard`, and the NumPy overlay `stubs/numpy/__init__.pyi`.
 - **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `set`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and builtin functions (`isinstance`, `enumerate`, `zip`, `map`, `filter`, `sorted`, `min`/`max` with `key=`, `sum`, `any`, `all`, `iter`, `next`, `open`, ...). They stand in for typeshed until it is bundled. `typing`/`collections.abc` names such as `Iterable`, `Sequence`, `Callable` map to them.
-- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses) must print exactly what plain CPython prints.
+- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses, generators) must print exactly what plain CPython prints.
 
 **Supported language subset:**
 - imports;
 - **functions:** annotated parameters of every kind (`/`, `*args: T`, keyword-only, `**kwargs: T`), literal defaults, generic functions (`def f[T: Bound](...)` and `TypeVar`s); calls with keywords, `*iterable` and `**mapping`;
 - **inner functions, closures and lambdas** (see below);
+- **generators** (`yield`, `yield from`; see below);
 - **module globals** read by functions, and assigned after `global x`;
 - `type X = ...` aliases;
 - **classes and dataclasses** (see below);
@@ -225,6 +226,15 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
 **Inner functions, closures and lambdas.** A syntactic scope analysis finds the variables that inner functions capture. Those live in real CPython cells, passed to the inner function as its closure, so late binding and `nonlocal` work as in Python, across several levels and for recursive inner functions. Inner functions and lambdas compile to their own functions (qualified names like `f.<locals>.g`) and are created at runtime with their closure and their defaults, which are evaluated where they are defined (`lambda x, n=n: ...`). `Callable[[A, B], R]` types functions, bound methods, classes and lambdas (parameters contravariant, result covariant). A lambda's parameter types come from the expected `Callable`; in a call, the other arguments are checked first so the callee's type variables are known (`sorted(people, key=lambda p: p.age)`).
 
+**Generators.** A generator function is annotated as returning `Iterator[T]`, `Iterable[T]` or `Generator[Y, S, R]`: its `yield`s are checked against `Y`, `yield` gives `S` (from `send`), and `return` gives `R` (`StopIteration.value`, and the value of `yield from` over it). Calling it checks the arguments and returns a `LizzardGenerator` that owns the function's frame.
+- **The model is the original VM's** (`lizzard-vm/src/generator.rs`): the frame is the registers and the pc of the `yield` it is suspended at. Resuming writes the sent value into the yield's destination register and continues after it; `throw` continues *at* the `yield` with the exception raised there, so the function's own handler table applies. An atomic "running" flag makes a concurrent or re-entrant resume raise `ValueError: generator already executing`.
+- **The interpreter's entries and exits are the JIT's.** `exec` enters a frame at any pc, optionally with an exception pending there, and leaves by `Return`, `Yield` or `YieldFrom` without unwinding the frame. A compiled function needs the same: an entry block that dispatches on pc 0 and the resume points (`Yield`/`YieldFrom` + 1, and the yields themselves for `throw`), with exits that store the pc. The generator object only moves registers between its owned frame and `exec`; it needs no change for compiled code.
+- **CPython's protocol:** `__next__`, `send`, `throw` (also the deprecated three-argument form, with its warning), `close` (returning the generator's return value), `StopIteration` values, PEP 479 (a `StopIteration` escaping the body becomes `RuntimeError`), `gi_running`. It is registered as a `collections.abc.Generator`.
+- **`yield from` works with any iterator**, Lizzard or Python: the generator object delegates `send`, `throw` and `close` to it as CPython does (`PyIter_Send`, `throw`, `close`), and resumes the frame with its return value. Python's `yield from` drives Lizzard generators the same way.
+- **The handled exception is part of the frame.** A generator suspended in an `except` block keeps its `sys.exception()` and gives the caller back theirs while suspended.
+- **Unfinished generators are closed when freed**, so their `finally` blocks run; an exception there is reported as unraisable, as CPython does.
+- **`for` loops resume Lizzard generators directly**, without a `StopIteration` at the end.
+
 **Behaviour decisions:**
 - **A type error in top-level code is a static error.** The example's last line therefore stops the import with a diagnostic. The runtime check is what Python callers see.
 - **`a[i]` on `npt.NDArray` (unknown ndim) is `Any`**, by the typing spec's rule for overloads matched through `Any`. The unboxed float32 path needs a shape-typed array: `np.ndarray[tuple[int], np.dtype[np.float32]]`.
@@ -238,6 +248,9 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **A lambda needs an expected `Callable` type** for its parameters (an annotation, a parameter, `key=`); `f = lambda x: ...` alone is an error, like an unannotated `def`.
 - **A name is local to a function if it is assigned anywhere in it**, as in Python: reading it before the assignment is an error rather than a read of the global.
 - **Builtin exceptions' attributes other than `args` are `Any`** (`errno`, `filename`, ...).
+- **The value sent to a `yield` is checked against `S | None`.** `next()` sends None whatever the send type is, as typing allows.
+- **Temporaries may keep objects alive until the function returns.** Assignment moves a temporary's reference into the variable, so `del x` frees an object at once, but other temporaries (a call's arguments, say) are only released when overwritten. A liveness pass that clears dead registers (needed by the JIT anyway) would make finalization as prompt as CPython's.
+- **Compiled frames add no traceback entries** (they add a `lizzard:` note per frame instead), so tracebacks of errors in generators point at the caller.
 
 **Findings:**
 - **Overlays must use only public names.** NumPy 2.5 renamed the private TypeVar `_NBit1` to `_NBitT`, which silently degraded an overlay that used it. The overlay now uses `Self` and method-level type parameters. `Self` is a TypeVar bounded by its class, solved to the receiver's own type.
@@ -247,7 +260,8 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 **Deferred:**
 - checking that overlays only refine the base declarations;
 - bundled typeshed (stdlib modules are `Any`), `Protocol`s (structural typing) and `Literal` types;
-- generators (`yield`) and generator expressions, `async`, `match`, `except*`, the walrus operator, `del` of names and attributes, chained comparisons;
+- generator expressions, `async` (coroutines, async generators), `match`, `except*`, the walrus operator, `del` of attributes and globals, chained comparisons;
+- `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;
 - decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
 - `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);
 - vectorcall entry points, the JIT, and safepoints;
