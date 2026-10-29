@@ -655,25 +655,7 @@ impl<'a> Lower<'a> {
         l.bound = keys.into_iter().filter(|k| !k.contains('.')).collect();
         let has_receiver = owner.is_some() && kind != MethodKind::Static;
         l.method = owner.map(|c| MethodCtx { class: c, receiver: if has_receiver { sig.params.first().map(|p| p.name.clone()) } else { None }, is_init: name == "__init__" });
-        // Literal defaults, in order of the parameters that have them.
-        let raw_defaults: Vec<Option<&Expr>> = d.parameters.posonlyargs.iter().chain(d.parameters.args.iter()).map(|p| p.default.as_deref()).collect();
-        let mut params = Vec::new();
-        for (i, p) in sig.params.iter().enumerate() {
-            if !matches!(p.kind, PKind::PosOnly | PKind::PosOrKw) {
-                l.err(off, format!("parameter `{}`: only positional parameters are supported by Lizzard yet", p.name));
-            }
-            let reg = l.reg(Repr::Obj);
-            l.locals.insert(p.name.clone(), Local { reg, ty: p.ty.clone(), repr: Repr::Obj });
-            let expected = l.show(&p.ty);
-            // The receiver is bound by Python itself.
-            let check = if i == 0 && has_receiver { RtCheck::Any } else { l.rtcheck(&p.ty) };
-            l.checks.push(CheckIr { check, what: format!("argument '{}'", p.name), expected, origin: None });
-            let default = match raw_defaults.get(i).copied().flatten() {
-                Some(e) => l.default_value(e, &p.ty, &p.name),
-                None => None,
-            };
-            params.push(ParamIr { name: p.name.clone(), check: (l.checks.len() - 1) as u32, default });
-        }
+        let params = l.params(&sig, &d.parameters, has_receiver);
         for s in &d.body {
             l.stmt(s);
         }
@@ -706,6 +688,39 @@ impl<'a> Lower<'a> {
         };
         self.db.rigid = saved_rigid;
         Some(ir)
+    }
+
+    /// Bind a signature's parameters to registers `0..n` (in `sig` order).
+    fn params(&mut self, sig: &Sig, ps: &ast::Parameters, has_receiver: bool) -> Vec<ParamIr> {
+        let defaults: HashMap<&str, &Expr> = ps
+            .posonlyargs
+            .iter()
+            .chain(ps.args.iter())
+            .chain(ps.kwonlyargs.iter())
+            .filter_map(|p| p.default.as_deref().map(|d| (p.parameter.name.as_str(), d)))
+            .collect();
+        let mut params = Vec::new();
+        for (i, p) in sig.params.iter().enumerate() {
+            let (kind, local_ty) = match p.kind {
+                PKind::PosOnly => (ParamKind::PosOnly, p.ty.clone()),
+                PKind::PosOrKw => (ParamKind::PosOrKw, p.ty.clone()),
+                PKind::KwOnly => (ParamKind::KwOnly, p.ty.clone()),
+                PKind::VarPos => (ParamKind::VarPos, Ty::TupleVar(Box::new(p.ty.clone()))),
+                PKind::VarKw => (ParamKind::VarKw, self.builtin_inst("dict", vec![Ty::Str, p.ty.clone()])),
+            };
+            let reg = self.reg(Repr::Obj);
+            self.locals.insert(p.name.clone(), Local { reg, ty: local_ty, repr: Repr::Obj });
+            let expected = self.show(&p.ty);
+            // The receiver is bound by Python itself.
+            let check = if i == 0 && has_receiver { RtCheck::Any } else { self.rtcheck(&p.ty) };
+            self.checks.push(CheckIr { check, what: format!("argument '{}'", p.name), expected, origin: None });
+            let default = match defaults.get(p.name.as_str()) {
+                Some(e) => self.default_value(e, &p.ty, &p.name),
+                None => None,
+            };
+            params.push(ParamIr { name: p.name.clone(), kind, check: (self.checks.len() - 1) as u32, default });
+        }
+        params
     }
 
     /// A parameter's default value: a literal of the parameter's type.
@@ -2357,21 +2372,18 @@ impl<'a> Lower<'a> {
             return Val { reg: dst, ty: Ty::Int, repr: Repr::I64 };
         }
         let fv = self.expr(&c.func);
+        if c.arguments.args.iter().any(|a| matches!(a, Expr::Starred(_))) || c.arguments.keywords.iter().any(|k| k.arg.is_none()) {
+            return self.star_call(c, fv, off);
+        }
         let (pos_hints, kw_hints) = self.arg_hints(&fv.ty);
         let mut pos = Vec::new();
         for (i, a) in c.arguments.args.iter().enumerate() {
-            if matches!(a, Expr::Starred(_)) {
-                self.err(off, "`*args` in calls is not supported by Lizzard yet");
-            }
             let hint = pos_hints.get(i).cloned().flatten();
             pos.push(self.expr_hint(a, hint.as_ref()));
         }
         let mut kws = Vec::new();
         for k in c.arguments.keywords.iter() {
-            let Some(name) = &k.arg else {
-                self.err(off, "`**kwargs` in calls is not supported by Lizzard yet");
-                continue;
-            };
+            let name = k.arg.as_ref().unwrap();
             let hint = kw_hints.get(name.as_str()).cloned();
             let v = self.expr_hint(&k.value, hint.as_ref());
             kws.push((name.as_str().to_string(), v));
@@ -2390,6 +2402,96 @@ impl<'a> Lower<'a> {
         }
         let dst = self.reg(Repr::Obj);
         self.emit(Instr::Call { dst, func, args, kwnames });
+        let v = Val { reg: dst, ty: ret, repr: Repr::Obj };
+        if !builtin_ctor {
+            let what = format!("{}(...)", self.src(&*c.func));
+            self.check(&v, what, origin);
+        }
+        self.unbox_f32(v)
+    }
+
+    /// A call with `*iterable` or `**mapping` arguments. Fixed-length tuples
+    /// spread into typed positional arguments; otherwise the arguments are
+    /// only checked where the callee is entered.
+    fn star_call(&mut self, c: &ast::ExprCall, fv: Val, off: u32) -> Val {
+        let list = self.reg(Repr::Obj);
+        self.emit(Instr::BuildList { dst: list, items: Vec::new() });
+        let mut pos_tys = Vec::new();
+        let mut exact = true;
+        for a in c.arguments.args.iter() {
+            match a {
+                Expr::Starred(st) => {
+                    let v = self.expr(&st.value);
+                    match &v.ty {
+                        Ty::Tuple(ts) => pos_tys.extend(ts.iter().cloned()),
+                        t => {
+                            let t = t.clone();
+                            self.iter_elem(&t, st.range().start().into());
+                            exact = false;
+                        }
+                    }
+                    let r = self.obj(&v);
+                    self.emit(Instr::ListExtend { list, iter: r });
+                }
+                a => {
+                    let v = self.expr(a);
+                    pos_tys.push(v.ty.clone());
+                    let r = self.obj(&v);
+                    self.emit(Instr::ListAppend { list, val: r });
+                }
+            }
+        }
+        let args = self.reg(Repr::Obj);
+        self.emit(Instr::ListToTuple { dst: args, src: list });
+        let kwargs = (!c.arguments.keywords.is_empty()).then(|| {
+            let d = self.reg(Repr::Obj);
+            self.emit(Instr::BuildDict { dst: d, keys: Vec::new(), vals: Vec::new() });
+            d
+        });
+        let mut kw_tys = Vec::new();
+        let func = self.obj(&fv);
+        for k in c.arguments.keywords.iter() {
+            let v = self.expr(&k.value);
+            let d = kwargs.unwrap();
+            match &k.arg {
+                Some(name) => {
+                    kw_tys.push((name.to_string(), v.ty.clone()));
+                    let key = self.konst(Const::Str(name.to_string()), Ty::Str);
+                    let one = self.reg(Repr::Obj);
+                    let vr = self.obj(&v);
+                    self.emit(Instr::BuildDict { dst: one, keys: vec![key.reg], vals: vec![vr] });
+                    self.emit(Instr::DictMerge { dict: d, src: one, func });
+                }
+                None => {
+                    exact = false;
+                    if !matches!(v.ty, Ty::Any) && self.builtin_args(&v.ty, "dict").is_none_or(|a| !self.assignable(&a[0], &Ty::Str)) {
+                        let t = self.show(&v.ty);
+                        self.err(k.range().start().into(), format!("`**` needs a dict with str keys, got {t}"));
+                    }
+                    let vr = self.obj(&v);
+                    self.emit(Instr::DictMerge { dict: d, src: vr, func });
+                }
+            }
+        }
+        let mut origin = None;
+        let mut builtin_ctor = false;
+        let ret = if exact {
+            self.call_type(fv.ty.clone(), &pos_tys, &kw_tys, off, &mut origin, &mut builtin_ctor)
+        } else {
+            match &fv.ty {
+                Ty::Func(FuncRef::Def(f) | FuncRef::Bound(f, _)) if self.db.sigs(*f).len() == 1 => {
+                    let r = self.db.sigs(*f)[0].ret.clone();
+                    self.db.erase(&r)
+                }
+                Ty::Type(t) => match self.lookup_ty(t) {
+                    Ty::Inst(k, args) if self.db.is_user_class(k) => Ty::Inst(k, args.iter().map(|a| self.db.erase(a)).collect()),
+                    _ => Ty::Any,
+                },
+                _ => Ty::Any,
+            }
+        };
+        let dst = self.reg(Repr::Obj);
+        self.emit(Instr::CallEx { dst, func, args, kwargs });
         let v = Val { reg: dst, ty: ret, repr: Repr::Obj };
         if !builtin_ctor {
             let what = format!("{}(...)", self.src(&*c.func));
@@ -2543,6 +2645,12 @@ impl<'a> Lower<'a> {
                 return Err(Mismatch::Arity("missing `self`".into()));
             };
             pairs.push((p.name.clone(), pt, r.clone()));
+        }
+        // Too many positional arguments is reported first, as CPython does.
+        let skip = usize::from(recv.is_some());
+        let npos = sig.params.iter().skip(skip).filter(|p| matches!(p.kind, PKind::PosOnly | PKind::PosOrKw)).count();
+        if pos.len() > npos && !sig.params.iter().any(|p| matches!(p.kind, PKind::VarPos)) {
+            return Err(Mismatch::Arity(format!("takes {npos} positional arguments but {} were given", pos.len())));
         }
         let mut i = 0;
         let mut used = vec![false; kws.len()];

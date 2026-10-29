@@ -97,6 +97,15 @@ pub enum Instr {
     StoreAttr { obj: Reg, name: u32, val: Reg },
     /// `func(*args[..n - kwnames.len()], **{kwnames: args[rest]})`
     Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32> },
+    /// `func(*args, **kwargs)` with a tuple and a dict (calls with `*`/`**`).
+    CallEx { dst: Reg, func: Reg, args: Reg, kwargs: Option<Reg> },
+    /// `list.extend(iter)`
+    ListExtend { list: Reg, iter: Reg },
+    /// `dst = tuple(src)`
+    ListToTuple { dst: Reg, src: Reg },
+    /// Merge mapping `src` into the keyword dict `dict` for `func`; a
+    /// repeated key is a TypeError, as in a call.
+    DictMerge { dict: Reg, src: Reg, func: Reg },
     /// `a op b`, or `a op= b` (`__iadd__`, ...) when `inplace`.
     BinOp { dst: Reg, op: BinOp, a: Reg, b: Reg, inplace: bool },
     Neg { dst: Reg, src: Reg },
@@ -182,9 +191,21 @@ pub struct HandlerIr {
     pub exc: Reg,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamKind {
+    PosOnly,
+    PosOrKw,
+    /// `*args`: its register holds a tuple, and `check` applies to items.
+    VarPos,
+    KwOnly,
+    /// `**kwargs`: its register holds a dict, and `check` applies to values.
+    VarKw,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParamIr {
     pub name: String,
+    pub kind: ParamKind,
     /// Index into `checks`.
     pub check: u32,
     /// The default value, an index into `consts`.

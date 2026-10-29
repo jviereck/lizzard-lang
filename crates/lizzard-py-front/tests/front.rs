@@ -283,3 +283,21 @@ fn sets_and_operators_are_typed() {
         ]
     );
 }
+
+#[test]
+fn variadic_and_keyword_only_parameters() {
+    let d = check(
+        "def f(a: int, *rest: str, flag: bool = False, **opts: float) -> None:\n    n: tuple[str, ...] = rest\n    m: dict[str, float] = opts\n    s: int = rest[0]\n\ndef g(x: int, *, y: int) -> None:\n    pass\n\ndef h(t: tuple[int, int], xs: list[int], d: dict[str, int]) -> None:\n    f(1, \"a\", \"b\", flag=True, w=1.5)\n    f(1, 2)\n    g(1, 2)\n    g(1)\n    g(*t)\n    g(*xs, **d)\n    g(1, **xs)\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "cannot assign str to `s` of type int",
+            "argument `rest` of f(): expected str, got int",
+            "g(): takes 1 positional arguments but 2 were given",
+            "g(): missing keyword argument `y`",
+            "g(): takes 1 positional arguments but 2 were given",
+            "`**` needs a dict with str keys, got list[int]",
+        ]
+    );
+}

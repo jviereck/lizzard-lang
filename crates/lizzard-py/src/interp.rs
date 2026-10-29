@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::PyBaseException;
 use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PySet, PyString, PyTuple, PyType};
-use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, Repr};
+use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, ParamKind, Repr};
 
 use crate::array;
 use crate::rt;
@@ -59,12 +59,7 @@ impl LizzardFunction {
     fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let ir = &self.rt.ir;
         let bound = bind_args(ir, &self.rt.consts, args, kwargs)?;
-        for (p, v) in ir.params.iter().zip(&bound) {
-            let c = &ir.checks[p.check as usize];
-            if let Err(got) = rt::check(py, v, &c.check)? {
-                return Err(PyTypeError::new_err(format!("{}() argument '{}': expected {}, got {got}", ir.name, p.name, c.expected)));
-            }
-        }
+        check_args(py, ir, &bound)?;
         run(py, &self.rt, self.globals.bind(py), bound)
     }
 
@@ -103,31 +98,130 @@ impl LizzardFunction {
 
 /// Bind call arguments to parameters, with CPython's error messages.
 fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let n = ir.params.len();
+    let py = args.py();
     let name = &ir.name;
-    if args.len() > n {
-        return Err(PyTypeError::new_err(format!("{name}() takes {n} positional arguments but {} were given", args.len())));
+    let err = |m: String| Err(PyTypeError::new_err(format!("{name}() {m}")));
+    let positional: Vec<usize> = (0..ir.params.len()).filter(|&i| matches!(ir.params[i].kind, ParamKind::PosOnly | ParamKind::PosOrKw)).collect();
+    let var_pos = ir.params.iter().position(|p| p.kind == ParamKind::VarPos);
+    let var_kw = ir.params.iter().position(|p| p.kind == ParamKind::VarKw);
+    let mut slots: Vec<Option<Bound<'py, PyAny>>> = vec![None; ir.params.len()];
+    let given: Vec<Bound<'py, PyAny>> = args.iter().collect();
+    for (i, a) in given.iter().enumerate().take(positional.len()) {
+        slots[positional[i]] = Some(a.clone());
     }
-    let mut slots: Vec<Option<Bound<'py, PyAny>>> = args.iter().map(Some).collect();
-    slots.resize(n, None);
+    let extra = &given[given.len().min(positional.len())..];
+    if let Some(vp) = var_pos {
+        slots[vp] = Some(PyTuple::new(py, extra)?.into_any());
+    }
+    let kw_dict = match var_kw {
+        Some(vk) => {
+            let d = PyDict::new(py);
+            slots[vk] = Some(d.clone().into_any());
+            Some(d)
+        }
+        None => None,
+    };
+    let mut posonly_as_kw = Vec::new();
+    let mut kwonly_given = 0;
     if let Some(kw) = kwargs {
         for (k, v) in kw.iter() {
-            let k: String = k.extract()?;
-            match ir.params.iter().position(|p| p.name == k) {
-                Some(i) if slots[i].is_some() => {
-                    return Err(PyTypeError::new_err(format!("{name}() got multiple values for argument '{k}'")));
+            let key: String = k.extract()?;
+            match ir.params.iter().position(|p| p.name == key && matches!(p.kind, ParamKind::PosOrKw | ParamKind::KwOnly)) {
+                Some(i) if slots[i].is_some() => return err(format!("got multiple values for argument '{key}'")),
+                Some(i) => {
+                    if ir.params[i].kind == ParamKind::KwOnly {
+                        kwonly_given += 1;
+                    }
+                    slots[i] = Some(v);
                 }
-                Some(i) => slots[i] = Some(v),
-                None => return Err(PyTypeError::new_err(format!("{name}() got an unexpected keyword argument '{k}'"))),
+                None => match &kw_dict {
+                    Some(d) => d.set_item(k, v)?,
+                    None if ir.params.iter().any(|p| p.name == key && p.kind == ParamKind::PosOnly) => posonly_as_kw.push(format!("'{key}'")),
+                    None => return err(format!("got an unexpected keyword argument '{key}'")),
+                },
             }
         }
     }
-    let missing: Vec<String> = ir.params.iter().zip(&slots).filter(|(p, s)| s.is_none() && p.default.is_none()).map(|(p, _)| format!("'{}'", p.name)).collect();
-    if !missing.is_empty() {
-        let s = if missing.len() == 1 { "" } else { "s" };
-        return Err(PyTypeError::new_err(format!("{name}() missing {} required positional argument{s}: {}", missing.len(), missing.join(" and "))));
+    if !extra.is_empty() && var_pos.is_none() {
+        let max = positional.len();
+        let min = positional.iter().filter(|&&i| ir.params[i].default.is_none()).count();
+        let takes = if min == max { format!("{max} positional argument{}", plural(max)) } else { format!("from {min} to {max} positional arguments") };
+        let n = given.len();
+        let were = if kwonly_given > 0 {
+            format!("{n} positional argument{} (and {kwonly_given} keyword-only argument{}) were given", plural(n), plural(kwonly_given))
+        } else {
+            format!("{n} {} given", if n == 1 { "was" } else { "were" })
+        };
+        return err(format!("takes {takes} but {were}"));
     }
-    Ok(slots.into_iter().zip(&ir.params).map(|(s, p)| s.unwrap_or_else(|| consts[p.default.unwrap() as usize].bind(args.py()).clone())).collect())
+    if !posonly_as_kw.is_empty() {
+        return err(format!("got some positional-only arguments passed as keyword arguments: {}", posonly_as_kw.join(", ")));
+    }
+    for (i, p) in ir.params.iter().enumerate() {
+        if slots[i].is_none() {
+            if let Some(d) = p.default {
+                slots[i] = Some(consts[d as usize].bind(py).clone());
+            }
+        }
+    }
+    for (kind, what) in [(ParamKind::PosOnly, "positional"), (ParamKind::KwOnly, "keyword-only")] {
+        let missing: Vec<String> = ir
+            .params
+            .iter()
+            .zip(&slots)
+            .filter(|(p, s)| s.is_none() && (p.kind == kind || (kind == ParamKind::PosOnly && p.kind == ParamKind::PosOrKw)))
+            .map(|(p, _)| format!("'{}'", p.name))
+            .collect();
+        if !missing.is_empty() {
+            return err(format!("missing {} required {what} argument{}: {}", missing.len(), plural(missing.len()), english_list(&missing)));
+        }
+    }
+    Ok(slots.into_iter().map(|s| s.unwrap()).collect())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// `'a'`, `'a' and 'b'`, `'a', 'b', and 'c'`, as CPython lists names.
+fn english_list(items: &[String]) -> String {
+    match items {
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// Check bound arguments against the parameters' types (each item of
+/// `*args`, each value of `**kwargs`).
+fn check_args(py: Python<'_>, ir: &FuncIr, bound: &[Bound<'_, PyAny>]) -> PyResult<()> {
+    for (p, v) in ir.params.iter().zip(bound) {
+        let c = &ir.checks[p.check as usize];
+        let fail = |what: String, got: String| Err(PyTypeError::new_err(format!("{}() argument {what}: expected {}, got {got}", ir.name, c.expected)));
+        match p.kind {
+            ParamKind::VarPos => {
+                for (i, item) in v.try_iter()?.enumerate() {
+                    if let Err(got) = rt::check(py, &item?, &c.check)? {
+                        return fail(format!("'{}[{i}]'", p.name), got);
+                    }
+                }
+            }
+            ParamKind::VarKw => {
+                for (k, item) in v.cast::<PyDict>().map_err(PyErr::from)?.iter() {
+                    if let Err(got) = rt::check(py, &item, &c.check)? {
+                        return fail(format!("'{}[{}]'", p.name, k.repr()?), got);
+                    }
+                }
+            }
+            _ => {
+                if let Err(got) = rt::check(py, v, &c.check)? {
+                    return fail(format!("'{}'", p.name), got);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 enum V<'py> {
@@ -247,6 +341,40 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
             };
             let v = obj!(regs, *func).call(PyTuple::new(py, pos)?, kwargs.as_ref())?;
             regs[*dst as usize] = V::O(v);
+        }
+        Instr::CallEx { dst, func, args, kwargs } => {
+            let a = obj!(regs, *args).cast::<PyTuple>().map_err(PyErr::from)?.clone();
+            let kw = match kwargs {
+                Some(k) => Some(obj!(regs, *k).cast::<PyDict>().map_err(PyErr::from)?.clone()),
+                None => None,
+            };
+            let v = obj!(regs, *func).call(a, kw.as_ref())?;
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::ListExtend { list, iter } => {
+            let l = obj!(regs, *list).cast::<PyList>().map_err(PyErr::from)?.clone();
+            for item in obj!(regs, *iter).try_iter()? {
+                l.append(item?)?;
+            }
+        }
+        Instr::ListToTuple { dst, src } => {
+            let t = obj!(regs, *src).cast::<PyList>().map_err(PyErr::from)?.to_tuple();
+            regs[*dst as usize] = V::O(t.into_any());
+        }
+        Instr::DictMerge { dict, src, func } => {
+            let d = obj!(regs, *dict).cast::<PyDict>().map_err(PyErr::from)?.clone();
+            let src = obj!(regs, *src);
+            let keys = src.call_method0("keys").map_err(|_| {
+                PyTypeError::new_err(format!("argument after ** must be a mapping, not {}", src.get_type().name().map(|n| n.to_string()).unwrap_or_default()))
+            })?;
+            for k in keys.try_iter()? {
+                let k = k?;
+                if d.contains(&k)? {
+                    let fname = obj!(regs, *func).getattr("__qualname__").and_then(|n| n.extract::<String>()).unwrap_or_else(|_| "function".into());
+                    return Err(PyTypeError::new_err(format!("{fname}() got multiple values for keyword argument '{}'", k.str()?)));
+                }
+                d.set_item(&k, src.get_item(&k)?)?;
+            }
         }
         Instr::BinOp { dst, op, a, b, inplace } => {
             let (x, y) = (obj!(regs, *a), obj!(regs, *b));

@@ -22,6 +22,7 @@ UNIONS = HERE / "programs" / "unions.py"
 GLOBALS = HERE / "programs" / "globals.py"
 EXCEPTIONS = HERE / "programs" / "exceptions.py"
 SETS = HERE / "programs" / "sets_and_ops.py"
+ARGUMENTS = HERE / "programs" / "arguments.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -161,7 +162,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -232,6 +233,27 @@ class Programs(unittest.TestCase):
             "ok: max says WOOF",
             "TypeError: self.sound(...) should be str, got int",
         ])
+
+
+class Arguments(unittest.TestCase):
+    def test_binding_errors_match_cpython(self):
+        probe = textwrap.dedent("""\
+            import arguments as a
+            for call in ["a.kw_only(1, 2, 3)", "a.kw_only(1)", "a.pos_only(1, a=2)", "a.describe()",
+                         "a.kw_only(1, offset=1, zz=2)", "a.pos_only(1, 2, 3)", "a.describe('a', sep='x', **{'sep': 'y'})",
+                         "a.Logger('x').log(1)"]:
+                try:
+                    print(eval(call))
+                except TypeError as e:
+                    print(e)
+            """)
+        lizzard = run("-c", "import lizzard\n" + probe, cwd=ARGUMENTS.parent)
+        plain = run("-c", probe, cwd=ARGUMENTS.parent)
+        self.assertEqual(lizzard[0], 0, lizzard[2])
+        lines, plain_lines = lizzard[1].splitlines(), plain[1].splitlines()
+        # The same errors, except that Lizzard checks the type of `*msgs`.
+        self.assertEqual(lines[:-1], plain_lines[:-1])
+        self.assertEqual(lines[-1], "Logger.log() argument 'msgs[0]': expected str, got int")
 
 
 class Checker(unittest.TestCase):
