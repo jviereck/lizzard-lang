@@ -88,8 +88,9 @@ def run_source(source, path, module):
         namespace.pop("__lizzard_functions__", None)
 
 
-def _is_setter(dec, name):
-    return isinstance(dec, ast.Attribute) and dec.attr == "setter" and isinstance(dec.value, ast.Name) and dec.value.id == name
+def _is_accessor(dec, name):
+    """``@name.getter``, ``@name.setter`` or ``@name.deleter``."""
+    return isinstance(dec, ast.Attribute) and dec.attr in ("getter", "setter", "deleter") and isinstance(dec.value, ast.Name) and dec.value.id == name
 
 
 def _replace_defs(body, functions, prefix):
@@ -97,8 +98,9 @@ def _replace_defs(body, functions, prefix):
     function, with the same decorators applied."""
     for i, node in enumerate(body):
         key = prefix + node.name if isinstance(node, ast.FunctionDef) else None
-        if key and any(_is_setter(d, node.name) for d in node.decorator_list):
-            key += ".setter"
+        accessor = key and next((d.attr for d in node.decorator_list if _is_accessor(d, node.name)), None)
+        if accessor:
+            key += "." + accessor
         if key in functions:
             value = ast.Subscript(ast.Name("__lizzard_functions__", ast.Load()), ast.Constant(key), ast.Load())
             for dec in reversed(node.decorator_list):

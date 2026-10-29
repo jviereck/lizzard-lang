@@ -566,6 +566,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
         }
         Instr::StoreAttr { obj, name, val } => obj!(regs, *obj).setattr(f.names[*name as usize].bind(py), obj!(regs, *val))?,
         Instr::DelItem { obj, key } => obj!(regs, *obj).del_item(obj!(regs, *key))?,
+        Instr::DelAttr { obj, name } => obj!(regs, *obj).delattr(f.names[*name as usize].bind(py))?,
         Instr::BuildList { dst, items } => {
             let mut v = Vec::with_capacity(items.len());
             for r in items {

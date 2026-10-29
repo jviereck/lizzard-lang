@@ -191,7 +191,7 @@ A first end-to-end slice runs the float32 NumPy example (`examples/numpy_add/add
   - direct float32 element access with a layout check (`array.rs`).
 - **The Python package** (`crates/lizzard-py/python/lizzard`): the import hook, `python -m lizzard`, and the NumPy overlay `stubs/numpy/__init__.pyi`.
 - **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `set`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and builtin functions (`isinstance`, `enumerate`, `zip`, `map`, `filter`, `sorted`, `min`/`max` with `key=`, `sum`, `any`, `all`, `iter`, `next`, `open`, ...). They stand in for typeshed until it is bundled. `typing`/`collections.abc` names such as `Iterable`, `Sequence`, `Callable` map to them.
-- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses, generators) must print exactly what plain CPython prints.
+- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses, generators, operator overloading, properties) must print exactly what plain CPython prints.
 
 **Supported language subset:**
 - imports;
@@ -213,10 +213,12 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 **Classes.** A class's methods are compiled to `LizzardFunction`s, which bind like Python functions (`__get__`), so the class itself is an ordinary CPython class:
 - Attributes are declared in the class body (`x: float`, optionally with a value) or annotated on their first assignment in `__init__` (`self.x: float = x`). Assigning an undeclared attribute is an error. Reads from the instance are checked at runtime, since Python code can set any attribute.
 - `__init__` may omit its return annotation. A call of the class is checked against `__init__` (inherited ones too); a class without `__init__` takes no arguments, unless it derives from an exception.
-- Single and multiple inheritance with CPython's MRO (C3), `super().name` in methods, `@staticmethod`, `@classmethod`, `@property` (getters), and dunders (`__add__`, `__eq__`, `__len__`, `__getitem__`, ...) used by operators.
-- `@property` with an optional `@x.setter`: assigning the property is checked against the setter.
+- Single and multiple inheritance with CPython's MRO (C3), `super().name` in methods, `@staticmethod` and `@classmethod`.
+- **Operator overloading** through dunders: arithmetic, bitwise and `@` operators with their reflected forms (`__radd__`, ...) and in-place forms (`a += b` uses `__iadd__` if defined), unary `-`/`+`/`~`, rich comparisons (a comparison uses the left operand's method, else the right one's reflected method, as Python does; ordering objects that define neither is an error, `==`/`!=` fall back to identity), chained comparisons, `__getitem__`/`__setitem__`/`__delitem__`, `__contains__`, `__iter__`, `__len__`, `__bool__`, `__call__`, and builtins that dispatch to dunders (`abs()`, `min`/`max`, `float()`, `hash()`, ...).
+- **Properties:** `@property` with `@x.getter`, `@x.setter` and `@x.deleter`, each compiled. Reads use the getter, assignments are checked against the setter, `del obj.x` needs a deleter; a property without a setter is read-only. `del obj.attr` also deletes plain attributes.
+- **`typing.Protocol`:** a class matches a protocol structurally, by the types of the members the protocol declares. Protocol-typed values are not `isinstance`-checked at runtime (Python allows that only for `@runtime_checkable` protocols), and a protocol's own methods stay Python functions.
 - Overrides must be compatible: the same arguments with parameter types at least as wide, and a return type at least as narrow. A redeclared attribute keeps its type.
-- `@dataclass` (from `dataclasses`): the checker builds `__init__` from the annotated fields (inherited dataclass fields first; defaults from values, `field(default=...)` and `field(default_factory=...)`; `kw_only=True`, `init=False`). Assigning a field of a frozen dataclass is an error. CPython generates the methods at runtime.
+- `@dataclass` (from `dataclasses`): the checker builds `__init__` from the annotated fields (inherited dataclass fields first; defaults from values, `field(default=...)` and `field(default_factory=...)`; `kw_only=True`, `init=False`, `order=True`). Assigning a field of a frozen dataclass is an error. CPython generates the methods at runtime.
 - PEP 695 generic classes (`class Stack[T]:`), with explicit arguments (`Stack[int]()`) or inferred from `__init__` (`Pair("a", 1)` is `Pair[str, int]`). Inside the class, `T` and `Self` are *rigid*: only values of that type itself are assignable to them, so `return 5` in a method returning `T` is an error.
 - Python code may subclass Lizzard classes. Compiled code calls the Python overrides and checks their results against the declared types.
 
@@ -259,8 +261,8 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
 **Deferred:**
 - checking that overlays only refine the base declarations;
-- bundled typeshed (stdlib modules are `Any`), `Protocol`s (structural typing) and `Literal` types;
-- generator expressions, `async` (coroutines, async generators), `match`, `except*`, the walrus operator, `del` of attributes and globals, chained comparisons;
+- bundled typeshed (stdlib modules are `Any`), `@runtime_checkable` protocols and `Literal` types;
+- generator expressions, `async` (coroutines, async generators), `match`, `except*`, the walrus operator, `del` of globals;
 - `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;
 - decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
 - `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);

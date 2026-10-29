@@ -305,8 +305,8 @@ pub struct Db {
     pub rigid: Vec<TvId>,
     /// The types of Lizzard modules' globals (from their top level).
     pub globals: HashMap<(ModId, String), Ty>,
-    /// Property getters' setters.
-    setters: HashMap<FuncId, FuncId>,
+    /// A property's accessors by its `@property` function and kind.
+    accessors: HashMap<(FuncId, &'static str), FuncId>,
     protocol_depth: u32,
 }
 
@@ -321,6 +321,9 @@ fn is_name(e: &Expr, s: &str) -> bool {
         _ => false,
     }
 }
+
+/// A property's accessor decorators (`@x.getter`, ...).
+pub const ACCESSORS: [&str; 3] = ["getter", "setter", "deleter"];
 
 /// Decorated `@name.which` (`@x.setter`).
 pub fn is_accessor(d: &ast::StmtFunctionDef, name: &str, which: &str) -> bool {
@@ -400,7 +403,7 @@ impl Db {
             warnings: Vec::new(),
             rigid: Vec::new(),
             globals: HashMap::new(),
-            setters: HashMap::new(),
+            accessors: HashMap::new(),
             protocol_depth: 0,
         }
     }
@@ -1232,9 +1235,20 @@ impl Db {
         None
     }
 
-    /// The setter of property getter `f`.
+    /// An accessor (`getter`, `setter`, `deleter`) of the property whose
+    /// `@property` function is `f`.
+    pub fn property_accessor(&self, f: FuncId, kind: &str) -> Option<FuncId> {
+        ACCESSORS.iter().find(|k| **k == kind).and_then(|k| self.accessors.get(&(f, *k)).copied())
+    }
+
+    /// The setter of property `f`.
     pub fn property_setter(&self, f: FuncId) -> Option<FuncId> {
-        self.setters.get(&f).copied()
+        self.property_accessor(f, "setter")
+    }
+
+    /// The function that reads property `f`: its `.getter` if it has one.
+    pub fn property_getter(&self, f: FuncId) -> FuncId {
+        self.property_accessor(f, "getter").unwrap_or(f)
     }
 
     /// The options of `@dataclass` (from `dataclasses`) on class `c`, if
@@ -1370,13 +1384,22 @@ impl Db {
                 .collect();
             if !defs.is_empty() {
                 let prop = defs.iter().any(|(d, _)| decorated(d, "property"));
-                // `@name.setter` defs are the property's setter.
-                let (setters, defs): (Vec<_>, Vec<_>) = defs.into_iter().partition(|(d, _)| is_accessor(d, name, "setter"));
-                let f = self.func_for(m, Some(c), name, defs);
-                if prop && !setters.is_empty() {
-                    let sf = self.func_for(m, Some(c), &format!("{name}.setter"), setters);
-                    self.funcs[sf].name = name.to_string();
-                    self.setters.insert(f, sf);
+                // `@name.getter`, `@name.setter` and `@name.deleter` defs are
+                // the property's accessors, each its own function.
+                let mut rest = defs;
+                let mut accessors = Vec::new();
+                for kind in ACCESSORS {
+                    let (these, others): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(d, _)| is_accessor(d, name, kind));
+                    rest = others;
+                    accessors.push((kind, these));
+                }
+                let f = self.func_for(m, Some(c), name, rest);
+                for (kind, these) in accessors {
+                    if prop && !these.is_empty() {
+                        let af = self.func_for(m, Some(c), &format!("{name}.{kind}"), these);
+                        self.funcs[af].name = name.to_string();
+                        self.accessors.insert((f, kind), af);
+                    }
                 }
                 found = Some(if prop { Member::Property(f) } else { Member::Method(f) });
                 break;

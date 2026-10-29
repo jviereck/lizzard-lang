@@ -416,3 +416,19 @@ fn protocols_match_structurally() {
         ]
     );
 }
+
+#[test]
+fn property_getters_and_deleters() {
+    let d = check(
+        "class P:\n    def __init__(self) -> None:\n        self._x: int = 0\n        self.tag: str = \"\"\n\n    @property\n    def x(self) -> int:\n        return self._x\n\n    @x.getter\n    def x(self) -> str:\n        return \"x\"\n\n    @property\n    def y(self) -> int:\n        return 1\n\n    @y.deleter\n    def y(self) -> None:\n        pass\n\n    def m(self) -> None:\n        pass\n\ndef f(p: P) -> None:\n    n: int = p.x\n    del p.x\n    del p.y\n    del p.tag\n    del p.m\n    del p.nope\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "cannot assign str to `n` of type int",
+            "property `x` has no deleter",
+            "cannot delete method `m`",
+            "P has no attribute `nope`",
+        ]
+    );
+}

@@ -676,10 +676,10 @@ impl<'a> Lower<'a> {
             self.err(off, "async functions are not supported by Lizzard yet");
             return None;
         }
-        let is_setter = is_accessor(d, name, "setter");
+        let accessor = ACCESSORS.into_iter().find(|k| is_accessor(d, name, k));
         for dec in &d.decorator_list {
             let ok = owner.is_some()
-                && (matches!(&dec.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod" | "property")) || is_setter);
+                && (matches!(&dec.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod" | "property")) || accessor.is_some());
             if !ok {
                 let what = if owner.is_some() { "decorators other than @staticmethod, @classmethod and @property" } else { "decorated functions" };
                 self.err(dec.range().start().into(), format!("{what} are not supported by Lizzard yet"));
@@ -692,8 +692,8 @@ impl<'a> Lower<'a> {
                 _ => return None,
             },
             Some(c) => match self.db.class_member(c, name) {
-                Some(Member::Property(f)) if is_setter => match self.db.property_setter(f) {
-                    Some(sf) => sf,
+                Some(Member::Property(f)) if accessor.is_some() => match self.db.property_accessor(f, accessor.unwrap()) {
+                    Some(af) => af,
                     None => return None,
                 },
                 Some(Member::Method(f) | Member::Property(f)) => f,
@@ -727,7 +727,10 @@ impl<'a> Lower<'a> {
         collect_vars(&sig.ret, &mut rigid);
         let has_receiver = owner.is_some() && kind != MethodKind::Static;
         let method = owner.map(|c| MethodCtx { class: c, receiver: if has_receiver { sig.params.first().map(|p| p.name.clone()) } else { None }, is_init: name == "__init__" });
-        let key = if is_setter { format!("{qual}.setter") } else { qual.clone() };
+        let key = match accessor {
+            Some(kind) => format!("{qual}.{kind}"),
+            None => qual.clone(),
+        };
         let spec = FnSpec {
             qual,
             key,
@@ -1290,7 +1293,11 @@ impl<'a> Lower<'a> {
                             self.emit(Instr::Unbind { reg: check });
                             self.invalidate(n.id.as_str());
                         }
-                        _ => self.err(off, "only `del x[key]` and `del local` are supported by Lizzard yet"),
+                        Expr::Attribute(at) => {
+                            let obj = self.expr(&at.value);
+                            self.del_attr(&obj, at);
+                        }
+                        _ => self.err(off, "only `del x[key]`, `del x.attr` and `del local` are supported by Lizzard yet"),
                     }
                 }
             }
@@ -2588,7 +2595,7 @@ impl<'a> Lower<'a> {
     fn member_value_ty(&mut self, obj_ty: &Ty, owner: ClassId, m: Member, on_class: bool, origin: &mut Option<String>) -> Ty {
         match m {
             Member::Property(_) if on_class => Ty::Any,
-            Member::Property(f) => match self.resolve(f, Some(obj_ty.clone()), &[], &[], None) {
+            Member::Property(f) => match self.resolve(self.db.property_getter(f), Some(obj_ty.clone()), &[], &[], None) {
                 Ok((t, file, doff)) => {
                     *origin = self.origin(file, doff);
                     t
@@ -2725,6 +2732,33 @@ impl<'a> Lower<'a> {
             self.check(&v, what, origin);
         }
         self.unbox_f32(v)
+    }
+
+    /// `del obj.name`: a property needs a deleter.
+    fn del_attr(&mut self, obj: &Val, a: &ast::ExprAttribute) {
+        let off: u32 = a.attr.range().start().into();
+        let name = a.attr.as_str();
+        if let Ty::Inst(c, _) = self.lookup_ty(&obj.ty) {
+            let cn = self.db.classes[c].name.clone();
+            match self.db.find_member(c, name) {
+                _ if self.db.is_frozen(c) => self.err(off, format!("cannot delete field `{name}` of frozen dataclass `{cn}`")),
+                Some((_, Member::Property(f))) if self.db.property_accessor(f, "deleter").is_none() => {
+                    self.err(off, format!("property `{name}` has no deleter"));
+                }
+                Some((_, Member::Method(_))) => self.err(off, format!("cannot delete method `{name}`")),
+                None if !self.db.has_any_base(c) => self.err(off, format!("{cn} has no attribute `{name}`")),
+                _ => {}
+            }
+        } else if !matches!(obj.ty, Ty::Any) {
+            let t = self.show(&obj.ty);
+            self.err(off, format!("cannot delete attribute `{name}` of {t}"));
+        }
+        let o = self.obj(obj);
+        let n = self.name(name);
+        self.emit(Instr::DelAttr { obj: o, name: n });
+        if let Some(p) = attr_path(a) {
+            self.invalidate(&p);
+        }
     }
 
     fn store_attr(&mut self, obj: &Val, a: &ast::ExprAttribute, val: Val) {

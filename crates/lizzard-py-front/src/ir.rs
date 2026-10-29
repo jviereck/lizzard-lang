@@ -111,6 +111,7 @@ pub enum Instr {
     Move { dst: Reg, src: Reg },
     LoadAttr { dst: Reg, obj: Reg, name: u32 },
     StoreAttr { obj: Reg, name: u32, val: Reg },
+    DelAttr { obj: Reg, name: u32 },
     /// `func(*args[..n - kwnames.len()], **{kwnames: args[rest]})`
     Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32> },
     /// `func(*args, **kwargs)` with a tuple and a dict (calls with `*`/`**`).

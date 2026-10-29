@@ -28,6 +28,7 @@ CLOSURES = HERE / "programs" / "closures.py"
 DATACLASSES = HERE / "programs" / "dataclasses_demo.py"
 GENERATORS = HERE / "programs" / "generators.py"
 OPERATORS = HERE / "programs" / "operators.py"
+PROPERTIES = HERE / "programs" / "properties.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -167,7 +168,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -361,6 +362,27 @@ class Generators(unittest.TestCase):
             "LizzardGenerator count False [0, 1, 2]",
             "LizzardFunction",
             "count() argument 'n': expected int, got str",
+        ])
+
+
+class Properties(unittest.TestCase):
+    def test_accessors_are_compiled_and_checked(self):
+        code, out, err = run("-c", textwrap.dedent("""\
+            import lizzard, properties
+            a = properties.Account("x", 1)
+            for attr in ("balance", "label"):
+                p = getattr(type(a), attr)
+                print(attr, type(p.fget).__name__, type(p.fset).__name__, type(p.fdel).__name__)
+            try:
+                a.balance = "lots"
+            except TypeError as e:
+                print(e)
+            """), cwd=PROPERTIES.parent)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            "balance LizzardFunction LizzardFunction LizzardFunction",
+            "label LizzardFunction NoneType NoneType",
+            "Account.balance() argument 'value': expected float, got str",
         ])
 
 
