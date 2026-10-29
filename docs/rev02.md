@@ -190,30 +190,40 @@ A first end-to-end slice runs the float32 NumPy example (`examples/numpy_add/add
   - runtime checks and qualified-name resolution (`rt.rs`);
   - direct float32 element access with a layout check (`array.rs`).
 - **The Python package** (`crates/lizzard-py/python/lizzard`): the import hook, `python -m lizzard`, and the NumPy overlay `stubs/numpy/__init__.pyi`.
-- **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and `isinstance`, `enumerate`, `zip`, `sorted`, `reversed`, `sum`, `abs`, `min`, `max`, `repr`. They stand in for typeshed until it is bundled.
-- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. `tests/programs/classes.py` and `containers.py` must print exactly what plain CPython prints.
+- **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `set`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and builtin functions (`isinstance`, `enumerate`, `zip`, `map`, `filter`, `sorted`, `min`/`max` with `key=`, `sum`, `any`, `all`, `iter`, `next`, `open`, ...). They stand in for typeshed until it is bundled. `typing`/`collections.abc` names such as `Iterable`, `Sequence`, `Callable` map to them.
+- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses) must print exactly what plain CPython prints.
 
 **Supported language subset:**
 - imports;
-- annotated functions with positional parameters and literal defaults;
+- **functions:** annotated parameters of every kind (`/`, `*args: T`, keyword-only, `**kwargs: T`), literal defaults, generic functions (`def f[T: Bound](...)` and `TypeVar`s); calls with keywords, `*iterable` and `**mapping`;
+- **inner functions, closures and lambdas** (see below);
+- **module globals** read by functions, and assigned after `global x`;
 - `type X = ...` aliases;
-- **classes** (see below);
-- **lists, dicts and tuples:** displays, comprehensions (`[...]`, `{k: v ...}`), indexing and slicing, `del x[k]`, methods from the bundled definitions, `in` / `not in`, iteration and unpacking (`a, b = t`, `for k, v in d.items()`);
-- assignments (including annotated, attribute, subscript, tuple and augmented assignments; `+=` is in place, as in Python);
-- `if`/`elif`/`else`, `for` over `range(...)` (unboxed) or any iterable, `while`, `break`, `continue`, `raise`, `assert`, `return`;
-- calls with keyword arguments, attributes, subscripts, conditional expressions, f-strings;
-- `+ - * / // %`, unary `-`, single comparisons, `and`/`or`/`not`.
+- **classes and dataclasses** (see below);
+- **lists, dicts, sets and tuples:** displays, comprehensions, indexing and slicing, `del x[k]`, methods from the bundled definitions, `in` / `not in`, iteration and unpacking (`a, b = t`, `for k, v in d.items()`);
+- **unions** (`T | None`, `Optional[T]`, `Union[...]`) with narrowing (see below);
+- assignments (including annotated, attribute, subscript, tuple and augmented assignments; `+=` is in place, as in Python) and `x: T` declarations;
+- `if`/`elif`/`else`, `for` over `range(...)` (unboxed) or any iterable, `while`, `break`, `continue`, `return`, `assert`;
+- **exceptions:** `try`/`except`/`else`/`finally`, `raise`, `raise X from Y`, bare `raise`, `with` (see below);
+- conditional expressions, f-strings, `+ - * / // % ** | & ^ << >>`, unary `- + ~`, single comparisons, `and`/`or`/`not`.
 
-Top-level code is checked and then run by CPython.
+Top-level code is checked and then run by CPython. It is checked first, so that functions know the types of the globals it assigns.
 
 **Classes.** A class's methods are compiled to `LizzardFunction`s, which bind like Python functions (`__get__`), so the class itself is an ordinary CPython class:
 - Attributes are declared in the class body (`x: float`, optionally with a value) or annotated on their first assignment in `__init__` (`self.x: float = x`). Assigning an undeclared attribute is an error. Reads from the instance are checked at runtime, since Python code can set any attribute.
 - `__init__` may omit its return annotation. A call of the class is checked against `__init__` (inherited ones too); a class without `__init__` takes no arguments, unless it derives from an exception.
 - Single and multiple inheritance with CPython's MRO (C3), `super().name` in methods, `@staticmethod`, `@classmethod`, `@property` (getters), and dunders (`__add__`, `__eq__`, `__len__`, `__getitem__`, ...) used by operators.
+- `@property` with an optional `@x.setter`: assigning the property is checked against the setter.
 - Overrides must be compatible: the same arguments with parameter types at least as wide, and a return type at least as narrow. A redeclared attribute keeps its type.
+- `@dataclass` (from `dataclasses`): the checker builds `__init__` from the annotated fields (inherited dataclass fields first; defaults from values, `field(default=...)` and `field(default_factory=...)`; `kw_only=True`, `init=False`). Assigning a field of a frozen dataclass is an error. CPython generates the methods at runtime.
 - PEP 695 generic classes (`class Stack[T]:`), with explicit arguments (`Stack[int]()`) or inferred from `__init__` (`Pair("a", 1)` is `Pair[str, int]`). Inside the class, `T` and `Self` are *rigid*: only values of that type itself are assignable to them, so `return 5` in a method returning `T` is an error.
-- `isinstance(x, C)` narrows a local to a subclass in the `if` body.
 - Python code may subclass Lizzard classes. Compiled code calls the Python overrides and checks their results against the declared types.
+
+**Unions and narrowing.** Attribute access, calls, operators and iteration on a union apply to every member; reading an attribute of `X | None` is an error until `None` is ruled out. Narrowing applies to locals and to `x.attr` (for a local `x`) and comes from `is None` / `is not None`, `isinstance` (also with a tuple of classes), truthiness, `not`, `and`/`or` (also between the operands of one condition), conditional expressions, comprehension conditions, `assert`, `while` conditions, early exits (`if x is None: return`) and assignments. Branches merge at joins; a loop forgets what its body assigns. Narrowed attributes are still checked when read, so a call that changes them in between raises a TypeError, never a crash.
+
+**Exceptions.** A function has a handler table: instruction ranges, the register that receives the exception and where handling continues; the innermost handler wins. The exception being handled is CPython's own (`PyErr_SetHandledException`), so `__context__` chaining and `sys.exc_info()` behave as in Python and are restored when a handler ends, whichever way. `return`, `break` and `continue` run the enclosing `finally` bodies, handler restores and `__exit__(None, None, None)` calls first, outside the ranges their own statement protects. `except E as e` binds `e` for that clause only, typed by the caught classes; the builtin exception hierarchy is known. `with` looks `__enter__`/`__exit__` up on the type, and `__exit__` may suppress the exception.
+
+**Inner functions, closures and lambdas.** A syntactic scope analysis finds the variables that inner functions capture. Those live in real CPython cells, passed to the inner function as its closure, so late binding and `nonlocal` work as in Python, across several levels and for recursive inner functions. Inner functions and lambdas compile to their own functions (qualified names like `f.<locals>.g`) and are created at runtime with their closure and their defaults, which are evaluated where they are defined (`lambda x, n=n: ...`). `Callable[[A, B], R]` types functions, bound methods, classes and lambdas (parameters contravariant, result covariant). A lambda's parameter types come from the expected `Callable`; in a call, the other arguments are checked first so the callee's type variables are known (`sorted(people, key=lambda p: p.age)`).
 
 **Behaviour decisions:**
 - **A type error in top-level code is a static error.** The example's last line therefore stops the import with a diagnostic. The runtime check is what Python callers see.
@@ -221,8 +231,13 @@ Top-level code is checked and then run by CPython.
 - **Container items are checked when read**, as planned: a `list[float]` from Python is only checked to be a `list` at the boundary, and `xs[i]` or a `for` loop item is checked against `float`.
 - **Literals take the expected type.** `[1, 2]` is `list[int]`, but where a `list[float]` is expected (an annotation, a parameter, an attribute) it is a `list[float]`. Empty `[]` and `{}` need an expected type. Without one, mixed items join to their common base class, or `object`.
 - **A local keeps the type of its first assignment.** Reusing a name for a value of another type is an error, as in mypy.
-- **`dict.get(key)` is `Any`** until unions exist (typeshed has `V | None`); `get(key, default)` is `V`.
+- **`dict.get(key)` is `Any`**; `get(key, default)` is `V`. (Typeshed has `V | None`; that would make every `get` need a check.)
 - **Generator expressions are rejected** rather than compiled eagerly as lists, which would change when their items are computed. List comprehensions work.
+- **Unions in third-party definition files are `Any`.** NumPy's stubs use them mostly for parameters built from protocols, which the checker does not model yet; real unions there would reject valid calls. Lizzard modules and the bundled builtins have real unions.
+- **A type variable is fixed by its first argument.** `same(1, "a")` for `def same[T](a: T, b: T)` is an error rather than `T = int | str` (widening could be unsound with invariant containers).
+- **A lambda needs an expected `Callable` type** for its parameters (an annotation, a parameter, `key=`); `f = lambda x: ...` alone is an error, like an unannotated `def`.
+- **A name is local to a function if it is assigned anywhere in it**, as in Python: reading it before the assignment is an error rather than a read of the global.
+- **Builtin exceptions' attributes other than `args` are `Any`** (`errno`, `filename`, ...).
 
 **Findings:**
 - **Overlays must use only public names.** NumPy 2.5 renamed the private TypeVar `_NBit1` to `_NBitT`, which silently degraded an overlay that used it. The overlay now uses `Self` and method-level type parameters. `Self` is a TypeVar bounded by its class, solved to the receiver's own type.
@@ -231,8 +246,9 @@ Top-level code is checked and then run by CPython.
 
 **Deferred:**
 - checking that overlays only refine the base declarations;
-- bundled typeshed (stdlib modules are `Any`), unions (`T | None`) and narrowing beyond `isinstance` on a local;
-- `try`/`except`/`with`, lambdas and nested functions, generator expressions, sets, `*args`/`**kwargs`, keyword-only parameters, property setters, class decorators (`@dataclass`), nested classes, generic functions, and module globals read by functions;
+- bundled typeshed (stdlib modules are `Any`), `Protocol`s (structural typing) and `Literal` types;
+- generators (`yield`) and generator expressions, `async`, `match`, `except*`, the walrus operator, `del` of names and attributes, chained comparisons;
+- decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
 - `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);
 - vectorcall entry points, the JIT, and safepoints;
 - direct access for other dtypes and dimensions.
