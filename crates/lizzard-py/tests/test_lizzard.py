@@ -24,6 +24,7 @@ EXCEPTIONS = HERE / "programs" / "exceptions.py"
 SETS = HERE / "programs" / "sets_and_ops.py"
 ARGUMENTS = HERE / "programs" / "arguments.py"
 GENERICS = HERE / "programs" / "generics.py"
+CLOSURES = HERE / "programs" / "closures.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -163,7 +164,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -255,6 +256,27 @@ class Arguments(unittest.TestCase):
         # The same errors, except that Lizzard checks the type of `*msgs`.
         self.assertEqual(lines[:-1], plain_lines[:-1])
         self.assertEqual(lines[-1], "Logger.log() argument 'msgs[0]': expected str, got int")
+
+
+class Closures(unittest.TestCase):
+    def test_inner_functions_and_lambdas_are_compiled(self):
+        code, out, err = run("-c", textwrap.dedent("""\
+            import lizzard
+            import closures as c
+
+            inc = c.make_counter(0)
+            add = c.compose(c.double, c.double)
+            print(type(inc).__name__, inc.__qualname__, type(add).__name__, add.__qualname__)
+            try:
+                add("x")
+            except TypeError as e:
+                print(e)
+            """), cwd=CLOSURES.parent)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            "LizzardFunction make_counter.<locals>.inc LizzardFunction compose.<locals>.<lambda>",
+            "compose.<locals>.<lambda>() argument 'x': expected int, got str",
+        ])
 
 
 class Checker(unittest.TestCase):

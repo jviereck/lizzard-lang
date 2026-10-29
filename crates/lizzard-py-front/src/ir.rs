@@ -72,6 +72,8 @@ pub enum RtCheck {
     NdArray { scalar: Option<String>, ndim: Option<u32> },
     /// Any of the checks.
     Union(Vec<RtCheck>),
+    /// `callable(obj)`
+    Callable,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,19 @@ pub enum Instr {
     /// Module globals, then builtins.
     LoadGlobal { dst: Reg, name: u32 },
     StoreGlobal { name: u32, val: Reg },
+    /// A new empty cell, for a variable an inner function captures.
+    MakeCell { dst: Reg },
+    /// The contents of a cell (UnboundLocalError if empty).
+    LoadCell { dst: Reg, cell: Reg },
+    StoreCell { cell: Reg, val: Reg },
+    /// The contents of closure cell `idx` (NameError if empty).
+    LoadFree { dst: Reg, idx: u32 },
+    StoreFree { idx: u32, val: Reg },
+    /// Closure cell `idx` itself, to pass on to an inner function.
+    LoadFreeCell { dst: Reg, idx: u32 },
+    /// A new function object for the module function with key `names[key]`,
+    /// closing over the cells in `closure`.
+    MakeFunction { dst: Reg, key: u32, closure: Vec<Reg>, defaults: Vec<Reg> },
     Move { dst: Reg, src: Reg },
     LoadAttr { dst: Reg, obj: Reg, name: u32 },
     StoreAttr { obj: Reg, name: u32, val: Reg },
@@ -210,6 +225,9 @@ pub struct ParamIr {
     pub check: u32,
     /// The default value, an index into `consts`.
     pub default: Option<u32>,
+    /// The default is a value the function object holds (evaluated where an
+    /// inner function or lambda is created), in parameter order.
+    pub dynamic_default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +249,8 @@ pub struct FuncIr {
     pub names: Vec<String>,
     pub checks: Vec<CheckIr>,
     pub handlers: Vec<HandlerIr>,
+    /// The variables its closure provides, in cell order.
+    pub free: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]

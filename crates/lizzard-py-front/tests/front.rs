@@ -325,3 +325,21 @@ fn generic_functions_are_checked_in_their_body_and_at_calls() {
         ]
     );
 }
+
+#[test]
+fn closures_and_lambdas_are_typed() {
+    let d = check(
+        "from typing import Callable\n\ndef f(xs: list[str]) -> None:\n    count = 0\n\n    def g() -> None:\n        nonlocal missing\n\n    def bump(n: int) -> str:\n        nonlocal count\n        count += n\n        return count\n\n    k: Callable[[int], str] = lambda x: x + 1\n    h = lambda a: a\n    ok: Callable[[int], int] = lambda x, n=2: x * n\n    by_len = sorted(xs, key=lambda s: len(s))\n    m = max(xs, key=lambda s: s.upper())\n    wrong = sorted(xs, key=lambda s: s.nope)\n    run: Callable[[str], int] = len\n    run(5)\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "no binding for nonlocal `missing` found",
+            "`f.<locals>.bump` returns str, but this returns int",
+            "cannot assign Callable[[int], int] to `k` of type Callable[[int], str]",
+            "cannot infer the parameter types of this lambda: use it where a `Callable[[...], ...]` is expected, or use a `def`",
+            "str has no attribute `nope`",
+            "argument 1: expected str, got int",
+        ]
+    );
+}

@@ -5,8 +5,10 @@
 //! throwaway function. Methods are lowered like functions, under their
 //! qualified names (`C.m`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
+use ruff_python_ast::visitor::{walk_except_handler, walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::Ranged;
 
@@ -25,6 +27,8 @@ struct Local {
     reg: Reg,
     ty: Ty,
     repr: Repr,
+    /// `reg` holds a cell (the variable is captured by an inner function).
+    cell: bool,
 }
 
 /// A failed call match: a message, or a mismatching argument.
@@ -107,6 +111,42 @@ struct Lower<'a> {
     cleanups: Vec<Cleanup>,
     /// The exceptions being handled, innermost last (for a bare `raise`).
     handled: Vec<Reg>,
+    /// Cells of the variables inner functions capture.
+    cell_regs: HashMap<String, Reg>,
+    /// The variables this function's closure provides, in cell order.
+    free: Vec<(String, Ty)>,
+    nonlocal_names: Vec<String>,
+    /// Inner functions and lambdas lowered inside this function.
+    nested: Vec<FuncIr>,
+}
+
+/// What a function's body is: statements, or a lambda's expression.
+#[derive(Clone, Copy)]
+enum FnBody<'b> {
+    Stmts(&'b [Stmt]),
+    Lambda(&'b Expr),
+}
+
+/// Everything `build_function` needs to lower one function.
+struct FnSpec<'b> {
+    qual: String,
+    key: String,
+    /// The name in messages (`f`, `<lambda>`).
+    name: String,
+    name_off: u32,
+    line: u32,
+    sig: Sig,
+    params: Option<&'b ast::Parameters>,
+    body: FnBody<'b>,
+    method: Option<MethodCtx>,
+    has_receiver: bool,
+    free: Vec<(String, Ty)>,
+    rigid: Vec<TvId>,
+    /// The expected result of a lambda.
+    ret_hint: Option<Ty>,
+    /// Defaults are evaluated where the function is created (inner
+    /// functions and lambdas), not literals in the IR.
+    dynamic_defaults: bool,
 }
 
 const BUILTIN_FNS: &[&str] = &["print", "len", "type"];
@@ -136,6 +176,7 @@ pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
             _ => {}
         }
     }
+    funcs.append(&mut top.nested);
     funcs
 }
 
@@ -169,6 +210,10 @@ impl<'a> Lower<'a> {
             regions: Vec::new(),
             cleanups: Vec::new(),
             handled: Vec::new(),
+            cell_regs: HashMap::new(),
+            free: Vec::new(),
+            nonlocal_names: Vec::new(),
+            nested: Vec::new(),
         }
     }
 
@@ -375,6 +420,7 @@ impl<'a> Lower<'a> {
             Ty::Inst(c, _) => RtCheck::Instance(self.db.runtime_class(t).unwrap_or_else(|| self.db.qualname(*c).to_string())),
             // A rigid variable (`Self`, a class's type parameter) is checked
             // against its bound.
+            Ty::Callable(..) => RtCheck::Callable,
             Ty::Union(v) => {
                 let cs: Vec<RtCheck> = v.iter().map(|m| self.rtcheck(m)).collect();
                 if cs.contains(&RtCheck::Any) { RtCheck::Any } else { RtCheck::Union(cs) }
@@ -646,12 +692,8 @@ impl<'a> Lower<'a> {
         if owner.is_some() && name == "__init__" && sig.ret != Ty::None {
             self.err(d.name.range().start().into(), "`__init__` must return None");
         }
-        let qual_key = qual.clone();
-        let line = self.db.files[self.file].line_col(off).0;
-        let path = self.db.files[self.file].path.clone();
         // Its type variables (its own, its class's, `Self`) are rigid in
         // the body.
-        let saved_rigid = self.db.rigid.clone();
         let mut rigid = Vec::new();
         if let Some(c) = owner {
             rigid = self.db.class_params(c);
@@ -661,36 +703,88 @@ impl<'a> Lower<'a> {
             collect_vars(&p.ty, &mut rigid);
         }
         collect_vars(&sig.ret, &mut rigid);
-        self.db.rigid = rigid;
-        let mut l = Lower::new(self.db, self.m, self.file, false, qual, sig.ret.clone());
-        l.at(d);
-        let mut keys = Vec::new();
-        assigned_keys(&d.body, &mut keys);
-        l.bound = keys.into_iter().filter(|k| !k.contains('.')).collect();
         let has_receiver = owner.is_some() && kind != MethodKind::Static;
-        l.method = owner.map(|c| MethodCtx { class: c, receiver: if has_receiver { sig.params.first().map(|p| p.name.clone()) } else { None }, is_init: name == "__init__" });
-        let params = l.params(&sig, &d.parameters, has_receiver);
-        for s in &d.body {
-            l.stmt(s);
-        }
-        if !always_exits(&d.body) {
-            if matches!(l.ret, Ty::None | Ty::Any) {
-                let none = l.konst(Const::None, Ty::None);
-                l.emit(Instr::Return { src: none.reg });
-            } else {
-                let off = d.name.range().start().into();
-                let want = l.show(&l.ret);
-                l.err(off, format!("`{name}` may end without returning a value (declared to return {want})"));
+        let method = owner.map(|c| MethodCtx { class: c, receiver: if has_receiver { sig.params.first().map(|p| p.name.clone()) } else { None }, is_init: name == "__init__" });
+        let key = if is_setter { format!("{qual}.setter") } else { qual.clone() };
+        let spec = FnSpec {
+            qual,
+            key,
+            name: name.to_string(),
+            name_off: d.name.range().start().into(),
+            line: self.db.files[self.file].line_col(off).0,
+            sig,
+            params: Some(&d.parameters),
+            body: FnBody::Stmts(&d.body),
+            method,
+            has_receiver,
+            free: Vec::new(),
+            rigid,
+            ret_hint: None,
+            dynamic_defaults: false,
+        };
+        Some(self.build_function(spec).0)
+    }
+
+    /// Lower one function (module-level, method, inner `def` or lambda).
+    /// Returns its IR and, for a lambda, its body's type. Functions nested
+    /// in it are added to `self.nested`.
+    fn build_function(&mut self, spec: FnSpec) -> (FuncIr, Ty) {
+        let path = self.db.files[self.file].path.clone();
+        let saved_rigid = std::mem::replace(&mut self.db.rigid, spec.rigid);
+        let scope = NameScope::of(spec.params, spec.body);
+        let mut l = Lower::new(self.db, self.m, self.file, false, spec.qual, spec.sig.ret.clone());
+        l.line = spec.line;
+        l.bound = scope.local_names().into_iter().collect();
+        l.method = spec.method;
+        l.free = spec.free.clone();
+        let params = match spec.params {
+            Some(ps) => l.params(&spec.sig, ps, spec.has_receiver, spec.dynamic_defaults),
+            None => l.params(&spec.sig, &ast::Parameters::default(), spec.has_receiver, spec.dynamic_defaults),
+        };
+        // Variables inner functions capture live in cells.
+        let mut cells: Vec<String> = scope.cells().into_iter().collect();
+        cells.sort();
+        for c in cells {
+            let cell = l.reg(Repr::Obj);
+            l.emit(Instr::MakeCell { dst: cell });
+            if let Some(p) = l.locals.get(&c).cloned() {
+                l.emit(Instr::StoreCell { cell, val: p.reg });
+                l.locals.insert(c.clone(), Local { reg: cell, ty: p.ty, repr: Repr::Obj, cell: true });
             }
-        } else {
-            // Unreachable when the analysis is right; never run off the end.
-            let none = l.konst(Const::None, Ty::None);
-            l.emit(Instr::Return { src: none.reg });
+            l.cell_regs.insert(c, cell);
+        }
+        let mut body_ty = Ty::None;
+        match spec.body {
+            FnBody::Stmts(body) => {
+                for s in body {
+                    l.stmt(s);
+                }
+                if !always_exits(body) {
+                    if matches!(l.ret, Ty::None | Ty::Any) {
+                        let none = l.konst(Const::None, Ty::None);
+                        l.emit(Instr::Return { src: none.reg });
+                    } else {
+                        let want = l.show(&l.ret);
+                        let n = spec.name.clone();
+                        l.err(spec.name_off, format!("`{n}` may end without returning a value (declared to return {want})"));
+                    }
+                } else {
+                    // Unreachable when the analysis is right; never run off the end.
+                    let none = l.konst(Const::None, Ty::None);
+                    l.emit(Instr::Return { src: none.reg });
+                }
+            }
+            FnBody::Lambda(e) => {
+                let v = l.expr_hint(e, spec.ret_hint.as_ref());
+                body_ty = v.ty.clone();
+                let r = l.obj(&v);
+                l.emit(Instr::Return { src: r });
+            }
         }
         let ir = FuncIr {
             name: l.fname,
             file: path,
-            line,
+            line: spec.line,
             params,
             reprs: l.reprs,
             code: l.code,
@@ -699,14 +793,211 @@ impl<'a> Lower<'a> {
             names: l.names,
             checks: l.checks,
             handlers: l.handlers,
-            key: if is_setter { format!("{qual_key}.setter") } else { qual_key },
+            key: spec.key,
+            free: spec.free.into_iter().map(|(n, _)| n).collect(),
         };
+        let nested = l.nested;
+        self.nested.extend(nested);
         self.db.rigid = saved_rigid;
-        Some(ir)
+        (ir, body_ty)
+    }
+
+    /// The cells to pass to an inner function whose closure needs `names`
+    /// (some of which may be globals), with their types.
+    fn closure_for(&mut self, names: &[String]) -> (Vec<(String, Ty)>, Vec<Reg>) {
+        let mut free = Vec::new();
+        let mut regs = Vec::new();
+        for n in names {
+            if let Some(&cell) = self.cell_regs.get(n) {
+                // Not assigned yet where the inner function is created: Any.
+                let ty = self.locals.get(n).map_or(Ty::Any, |l| l.ty.clone());
+                free.push((n.clone(), ty));
+                regs.push(cell);
+            } else if let Some(i) = self.free.iter().position(|(f, _)| f == n) {
+                let ty = self.free[i].1.clone();
+                let dst = self.reg(Repr::Obj);
+                self.emit(Instr::LoadFreeCell { dst, idx: i as u32 });
+                free.push((n.clone(), ty));
+                regs.push(dst);
+            }
+        }
+        (free, regs)
+    }
+
+    /// Evaluate an inner function's defaults where it is defined, in
+    /// parameter order, checked against the parameters' types.
+    fn eval_defaults(&mut self, sig: &Sig, ps: &ast::Parameters) -> Vec<Reg> {
+        let defaults: HashMap<&str, &Expr> = ps
+            .posonlyargs
+            .iter()
+            .chain(ps.args.iter())
+            .chain(ps.kwonlyargs.iter())
+            .filter_map(|p| p.default.as_deref().map(|d| (p.parameter.name.as_str(), d)))
+            .collect();
+        let mut regs = Vec::new();
+        for p in &sig.params {
+            if let Some(e) = defaults.get(p.name.as_str()) {
+                let v = self.expr_hint(e, Some(&p.ty));
+                let pn = p.name.clone();
+                let v = self.coerce(v, &p.ty, e.range().start().into(), |_, got, want| format!("the default of `{pn}` is {got}, but the parameter is {want}"));
+                regs.push(self.obj(&v));
+            }
+        }
+        regs
+    }
+
+    /// The qualified name of a function defined in this one.
+    fn inner_qual(&self, name: &str) -> String {
+        if self.toplevel { name.to_string() } else { format!("{}.<locals>.{name}", self.fname) }
+    }
+
+    /// `def` inside a function (or in a block at the top level, where it is
+    /// only checked: CPython runs it).
+    fn nested_def(&mut self, d: &ast::StmtFunctionDef, off: u32) {
+        let name = d.name.as_str();
+        if d.is_async {
+            return self.err(off, "async functions are not supported by Lizzard yet");
+        }
+        if let Some(dec) = d.decorator_list.first() {
+            return self.err(dec.range().start().into(), "decorated inner functions are not supported by Lizzard yet");
+        }
+        let qual = self.inner_qual(name);
+        let key = format!("{qual}@{off}");
+        let f = self.db.local_func(self.m, &key, name, Rc::new(d.clone()), self.file);
+        let sig = self.db.sigs(f)[0].clone();
+        let mut rigid = self.db.rigid.clone();
+        for p in &sig.params {
+            collect_vars(&p.ty, &mut rigid);
+        }
+        collect_vars(&sig.ret, &mut rigid);
+        let fty = Ty::Func(FuncRef::Def(f));
+        // A recursive inner function captures its own name: its cell has
+        // its type from the start.
+        if let Some(&cell) = self.cell_regs.get(name) {
+            self.locals.entry(name.to_string()).or_insert(Local { reg: cell, ty: fty.clone(), repr: Repr::Obj, cell: true });
+        }
+        let mut names: Vec<String> = NameScope::of(Some(&d.parameters), FnBody::Stmts(&d.body)).free().into_iter().collect();
+        names.sort();
+        let defaults = self.eval_defaults(&sig, &d.parameters);
+        let (free, regs) = self.closure_for(&names);
+        let spec = FnSpec {
+            qual,
+            key: key.clone(),
+            name: name.to_string(),
+            name_off: d.name.range().start().into(),
+            line: self.db.files[self.file].line_col(off).0,
+            sig,
+            params: Some(&d.parameters),
+            body: FnBody::Stmts(&d.body),
+            method: None,
+            has_receiver: false,
+            free,
+            rigid,
+            ret_hint: None,
+            dynamic_defaults: true,
+        };
+        let (ir, _) = self.build_function(spec);
+        if !self.toplevel {
+            self.nested.push(ir);
+        }
+        let dst = self.reg(Repr::Obj);
+        let k = self.name(&key);
+        self.emit(Instr::MakeFunction { dst, key: k, closure: regs, defaults });
+        self.assign_local(name, Val { reg: dst, ty: fty, repr: Repr::Obj }, None, off);
+    }
+
+    /// `lambda params: body`, its parameter types taken from the expected
+    /// `Callable` type.
+    fn lambda(&mut self, l: &ast::ExprLambda, hint: Option<&Ty>, off: u32) -> Val {
+        let mut names = Vec::new();
+        let mut defaults = Vec::new();
+        if let Some(ps) = l.parameters.as_deref() {
+            if ps.vararg.is_some() || ps.kwarg.is_some() || !ps.kwonlyargs.is_empty() {
+                self.err(off, "lambdas with `*`, `**` or keyword-only parameters are not supported by Lizzard yet");
+            }
+            for p in ps.posonlyargs.iter().chain(ps.args.iter()) {
+                names.push(p.parameter.name.to_string());
+                defaults.push(p.default.is_some());
+            }
+        }
+        // The expected `Callable` gives the parameters without defaults (or
+        // all of them); the others take their default's type.
+        let required = defaults.iter().filter(|d| !**d).count();
+        let expected = hint.into_iter().flat_map(members).find_map(|m| match m {
+            Ty::Callable(Some(ps), r) if ps.len() == required || ps.len() == names.len() => Some((ps, *r)),
+            Ty::Callable(None, r) if required == 0 => Some((Vec::new(), *r)),
+            _ => None,
+        });
+        let concrete = |db: &Db, t: &Ty| {
+            let mut v = Vec::new();
+            collect_vars(t, &mut v);
+            v.iter().all(|x| db.rigid.contains(x))
+        };
+        let (mut ptys, ret_hint): (Vec<Option<Ty>>, Option<Ty>) = match expected {
+            Some((ps, r)) => {
+                let ps = ps.iter().map(|p| Some(if concrete(self.db, p) { p.clone() } else { Ty::Any })).collect();
+                (ps, concrete(self.db, &r).then_some(r))
+            }
+            None => (Vec::new(), None),
+        };
+        ptys.resize(names.len(), None);
+        let mut default_regs = Vec::new();
+        if let Some(ps) = l.parameters.as_deref() {
+            for (i, p) in ps.posonlyargs.iter().chain(ps.args.iter()).enumerate() {
+                if let Some(dflt) = &p.default {
+                    let v = self.expr_hint(dflt, ptys[i].as_ref());
+                    let v = match ptys[i].clone() {
+                        Some(t) => self.coerce(v, &t, dflt.range().start().into(), |_, got, want| format!("the default of `{}` is {got}, but the parameter is {want}", p.parameter.name)),
+                        None => {
+                            ptys[i] = Some(v.ty.clone());
+                            v
+                        }
+                    };
+                    default_regs.push(self.obj(&v));
+                }
+            }
+        }
+        if ptys.iter().any(Option::is_none) {
+            self.err(off, "cannot infer the parameter types of this lambda: use it where a `Callable[[...], ...]` is expected, or use a `def`");
+        }
+        let ptys: Vec<Ty> = ptys.into_iter().map(|t| t.unwrap_or(Ty::Any)).collect();
+        let params: Vec<Param> = names.iter().zip(&ptys).zip(&defaults).map(|((n, t), d)| Param { name: n.clone(), ty: t.clone(), kind: PKind::PosOrKw, default: *d }).collect();
+        let sig = Sig { params, ret: Ty::Any, file: self.file, off };
+        let qual = self.inner_qual("<lambda>");
+        let key = format!("{qual}@{off}");
+        let mut fv: Vec<String> = NameScope::of(l.parameters.as_deref(), FnBody::Lambda(&l.body)).free().into_iter().collect();
+        fv.sort();
+        let (free, regs) = self.closure_for(&fv);
+        let spec = FnSpec {
+            qual,
+            key: key.clone(),
+            name: "<lambda>".into(),
+            name_off: off,
+            line: self.line,
+            sig,
+            params: l.parameters.as_deref(),
+            body: FnBody::Lambda(&l.body),
+            method: None,
+            has_receiver: false,
+            free,
+            rigid: self.db.rigid.clone(),
+            ret_hint,
+            dynamic_defaults: true,
+        };
+        let (ir, body_ty) = self.build_function(spec);
+        if !self.toplevel {
+            self.nested.push(ir);
+        }
+        let dst = self.reg(Repr::Obj);
+        let k = self.name(&key);
+        self.emit(Instr::MakeFunction { dst, key: k, closure: regs, defaults: default_regs });
+        // Callers see the parameters without defaults.
+        let shown: Vec<Ty> = ptys.iter().zip(&defaults).filter(|(_, d)| !**d).map(|(t, _)| t.clone()).collect();
+        Val { reg: dst, ty: Ty::Callable(Some(shown), Box::new(body_ty)), repr: Repr::Obj }
     }
 
     /// Bind a signature's parameters to registers `0..n` (in `sig` order).
-    fn params(&mut self, sig: &Sig, ps: &ast::Parameters, has_receiver: bool) -> Vec<ParamIr> {
+    fn params(&mut self, sig: &Sig, ps: &ast::Parameters, has_receiver: bool, dynamic_defaults: bool) -> Vec<ParamIr> {
         let defaults: HashMap<&str, &Expr> = ps
             .posonlyargs
             .iter()
@@ -724,16 +1015,17 @@ impl<'a> Lower<'a> {
                 PKind::VarKw => (ParamKind::VarKw, self.builtin_inst("dict", vec![Ty::Str, p.ty.clone()])),
             };
             let reg = self.reg(Repr::Obj);
-            self.locals.insert(p.name.clone(), Local { reg, ty: local_ty, repr: Repr::Obj });
+            self.locals.insert(p.name.clone(), Local { reg, ty: local_ty, repr: Repr::Obj, cell: false });
             let expected = self.show(&p.ty);
             // The receiver is bound by Python itself.
             let check = if i == 0 && has_receiver { RtCheck::Any } else { self.rtcheck(&p.ty) };
             self.checks.push(CheckIr { check, what: format!("argument '{}'", p.name), expected, origin: None });
+            let dynamic_default = dynamic_defaults && defaults.contains_key(p.name.as_str());
             let default = match defaults.get(p.name.as_str()) {
-                Some(e) => self.default_value(e, &p.ty, &p.name),
-                None => None,
+                Some(e) if !dynamic_defaults => self.default_value(e, &p.ty, &p.name),
+                _ => None,
             };
-            params.push(ParamIr { name: p.name.clone(), kind, check: (self.checks.len() - 1) as u32, default });
+            params.push(ParamIr { name: p.name.clone(), kind, check: (self.checks.len() - 1) as u32, default, dynamic_default });
         }
         params
     }
@@ -919,7 +1211,16 @@ impl<'a> Lower<'a> {
                 }
             }
             Stmt::ClassDef(_) => self.err(off, "classes inside functions or blocks are not supported by Lizzard yet"),
-            Stmt::FunctionDef(_) => self.err(off, "nested functions are not supported by Lizzard yet"),
+            Stmt::FunctionDef(d) => self.nested_def(d, off),
+            Stmt::Nonlocal(n) if !self.toplevel => {
+                for name in &n.names {
+                    if self.free.iter().any(|(f, _)| f == name.as_str()) {
+                        self.nonlocal_names.push(name.to_string());
+                    } else {
+                        self.err(off, format!("no binding for nonlocal `{}` found", name.as_str()));
+                    }
+                }
+            }
             _ => self.err(off, "this statement is not supported by Lizzard yet"),
         }
     }
@@ -1053,7 +1354,7 @@ impl<'a> Lower<'a> {
                     self.invalidate(name);
                     let reg = self.reg(Repr::Obj);
                     self.emit(Instr::Move { dst: reg, src: exc });
-                    self.locals.insert(name.clone(), Local { reg, ty, repr: Repr::Obj });
+                    self.locals.insert(name.clone(), Local { reg, ty, repr: Repr::Obj, cell: false });
                 }
                 self.handled.push(exc);
                 self.stmts(&h.body);
@@ -1372,7 +1673,7 @@ impl<'a> Lower<'a> {
                 return self.err(off, format!("`{name}` is already declared"));
             }
             let reg = self.reg(Repr::Obj);
-            self.locals.insert(name.to_string(), Local { reg, ty, repr: Repr::Obj });
+            self.locals.insert(name.to_string(), Local { reg, ty, repr: Repr::Obj, cell: false });
             return;
         };
         match &*a.target {
@@ -1441,6 +1742,31 @@ impl<'a> Lower<'a> {
             self.emit(Instr::StoreGlobal { name: n, val: r });
             return;
         }
+        if let Some(i) = self.nonlocal_names.iter().any(|n| n == name).then(|| self.free.iter().position(|(f, _)| f == name)).flatten() {
+            let t = self.free[i].1.clone();
+            let v = self.coerce(v, &t, off, |_, got, want| format!("cannot assign {got} to `{name}` of type {want}"));
+            let r = self.obj(&v);
+            self.emit(Instr::StoreFree { idx: i as u32, val: r });
+            return;
+        }
+        if let Some(&cell) = self.cell_regs.get(name) {
+            let declared = self.locals.get(name).map(|l| l.ty.clone());
+            let v = match declared.as_ref().or(ann.as_ref()) {
+                Some(t) => {
+                    let t = t.clone();
+                    let v = self.coerce(v, &t, off, |_, got, want| format!("cannot assign {got} to `{name}` of type {want}"));
+                    Val { ty: t, ..v }
+                }
+                None => v,
+            };
+            let r = self.obj(&v);
+            self.emit(Instr::StoreCell { cell, val: r });
+            if declared.is_none() {
+                self.locals.insert(name.to_string(), Local { reg: cell, ty: v.ty, repr: Repr::Obj, cell: true });
+            }
+            self.invalidate(name);
+            return;
+        }
         if let Some(l) = self.locals.get(name).cloned() {
             if let Some(a) = &ann {
                 if *a != l.ty {
@@ -1469,7 +1795,7 @@ impl<'a> Lower<'a> {
         if let Some(a) = &ann {
             self.narrow_to(name.to_string(), a, &v.ty);
         }
-        self.locals.insert(name.to_string(), Local { reg, ty: v.ty, repr: v.repr });
+        self.locals.insert(name.to_string(), Local { reg, ty: v.ty, repr: v.repr, cell: false });
     }
 
     /// After assigning a value of type `got` to `key` declared `declared`:
@@ -1489,8 +1815,8 @@ impl<'a> Lower<'a> {
     /// The narrowing key of `x` or `x.attr` for a local `x`.
     fn narrow_key(&self, e: &Expr) -> Option<String> {
         match e {
-            Expr::Name(n) if self.locals.contains_key(n.id.as_str()) => Some(n.id.to_string()),
-            Expr::Attribute(a) => attr_path(a).filter(|p| self.locals.contains_key(p.split('.').next().unwrap())),
+            Expr::Name(n) if self.locals.get(n.id.as_str()).is_some_and(|l| !l.cell) => Some(n.id.to_string()),
+            Expr::Attribute(a) => attr_path(a).filter(|p| self.locals.get(p.split('.').next().unwrap()).is_some_and(|l| !l.cell)),
             _ => None,
         }
     }
@@ -1936,6 +2262,7 @@ impl<'a> Lower<'a> {
             Expr::Tuple(t) => self.tuple_lit(&t.elts, hint, off),
             Expr::Dict(d) => self.dict_lit(d, hint, off),
             Expr::ListComp(lc) => self.comprehension(&lc.generators, CompBody::List(&lc.elt), hint, off),
+            Expr::Lambda(l) => self.lambda(l, hint, off),
             Expr::Generator(_) => {
                 self.err(off, "generator expressions are not supported by Lizzard yet; use a list comprehension");
                 self.any()
@@ -2039,9 +2366,20 @@ impl<'a> Lower<'a> {
     }
 
     fn load_name(&mut self, name: &str, off: u32) -> Val {
-        if let Some(l) = self.locals.get(name) {
+        if let Some(l) = self.locals.get(name).cloned() {
+            if l.cell {
+                let dst = self.reg(Repr::Obj);
+                self.emit(Instr::LoadCell { dst, cell: l.reg });
+                return Val { reg: dst, ty: l.ty, repr: Repr::Obj };
+            }
             let ty = self.narrow.get(name).cloned().unwrap_or_else(|| l.ty.clone());
             return Val { reg: l.reg, ty, repr: l.repr };
+        }
+        if let Some(i) = self.free.iter().position(|(f, _)| f == name) {
+            let ty = self.free[i].1.clone();
+            let dst = self.reg(Repr::Obj);
+            self.emit(Instr::LoadFree { dst, idx: i as u32 });
+            return Val { reg: dst, ty, repr: Repr::Obj };
         }
         let ty = match self.db.lookup_in(self.m, name) {
             Some(Sym::UserVar) if self.toplevel => {
@@ -2398,18 +2736,40 @@ impl<'a> Lower<'a> {
             return self.star_call(c, fv, off);
         }
         let (pos_hints, kw_hints) = self.arg_hints(&fv.ty);
-        let mut pos = Vec::new();
+        // Lambdas are typed last, from what the other arguments tell about
+        // the callee's type variables (creating them has no side effects).
+        let is_lambda = |e: &Expr| matches!(e, Expr::Lambda(_));
+        let mut pos: Vec<Option<Val>> = Vec::new();
         for (i, a) in c.arguments.args.iter().enumerate() {
             let hint = pos_hints.get(i).cloned().flatten();
-            pos.push(self.expr_hint(a, hint.as_ref()));
+            pos.push((!is_lambda(a)).then(|| self.expr_hint(a, hint.as_ref())));
         }
-        let mut kws = Vec::new();
+        let mut kws: Vec<(String, Option<Val>)> = Vec::new();
         for k in c.arguments.keywords.iter() {
             let name = k.arg.as_ref().unwrap();
             let hint = kw_hints.get(name.as_str()).cloned();
-            let v = self.expr_hint(&k.value, hint.as_ref());
-            kws.push((name.as_str().to_string(), v));
+            kws.push((name.to_string(), (!is_lambda(&k.value)).then(|| self.expr_hint(&k.value, hint.as_ref()))));
         }
+        if pos.iter().any(Option::is_none) || kws.iter().any(|(_, v)| v.is_none()) {
+            let known_pos: Vec<Ty> = pos.iter().map(|v| v.as_ref().map_or(Ty::Any, |v| v.ty.clone())).collect();
+            let known_kws: Vec<(String, Ty)> = kws.iter().map(|(n, v)| (n.clone(), v.as_ref().map_or(Ty::Any, |v| v.ty.clone()))).collect();
+            let (lp, lk) = self.lambda_hints(&fv.ty, &known_pos, &known_kws);
+            for (i, a) in c.arguments.args.iter().enumerate() {
+                if pos[i].is_none() {
+                    let hint = lp.get(i).cloned().flatten().or_else(|| pos_hints.get(i).cloned().flatten());
+                    pos[i] = Some(self.expr_hint(a, hint.as_ref()));
+                }
+            }
+            for (j, k) in c.arguments.keywords.iter().enumerate() {
+                if kws[j].1.is_none() {
+                    let name = kws[j].0.clone();
+                    let hint = lk.get(&name).cloned().or_else(|| kw_hints.get(&name).cloned());
+                    kws[j].1 = Some(self.expr_hint(&k.value, hint.as_ref()));
+                }
+            }
+        }
+        let pos: Vec<Val> = pos.into_iter().map(Option::unwrap).collect();
+        let kws: Vec<(String, Val)> = kws.into_iter().map(|(n, v)| (n, v.unwrap())).collect();
         let pos_tys: Vec<Ty> = pos.iter().map(|v| v.ty.clone()).collect();
         let kw_tys: Vec<(String, Ty)> = kws.iter().map(|(n, v)| (n.clone(), v.ty.clone())).collect();
         let mut origin = None;
@@ -2430,6 +2790,72 @@ impl<'a> Lower<'a> {
             self.check(&v, what, origin);
         }
         self.unbox_f32(v)
+    }
+
+    /// The parameter types the arguments of a call bind to, with the
+    /// callee's type variables solved from the known argument types (`Any`
+    /// marks the ones not known yet): what a lambda argument should be.
+    fn lambda_hints(&mut self, callee: &Ty, pos: &[Ty], kws: &[(String, Ty)]) -> (Vec<Option<Ty>>, HashMap<String, Ty>) {
+        let (f, recv) = match callee {
+            Ty::Func(FuncRef::Def(f)) => (*f, None),
+            Ty::Func(FuncRef::Bound(f, r)) => (*f, Some((**r).clone())),
+            Ty::Type(t) => match self.lookup_ty(t) {
+                Ty::Inst(k, _) if self.db.is_user_class(k) || self.db.is_builtin_class(k) => match self.db.find_member(k, "__init__") {
+                    Some((_, Member::Method(f))) => {
+                        let ps = self.db.class_params(k);
+                        let recv = Ty::Inst(k, ps.iter().map(|_| Ty::Var(self.db.new_tv("_", Variance::Inv))).collect());
+                        (f, Some(recv))
+                    }
+                    _ => return (Vec::new(), HashMap::new()),
+                },
+                _ => return (Vec::new(), HashMap::new()),
+            },
+            _ => return (Vec::new(), HashMap::new()),
+        };
+        for sig in self.db.sigs(f).iter() {
+            if let Some(h) = self.solve_args(sig, recv.as_ref(), pos, kws) {
+                return h;
+            }
+        }
+        (Vec::new(), HashMap::new())
+    }
+
+    fn solve_args(&mut self, sig: &Sig, recv: Option<&Ty>, pos: &[Ty], kws: &[(String, Ty)]) -> Option<(Vec<Option<Ty>>, HashMap<String, Ty>)> {
+        let fresh = {
+            let mut tys: Vec<&Ty> = sig.params.iter().map(|p| &p.ty).collect();
+            tys.push(&sig.ret);
+            self.db.fresh_rigid(&tys)
+        };
+        let params: Vec<(Param, Ty)> = sig.params.iter().map(|p| (p.clone(), subst(&p.ty, &fresh))).collect();
+        let mut it = params.iter();
+        let mut s = Subst::new();
+        if let Some(r) = recv {
+            let (_, t) = it.next()?;
+            if !self.db.assign(r, t, &mut s, &mut false) {
+                return None;
+            }
+        }
+        let rest: Vec<&(Param, Ty)> = it.collect();
+        let positional: Vec<&Ty> = rest.iter().filter(|(p, _)| matches!(p.kind, PKind::PosOnly | PKind::PosOrKw)).map(|(_, t)| t).collect();
+        let var_pos = rest.iter().find(|(p, _)| matches!(p.kind, PKind::VarPos)).map(|(_, t)| t);
+        let var_kw = rest.iter().find(|(p, _)| matches!(p.kind, PKind::VarKw)).map(|(_, t)| t);
+        let mut pos_params = Vec::new();
+        for i in 0..pos.len() {
+            pos_params.push(positional.get(i).copied().or(var_pos)?.clone());
+        }
+        let mut kw_params = Vec::new();
+        for (n, _) in kws {
+            let t = rest.iter().find(|(p, _)| p.name == *n && matches!(p.kind, PKind::PosOrKw | PKind::KwOnly)).map(|(_, t)| t).or(var_kw)?;
+            kw_params.push(t.clone());
+        }
+        for (a, p) in pos.iter().zip(&pos_params).chain(kws.iter().map(|(_, t)| t).zip(&kw_params)) {
+            if *a != Ty::Any && !self.db.assign(a, p, &mut s, &mut false) {
+                return None;
+            }
+        }
+        let hints = pos_params.iter().map(|p| Some(deep_subst(p, &s))).collect();
+        let kw_hints = kws.iter().zip(&kw_params).map(|((n, _), p)| (n.clone(), deep_subst(p, &s))).collect();
+        Some((hints, kw_hints))
     }
 
     /// A call with `*iterable` or `**mapping` arguments. Fixed-length tuples
@@ -2543,6 +2969,23 @@ impl<'a> Lower<'a> {
             }
             Ty::Func(FuncRef::Def(f)) => self.call_result(f, None, &pos, &kws, off, origin),
             Ty::Func(FuncRef::Bound(f, recv)) => self.call_result(f, Some(*recv), &pos, &kws, off, origin),
+            Ty::Callable(ps, r) => {
+                if let Some(ps) = ps {
+                    if !kws.is_empty() {
+                        self.err(off, "a `Callable` cannot be called with keyword arguments");
+                    } else if ps.len() != pos.len() {
+                        self.err(off, format!("expected {} arguments, got {}", ps.len(), pos.len()));
+                    } else {
+                        for (i, (p, a)) in ps.iter().zip(pos).enumerate() {
+                            if !self.assignable(a, p) {
+                                let (a, p) = (self.show(a), self.show(p));
+                                self.err(off, format!("argument {}: expected {p}, got {a}", i + 1));
+                            }
+                        }
+                    }
+                }
+                *r
+            }
             // A union of callables (`shape.area` for `shape: Circle | Rect`).
             Ty::Union(ms) if !ms.contains(&Ty::None) => {
                 let mut tys = Vec::new();
@@ -3274,6 +3717,125 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The names a function's body uses and binds, for closures: which of its
+/// variables inner functions capture (cells), and which names it needs from
+/// enclosing functions (free).
+#[derive(Default)]
+struct NameScope {
+    params: HashSet<String>,
+    loads: HashSet<String>,
+    bound: HashSet<String>,
+    nested_free: HashSet<String>,
+    globals: HashSet<String>,
+    nonlocals: HashSet<String>,
+}
+
+impl NameScope {
+    fn of(params: Option<&ast::Parameters>, body: FnBody) -> NameScope {
+        let mut s = NameScope::default();
+        if let Some(ps) = params {
+            for p in ps.iter() {
+                s.params.insert(p.name().to_string());
+            }
+        }
+        match body {
+            FnBody::Stmts(b) => b.iter().for_each(|st| s.visit_stmt(st)),
+            FnBody::Lambda(e) => s.visit_expr(e),
+        }
+        s
+    }
+
+    /// Names local to the function (assigned in it), besides parameters.
+    fn local_names(&self) -> HashSet<String> {
+        self.bound.iter().filter(|n| !self.nonlocals.contains(*n) && !self.globals.contains(*n)).cloned().collect()
+    }
+
+    fn cells(&self) -> HashSet<String> {
+        let mine: HashSet<String> = self.local_names().union(&self.params).cloned().collect();
+        mine.intersection(&self.nested_free).cloned().collect()
+    }
+
+    fn free(&self) -> HashSet<String> {
+        let mine: HashSet<String> = self.local_names().union(&self.params).cloned().collect();
+        self.loads.iter().chain(&self.nested_free).chain(&self.nonlocals).filter(|n| !mine.contains(*n) && !self.globals.contains(*n)).cloned().collect()
+    }
+
+    fn nested(&mut self, params: Option<&ast::Parameters>, body: FnBody) {
+        let inner = NameScope::of(params, body);
+        self.nested_free.extend(inner.free());
+    }
+}
+
+impl<'a> Visitor<'a> for NameScope {
+    fn visit_stmt(&mut self, st: &'a Stmt) {
+        match st {
+            Stmt::FunctionDef(d) => {
+                self.bound.insert(d.name.to_string());
+                for dec in &d.decorator_list {
+                    self.visit_expr(&dec.expression);
+                }
+                for p in d.parameters.iter_non_variadic_params() {
+                    if let Some(dflt) = &p.default {
+                        self.visit_expr(dflt);
+                    }
+                }
+                self.nested(Some(&d.parameters), FnBody::Stmts(&d.body));
+            }
+            Stmt::ClassDef(c) => {
+                self.bound.insert(c.name.to_string());
+            }
+            Stmt::Global(g) => self.globals.extend(g.names.iter().map(|n| n.to_string())),
+            Stmt::Nonlocal(n) => self.nonlocals.extend(n.names.iter().map(|n| n.to_string())),
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let n = a.asname.as_ref().map_or_else(|| a.name.split('.').next().unwrap_or("").to_string(), |x| x.to_string());
+                    self.bound.insert(n);
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    self.bound.insert(a.asname.as_ref().unwrap_or(&a.name).to_string());
+                }
+            }
+            _ => walk_stmt(self, st),
+        }
+    }
+
+    fn visit_expr(&mut self, e: &'a Expr) {
+        match e {
+            Expr::Name(n) => {
+                if n.ctx == ast::ExprContext::Load {
+                    self.loads.insert(n.id.to_string());
+                } else {
+                    self.bound.insert(n.id.to_string());
+                }
+            }
+            Expr::Lambda(l) => {
+                if let Some(ps) = l.parameters.as_deref() {
+                    for p in ps.iter_non_variadic_params() {
+                        if let Some(dflt) = &p.default {
+                            self.visit_expr(dflt);
+                        }
+                    }
+                }
+                self.nested(l.parameters.as_deref(), FnBody::Lambda(&l.body));
+            }
+            _ => walk_expr(self, e),
+        }
+    }
+
+    /// Annotations are not evaluated by compiled code.
+    fn visit_annotation(&mut self, _: &'a Expr) {}
+
+    fn visit_except_handler(&mut self, h: &'a ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(eh) = h;
+        if let Some(n) = &eh.name {
+            self.bound.insert(n.to_string());
+        }
+        walk_except_handler(self, h);
+    }
+}
+
 /// Whether `t` contains `Any` (type variables are not `Any` here).
 fn mentions_any(t: &Ty) -> bool {
     match t {
@@ -3343,6 +3905,7 @@ fn assigned_keys(body: &[Stmt], out: &mut Vec<String>) {
                 w.items.iter().filter_map(|i| i.optional_vars.as_deref()).for_each(|t| target(t, out));
                 assigned_keys(&w.body, out);
             }
+            Stmt::FunctionDef(d) => out.push(d.name.to_string()),
             _ => {}
         }
     }

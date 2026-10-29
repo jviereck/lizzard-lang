@@ -1,6 +1,7 @@
 //! The IR interpreter and Lizzard function objects.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyNameError, PyTypeError, PyUnboundLocalError, PyValueError};
@@ -14,14 +15,18 @@ use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, ParamKind, Repr};
 use crate::array;
 use crate::rt;
 
+/// A module's functions by key, for creating inner functions and lambdas.
+pub type Table = Arc<OnceLock<HashMap<String, Arc<FuncRt>>>>;
+
 pub struct FuncRt {
     pub ir: FuncIr,
     consts: Vec<Py<PyAny>>,
     names: Vec<Py<PyString>>,
+    table: Table,
 }
 
 impl FuncRt {
-    pub fn new(py: Python<'_>, ir: FuncIr) -> PyResult<FuncRt> {
+    pub fn new(py: Python<'_>, ir: FuncIr, table: Table) -> PyResult<FuncRt> {
         let mut consts = Vec::new();
         for c in &ir.consts {
             let o: Bound<'_, PyAny> = match c {
@@ -35,7 +40,7 @@ impl FuncRt {
             consts.push(o.unbind());
         }
         let names = ir.names.iter().map(|n| PyString::intern(py, n).unbind()).collect();
-        Ok(FuncRt { ir, consts, names })
+        Ok(FuncRt { ir, consts, names, table })
     }
 }
 
@@ -45,11 +50,16 @@ pub struct LizzardFunction {
     rt: Arc<FuncRt>,
     globals: Py<PyDict>,
     module: String,
+    /// Cells for the variables it captures (`ir.free`).
+    closure: Vec<Py<PyAny>>,
+    /// Defaults evaluated where it was created (parameters with
+    /// `dynamic_default`, in order).
+    defaults: Vec<Py<PyAny>>,
 }
 
 impl LizzardFunction {
-    pub fn new(rt: Arc<FuncRt>, globals: Py<PyDict>, module: String) -> LizzardFunction {
-        LizzardFunction { rt, globals, module }
+    pub fn new(rt: Arc<FuncRt>, globals: Py<PyDict>, module: String, closure: Vec<Py<PyAny>>, defaults: Vec<Py<PyAny>>) -> LizzardFunction {
+        LizzardFunction { rt, globals, module, closure, defaults }
     }
 }
 
@@ -58,9 +68,9 @@ impl LizzardFunction {
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let ir = &self.rt.ir;
-        let bound = bind_args(ir, &self.rt.consts, args, kwargs)?;
+        let bound = bind_args(ir, &self.rt.consts, &self.defaults, args, kwargs)?;
         check_args(py, ir, &bound)?;
-        run(py, &self.rt, self.globals.bind(py), bound)
+        run(py, &self.rt, self.globals.bind(py), bound, &self.closure)
     }
 
     /// Bind as a method when stored in a class, like a Python function.
@@ -97,7 +107,7 @@ impl LizzardFunction {
 }
 
 /// Bind call arguments to parameters, with CPython's error messages.
-fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], dynamic: &[Py<PyAny>], args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let py = args.py();
     let name = &ir.name;
     let err = |m: String| Err(PyTypeError::new_err(format!("{name}() {m}")));
@@ -144,7 +154,7 @@ fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], args: &Bound<'py, PyTuple>,
     }
     if !extra.is_empty() && var_pos.is_none() {
         let max = positional.len();
-        let min = positional.iter().filter(|&&i| ir.params[i].default.is_none()).count();
+        let min = positional.iter().filter(|&&i| ir.params[i].default.is_none() && !ir.params[i].dynamic_default).count();
         let takes = if min == max { format!("{max} positional argument{}", plural(max)) } else { format!("from {min} to {max} positional arguments") };
         let n = given.len();
         let were = if kwonly_given > 0 {
@@ -157,8 +167,14 @@ fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], args: &Bound<'py, PyTuple>,
     if !posonly_as_kw.is_empty() {
         return err(format!("got some positional-only arguments passed as keyword arguments: {}", posonly_as_kw.join(", ")));
     }
+    let mut next_dynamic = 0;
     for (i, p) in ir.params.iter().enumerate() {
-        if slots[i].is_none() {
+        if p.dynamic_default {
+            if slots[i].is_none() {
+                slots[i] = dynamic.get(next_dynamic).map(|d| d.bind(py).clone());
+            }
+            next_dynamic += 1;
+        } else if slots[i].is_none() {
             if let Some(d) = p.default {
                 slots[i] = Some(consts[d as usize].bind(py).clone());
             }
@@ -236,7 +252,7 @@ fn unbound() -> PyErr {
     PyUnboundLocalError::new_err("local variable referenced before assignment")
 }
 
-fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>) -> PyResult<Py<PyAny>> {
+fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>, closure: &[Py<PyAny>]) -> PyResult<Py<PyAny>> {
     let ir = &f.ir;
     let mut regs: Vec<V<'py>> = (0..ir.reprs.len()).map(|_| V::Empty).collect();
     for (i, a) in args.into_iter().enumerate() {
@@ -244,7 +260,7 @@ fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec
     }
     let mut pc = 0usize;
     loop {
-        match step(py, f, globals, &mut regs, &mut pc) {
+        match step(py, f, globals, closure, &mut regs, &mut pc) {
             Ok(Some(ret)) => return Ok(ret),
             Ok(None) => {}
             Err(e) => {
@@ -285,6 +301,27 @@ macro_rules! scalar {
     };
 }
 
+fn cell_get<'py>(py: Python<'py>, cell: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    // SAFETY: `cell` is a cell object; returns a new reference or NULL
+    // (empty cell, no exception set).
+    let p = unsafe { ffi::PyCell_Get(cell.as_ptr()) };
+    if p.is_null() {
+        return match PyErr::take(py) {
+            Some(e) => Err(e),
+            None => Ok(None),
+        };
+    }
+    Ok(Some(unsafe { Bound::from_owned_ptr(py, p) }))
+}
+
+fn cell_set(cell: &Bound<'_, PyAny>, val: &Bound<'_, PyAny>) -> PyResult<()> {
+    // SAFETY: `cell` is a cell object; the value is not stolen.
+    if unsafe { ffi::PyCell_Set(cell.as_ptr(), val.as_ptr()) } < 0 {
+        return Err(PyErr::fetch(cell.py()));
+    }
+    Ok(())
+}
+
 /// The exception `raise x` raises: `x`, or an instance of the class `x`.
 fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let e = if x.is_instance_of::<PyType>() { x.call0()? } else { x.clone() };
@@ -295,7 +332,7 @@ fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>
 }
 
 /// Execute one instruction; `Some` when the function returns.
-fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &mut [V<'py>], pc: &mut usize) -> PyResult<Option<Py<PyAny>>> {
+fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut [V<'py>], pc: &mut usize) -> PyResult<Option<Py<PyAny>>> {
     let ir = &f.ir;
     let instr = &ir.code[*pc];
     let mut next = *pc + 1;
@@ -310,6 +347,43 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
             regs[*dst as usize] = V::O(v);
         }
         Instr::StoreGlobal { name, val } => globals.set_item(f.names[*name as usize].bind(py), obj!(regs, *val))?,
+        Instr::MakeCell { dst } => {
+            // SAFETY: NULL makes an empty cell; returns a new reference.
+            let c = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyCell_New(std::ptr::null_mut()))? };
+            regs[*dst as usize] = V::O(c);
+        }
+        Instr::LoadCell { dst, cell } => match cell_get(py, obj!(regs, *cell))? {
+            Some(v) => regs[*dst as usize] = V::O(v),
+            None => return Err(unbound()),
+        },
+        Instr::StoreCell { cell, val } => cell_set(obj!(regs, *cell), obj!(regs, *val))?,
+        Instr::LoadFree { dst, idx } => match cell_get(py, closure[*idx as usize].bind(py))? {
+            Some(v) => regs[*dst as usize] = V::O(v),
+            None => {
+                let n = &f.ir.free[*idx as usize];
+                return Err(PyNameError::new_err(format!("cannot access free variable '{n}' where it is not associated with a value in enclosing scope")));
+            }
+        },
+        Instr::StoreFree { idx, val } => cell_set(closure[*idx as usize].bind(py), obj!(regs, *val))?,
+        Instr::LoadFreeCell { dst, idx } => regs[*dst as usize] = V::O(closure[*idx as usize].bind(py).clone()),
+        Instr::MakeFunction { dst, key, closure: cells, defaults } => {
+            let key = f.names[*key as usize].bind(py).to_cow()?;
+            let rt = f.table.get().and_then(|t| t.get(key.as_ref())).cloned().expect("inner function compiled with its module");
+            let module = match globals.get_item("__name__")? {
+                Some(n) => n.extract()?,
+                None => String::new(),
+            };
+            let mut cl = Vec::with_capacity(cells.len());
+            for r in cells {
+                cl.push(obj!(regs, *r).clone().unbind());
+            }
+            let mut dv = Vec::with_capacity(defaults.len());
+            for r in defaults {
+                dv.push(obj!(regs, *r).clone().unbind());
+            }
+            let func = Py::new(py, LizzardFunction::new(rt, globals.clone().unbind(), module, cl, dv))?;
+            regs[*dst as usize] = V::O(func.into_bound(py).into_any());
+        }
         Instr::Move { dst, src } => {
             let v = match &regs[*src as usize] {
                 V::Empty => return Err(unbound()),

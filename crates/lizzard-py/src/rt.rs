@@ -69,6 +69,7 @@ pub fn check(py: Python<'_>, obj: &Bound<'_, PyAny>, check: &RtCheck) -> PyResul
             }
             _ => false,
         },
+        RtCheck::Callable => obj.is_callable(),
         RtCheck::Union(cs) => {
             let mut any = false;
             for c in cs {

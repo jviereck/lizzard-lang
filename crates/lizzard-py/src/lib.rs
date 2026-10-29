@@ -12,7 +12,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use interp::{FuncRt, LizzardFunction};
+use interp::{FuncRt, LizzardFunction, Table};
 
 /// The checked and lowered functions of one Lizzard module.
 #[pyclass(frozen, module = "lizzard._lizzard")]
@@ -33,7 +33,7 @@ impl CompiledModule {
             Some(n) => n.extract()?,
             None => String::new(),
         };
-        Ok(LizzardFunction::new(f.clone(), globals.unbind(), module))
+        Ok(LizzardFunction::new(f.clone(), globals.unbind(), module, Vec::new(), Vec::new()))
     }
 }
 
@@ -67,10 +67,12 @@ fn compile_module<'py>(py: Python<'py>, source: &str, path: &str, name: &str, en
     if !compiled.diagnostics.is_empty() {
         return Ok((None, diags, warnings));
     }
+    let table: Table = Arc::default();
     let mut funcs = Vec::new();
     for f in compiled.module.functions {
-        funcs.push(Arc::new(FuncRt::new(py, f)?));
+        funcs.push(Arc::new(FuncRt::new(py, f, table.clone())?));
     }
+    let _ = table.set(funcs.iter().map(|f| (f.ir.key.clone(), f.clone())).collect());
     Ok((Some(CompiledModule { funcs }), diags, warnings))
 }
 

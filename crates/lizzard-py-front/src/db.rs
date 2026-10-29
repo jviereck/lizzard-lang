@@ -86,6 +86,8 @@ pub enum Ty {
     Exc(String),
     /// `A | B`, flattened, without duplicates, two or more members.
     Union(Vec<Ty>),
+    /// `Callable[[A, B], R]`; `None` parameters for `Callable[..., R]`.
+    Callable(Option<Vec<Ty>>, Box<Ty>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +116,7 @@ pub enum Special {
     Never,
     Tuple,
     Type,
+    Callable,
 }
 
 #[derive(Clone, Debug)]
@@ -1158,6 +1161,14 @@ impl Db {
         f
     }
 
+    /// A function defined inside another one, under a key unique in the
+    /// module (`f.<locals>.g@offset`).
+    pub fn local_func(&mut self, m: ModId, key: &str, name: &str, def: Rc<ast::StmtFunctionDef>, file: FileId) -> FuncId {
+        let f = self.func_for(m, None, key, vec![(def, file)]);
+        self.funcs[f].name = name.to_string();
+        f
+    }
+
     /// A member declared by class `c` itself (overlay first).
     pub fn class_member(&mut self, c: ClassId, name: &str) -> Option<Member> {
         if let Some(m) = self.classes[c].members.get(name) {
@@ -1386,6 +1397,14 @@ impl Db {
                         _ => Ty::Any,
                     },
                     Some(Sym::Special(Special::Final | Special::ClassVar)) => args.first().map_or(Ty::Any, |a| self.eval_type(a, sc)),
+                    Some(Sym::Special(Special::Callable)) => {
+                        let ret = args.get(1).map_or(Ty::Any, |a| self.eval_type(a, sc));
+                        let params = match args.first() {
+                            Some(Expr::List(l)) => Some(l.elts.iter().map(|a| self.eval_type(a, sc)).collect()),
+                            _ => None,
+                        };
+                        Ty::Callable(params, Box::new(ret))
+                    }
                     Some(Sym::Special(Special::Union)) if self.unions_ok(sc.m) => {
                         let members = args.iter().map(|a| self.eval_type(a, sc)).collect();
                         union(members)
@@ -1439,6 +1458,7 @@ impl Db {
             Sym::Special(Special::SelfTy) => sc.self_ty.cloned().unwrap_or(Ty::Any),
             Sym::Special(Special::Tuple) => Ty::TupleVar(Box::new(Ty::Any)),
             Sym::Special(Special::Type) => Ty::Type(Box::new(Ty::Any)),
+            Sym::Special(Special::Callable) => Ty::Callable(None, Box::new(Ty::Any)),
             Sym::Any | Sym::Special(_) => Ty::Any,
             Sym::Value(_) | Sym::Module(_) | Sym::Func(_) | Sym::UserVar => {
                 self.err(sc.m, off, format!("`{what}` is not a type"));
@@ -1519,14 +1539,79 @@ impl Db {
             }
             (Ty::Type(a), Ty::Type(b)) => self.assign(a, b, s, any),
             (Ty::Exc(a), Ty::Exc(b)) => exc_sub(a, b),
+            (Ty::Callable(ps, r), Ty::Callable(qs, q)) => {
+                // Parameters are contravariant, the result covariant.
+                if let (Some(ps), Some(qs)) = (ps, qs) {
+                    if ps.len() != qs.len() {
+                        return false;
+                    }
+                    for (p, q) in ps.iter().zip(qs) {
+                        if !self.assign(q, p, s, any) {
+                            return false;
+                        }
+                    }
+                }
+                self.assign(r, q, s, any)
+            }
+            (Ty::Func(_) | Ty::Type(_) | Ty::Inst(..), Ty::Callable(..)) => match self.callable_of(src) {
+                Some(c) => self.assign(&c, dst, s, any),
+                None => false,
+            },
             (Ty::Inst(c, args), _) => self.inst_assign(*c, args, dst, s, any),
             (Ty::Str | Ty::Tuple(_) | Ty::TupleVar(_), Ty::Inst(..)) => match self.nominal(src) {
                 Some(n) => self.assign(&n, dst, s, any),
                 None => false,
             },
             (Ty::Module(a), Ty::Module(b)) => a == b,
+            (Ty::Func(a), Ty::Func(b)) => a == b,
             _ => false,
         }
+    }
+
+    /// The `Callable` type of a function, bound method, class (its
+    /// constructor) or instance with `__call__`: its positional parameters
+    /// and result, if it has a single signature.
+    pub fn callable_of(&mut self, t: &Ty) -> Option<Ty> {
+        let (f, skip, ret) = match t {
+            // The builtins the checker handles itself.
+            Ty::Func(FuncRef::Builtin("len")) => return Some(Ty::Callable(Some(vec![Ty::Any]), Box::new(Ty::Int))),
+            Ty::Func(FuncRef::Builtin("print")) => return Some(Ty::Callable(None, Box::new(Ty::None))),
+            Ty::Func(FuncRef::Builtin(_)) => return Some(Ty::Callable(None, Box::new(Ty::Any))),
+            Ty::Func(FuncRef::Def(f)) => (*f, 0, None),
+            Ty::Func(FuncRef::Bound(f, _)) => (*f, 1, None),
+            Ty::Type(inner) => {
+                let Ty::Inst(c, _) = &**inner else { return None };
+                match self.find_member(*c, "__init__") {
+                    Some((_, Member::Method(f))) => (f, 1, Some((**inner).clone())),
+                    _ => return Some(Ty::Callable(Some(Vec::new()), inner.clone())),
+                }
+            }
+            Ty::Inst(c, _) => match self.find_member(*c, "__call__") {
+                Some((_, Member::Method(f))) => (f, 1, None),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let sigs = self.sigs(f);
+        let [sig] = sigs.as_slice() else { return None };
+        let mut params = Vec::new();
+        for p in sig.params.iter().skip(skip) {
+            match p.kind {
+                PKind::PosOnly | PKind::PosOrKw if !p.default => params.push(p.ty.clone()),
+                PKind::KwOnly if !p.default => return None,
+                _ => {}
+            }
+        }
+        let mut sub = Subst::new();
+        // A bound method's `self` and its class's parameters come from
+        // the receiver.
+        if let Ty::Func(FuncRef::Bound(_, recv)) = t {
+            if let Some(p0) = sig.params.first() {
+                self.assign(recv, &p0.ty, &mut sub, &mut false);
+            }
+        }
+        let ret = ret.unwrap_or_else(|| deep_subst(&sig.ret, &sub));
+        Some(Ty::Callable(Some(params.iter().map(|p| deep_subst(p, &sub)).collect()), Box::new(ret)))
     }
 
     fn inst_assign(&mut self, c: ClassId, args: &[Ty], dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
@@ -1601,6 +1686,8 @@ impl Db {
             Ty::Var(v) => self.tvs[*v].name.clone(),
             Ty::Exc(n) => n.clone(),
             Ty::Union(v) => v.iter().map(|x| self.display(x)).collect::<Vec<_>>().join(" | "),
+            Ty::Callable(None, r) => format!("Callable[..., {}]", self.display(r)),
+            Ty::Callable(Some(ps), r) => format!("Callable[[{}], {}]", ps.iter().map(|x| self.display(x)).collect::<Vec<_>>().join(", "), self.display(r)),
         }
     }
 
@@ -1657,6 +1744,7 @@ impl Db {
             Ty::Type(x) => Ty::Type(Box::new(self.erase(x))),
             Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(self.erase(r)))),
             Ty::Union(v) => union(v.iter().map(|x| self.erase(x)).collect()),
+            Ty::Callable(ps, r) => Ty::Callable(ps.as_ref().map(|v| v.iter().map(|x| self.erase(x)).collect()), Box::new(self.erase(r))),
             t => t.clone(),
         }
     }
@@ -1708,6 +1796,7 @@ pub fn subst(t: &Ty, s: &Subst) -> Ty {
         Ty::Type(x) => Ty::Type(Box::new(subst(x, s))),
         Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(subst(r, s)))),
         Ty::Union(v) => union(v.iter().map(|x| subst(x, s)).collect()),
+        Ty::Callable(ps, r) => Ty::Callable(ps.as_ref().map(|v| v.iter().map(|x| subst(x, s)).collect()), Box::new(subst(r, s))),
         t => t.clone(),
     }
 }
@@ -1808,6 +1897,7 @@ pub fn erase_vars(t: &Ty) -> Ty {
         Ty::Inst(c, args) => Ty::Inst(*c, args.iter().map(erase_vars).collect()),
         Ty::Type(x) => Ty::Type(Box::new(erase_vars(x))),
         Ty::Union(v) => union(v.iter().map(erase_vars).collect()),
+        Ty::Callable(ps, r) => Ty::Callable(ps.as_ref().map(|v| v.iter().map(erase_vars).collect()), Box::new(erase_vars(r))),
         t => t.clone(),
     }
 }
@@ -1819,6 +1909,7 @@ pub fn has_any(t: &Ty) -> bool {
         Ty::Tuple(v) | Ty::Union(v) => v.iter().any(has_any),
         Ty::TupleVar(x) | Ty::Type(x) => has_any(x),
         Ty::Inst(_, args) => args.iter().any(has_any),
+        Ty::Callable(ps, r) => ps.as_ref().is_some_and(|v| v.iter().any(has_any)) || has_any(r),
         _ => false,
     }
 }
@@ -1833,6 +1924,10 @@ pub fn collect_vars(t: &Ty, out: &mut Vec<TvId>) {
         Ty::Tuple(v) | Ty::Union(v) => v.iter().for_each(|x| collect_vars(x, out)),
         Ty::TupleVar(x) | Ty::Type(x) => collect_vars(x, out),
         Ty::Inst(_, args) => args.iter().for_each(|x| collect_vars(x, out)),
+        Ty::Callable(ps, r) => {
+            ps.iter().flatten().for_each(|x| collect_vars(x, out));
+            collect_vars(r, out);
+        }
         _ => {}
     }
 }
@@ -1935,6 +2030,7 @@ fn special_sym(name: &str) -> Sym {
         "Never" | "NoReturn" => Special::Never,
         "Tuple" => Special::Tuple,
         "Type" => Special::Type,
+        "Callable" => Special::Callable,
         _ => return Sym::Any,
     })
 }
