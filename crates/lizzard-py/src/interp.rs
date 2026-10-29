@@ -46,6 +46,8 @@ pub struct FuncRt {
     pub(crate) mics: Vec<ops::MethodIc>,
     /// The interpreter's encoding of `ir.code` (`bytecode`).
     pub(crate) ops: Vec<bytecode::Op>,
+    /// A construction cache per instruction (used by `Call` of a class).
+    pub(crate) ctics: Vec<ops::CtorIc>,
     /// Per call site: the function its `direct` resolved to, once seen.
     pub(crate) cics: Vec<OnceLock<Arc<FuncRt>>>,
     /// A global-lookup cache per instruction (used by `LoadGlobal`).
@@ -108,8 +110,9 @@ impl FuncRt {
         let mics = ir.code.iter().map(|_| ops::MethodIc::default()).collect();
         let cics = ir.code.iter().map(|_| OnceLock::new()).collect();
         let ops = bytecode::lower(&ir);
+        let ctics = ir.code.iter().map(|_| ops::CtorIc::default()).collect();
         let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
-        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, ops, cics, gics, table })
+        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, table })
     }
 }
 
@@ -201,6 +204,7 @@ impl LizzardFunction {
     }
 
     /// The checks a call site may skip for this function (see `Direct`).
+    #[inline(always)]
     fn proven(&self, site: &FuncRt, pc: usize, direct: Option<&Direct>) -> u64 {
         let rt = &self.rt;
         match direct {
@@ -226,6 +230,7 @@ impl LizzardFunction {
     /// # Safety
     /// `out` has room for this function's registers and does not overlap
     /// the caller's.
+    #[inline(always)]
     pub(crate) unsafe fn bind_into(&self, py: Python<'_>, site: &FuncRt, pc: usize, direct: Option<&Direct>, regs: &Regs, slf: Option<*mut ffi::PyObject>, args: &[u32], out: *mut u64) -> Option<PyResult<()>> {
         let rt = &self.rt;
         let ir = &rt.ir;
@@ -819,7 +824,17 @@ fn run_interp<'py>(
                             Some(t) => {
                                 pop_frame(&mut stack, &t);
                                 p = t.ret_pc + 1;
-                                ret = Some((t.ret_dst, v));
+                                match t.instance {
+                                    None => ret = Some((t.ret_dst, v)),
+                                    // An `__init__`: the instance is the result.
+                                    Some(obj) => match init_returned(&v) {
+                                        Ok(()) => ret = Some((t.ret_dst, obj)),
+                                        Err(e) => {
+                                            p -= 1;
+                                            err = Some(e);
+                                        }
+                                    },
+                                }
                                 continue 'frame;
                             }
                             None => {
@@ -835,14 +850,14 @@ fn run_interp<'py>(
                         stack.reserve(FRAME_ROOM);
                         continue 'frame;
                     }
-                    Opc::Call => match call_or_frame(py, f, p, regs, &mut stack) {
+                    Opc::Call => match call_or_frame(py, f, p, regs, Some(&mut stack)) {
                         Ok(Called::Value(v)) => {
                             regs.set_obj(o.x, v);
                             NEXT
                         }
                         // An interpreted Lizzard function: run it here.
-                        Ok(Called::Frame(func, base)) => {
-                            let t = Callee { func, base, ret_pc: p, ret_dst: o.x };
+                        Ok(Called::Frame(func, base, instance)) => {
+                            let t = Callee { func, base, ret_pc: p, ret_dst: o.x, instance };
                             if frames.len() >= recursion_limit() {
                                 pop_frame(&mut stack, &t);
                                 err = Some(pyo3::exceptions::PyRecursionError::new_err("maximum recursion depth exceeded"));
@@ -877,7 +892,17 @@ fn run_interp<'py>(
                                 Some(t) => {
                                     pop_frame(&mut stack, &t);
                                     p = t.ret_pc + 1;
-                                    ret = Some((t.ret_dst, v));
+                                    match t.instance {
+                                        None => ret = Some((t.ret_dst, v)),
+                                        // An `__init__`: the instance is the result.
+                                        Some(obj) => match init_returned(&v) {
+                                            Ok(()) => ret = Some((t.ret_dst, obj)),
+                                            Err(e) => {
+                                                p -= 1;
+                                                err = Some(e);
+                                            }
+                                        },
+                                    }
                                     continue 'frame;
                                 }
                                 None => {
@@ -918,6 +943,8 @@ struct Callee<'py> {
     /// The caller's call instruction, and the register for the result.
     ret_pc: usize,
     ret_dst: u32,
+    /// For an `__init__` constructing it: the instance, the call's result.
+    instance: Option<Bound<'py, PyAny>>,
 }
 
 /// Slots kept free on the interpreter's stack for the next callee frame.
@@ -1054,15 +1081,18 @@ impl ArgList {
 
 /// What the interpreter does for a call: its result, or (calling an
 /// interpreted Lizzard function) the callee's frame, set up at `base` on the
-/// interpreter's stack, to run in the same loop.
+/// interpreter's stack, to run in the same loop; with the instance when the
+/// callee is the `__init__` of a class being constructed (the call's result).
 pub(crate) enum Called<'py> {
     Value(Bound<'py, PyAny>),
-    Frame(Bound<'py, LizzardFunction>, usize),
+    Frame(Bound<'py, LizzardFunction>, usize, Option<Bound<'py, PyAny>>),
 }
 
-/// `Call` or `CallMethod` at `pc`, for the interpreter: an interpreted
-/// Lizzard function with plain positional parameters comes back as a frame.
-pub(crate) fn call_or_frame<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs, stack: &mut Vec<u64>) -> PyResult<Called<'py>> {
+/// `Call` or `CallMethod` at `pc`. With the interpreter's `stack`, an
+/// interpreted Lizzard function (or the `__init__` of a class being
+/// constructed) comes back as a frame set up on it, to run in the same loop.
+#[inline(always)]
+pub(crate) fn call_or_frame<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs, mut stack: Option<&mut Vec<u64>>) -> PyResult<Called<'py>> {
     let (callee, slf, args, nkw, direct) = match &f.ir.code[pc] {
         Instr::Call { func, args, kwnames, direct, .. } => (regs.obj(py, *func)?.clone(), None, args, kwnames.len(), direct),
         Instr::CallMethod { obj, name, args, kwnames, direct, .. } => {
@@ -1081,90 +1111,143 @@ pub(crate) fn call_or_frame<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &
     if nkw == 0 && unsafe { ffi::Py_TYPE(c) } == lizzard_function_type() {
         // SAFETY: the type says what it is.
         let lf = unsafe { callee.clone().cast_into_unchecked::<LizzardFunction>() };
-        let interpreted = !jit::enabled() || jit::code(&lf.get().rt).is_none();
-        let n = lf.get().rt.objs.len();
-        // The stack keeps room for a frame this size (`FRAME_ROOM`), so it
-        // does not move while the caller's registers are read: bind
-        // straight into the new frame.
-        if interpreted && stack.capacity() - stack.len() >= n {
-            let base = stack.len();
-            // SAFETY: room reserved; zeroed slots are unbound.
-            let out = unsafe { stack.as_mut_ptr().add(base) };
-            unsafe { std::ptr::write_bytes(out, 0, n) };
-            // SAFETY: room for the frame, after the caller's registers.
-            if let Some(r) = unsafe { lf.get().bind_into(py, f, pc, direct.as_ref(), regs, slf, args, out) } {
-                // SAFETY: initialized above.
-                unsafe { stack.set_len(base + n) };
-                return match r {
-                    Ok(()) => Ok(Called::Frame(lf, base)),
-                    Err(e) => {
-                        let objs = &lf.get().rt.objs;
-                        crate::frame::release_slots(&mut stack[base..], objs);
-                        stack.truncate(base);
-                        Err(e)
-                    }
-                };
-            }
+        if let Some(r) = lizzard_call(py, f, pc, regs, stack.as_deref_mut(), lf, slf, args, direct.as_ref()) {
+            return r;
         }
-        if interpreted {
-            if let Some(a) = lf.get().args_for(py, f, pc, direct.as_ref(), regs, slf, args) {
-                let a = a?;
-                // Growing the stack may move it, and with it the caller's
-                // registers (`regs`): the arguments were read before.
-                let base = stack.len();
-                let n = lf.get().rt.objs.len();
-                stack.reserve(n);
-                // SAFETY: reserved; the parameters come first, the other
-                // registers start unbound.
-                unsafe {
-                    let s = stack.as_mut_ptr().add(base);
-                    let a = a.as_slice();
-                    for (i, &o) in a.iter().enumerate() {
-                        crate::rc::incref(o);
-                        *s.add(i) = o as u64;
-                    }
-                    std::ptr::write_bytes(s.add(a.len()), 0, n - a.len());
-                    stack.set_len(base + n);
-                }
-                return Ok(Called::Frame(lf, base));
-            }
-        } else if let Some(r) = lf.get().call_regs(py, f, pc, direct.as_ref(), regs, slf, args) {
-            return r.map(Called::Value);
+    }
+    // `C(args)` for a plain class (see `construct`).
+    // SAFETY: a type pointer comparison on a valid object.
+    if slf.is_none() && nkw == 0 && unsafe { ffi::Py_TYPE(c) } == &raw mut ffi::PyType_Type {
+        if let Some(r) = construct(py, f, pc, regs, stack.as_deref_mut(), c, args, direct.as_ref()) {
+            return r;
         }
     }
     vector_call(py, regs, slf, c, args, f.kwnames(pc)).map(Called::Value)
 }
 
-/// `Call` or `CallMethod` at `pc`: its result.
-///
-/// A Lizzard function with plain positional parameters gets its frame
-/// straight from the caller's registers. When the call site's `direct`
-/// says which function the checker resolved and that is the one called,
-/// the parameter checks the arguments' static types satisfy are skipped.
-pub(crate) fn call_at<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs) -> PyResult<Bound<'py, PyAny>> {
-    let (callee, slf, args, nkw, direct) = match &f.ir.code[pc] {
-        Instr::Call { func, args, kwnames, direct, .. } => (regs.obj(py, *func)?.clone(), None, args, kwnames.len(), direct),
-        Instr::CallMethod { obj, name, args, kwnames, direct, .. } => {
-            let o = regs.obj(py, *obj)?.as_ptr();
-            let name = f.names[*name as usize].as_ptr();
-            // SAFETY: valid objects; a new reference to the method comes back.
-            match unsafe { ops::method(&f.mics[pc], o, name) } {
-                Some(m) => (unsafe { Bound::from_owned_ptr(py, m) }, Some(o), args, kwnames.len(), direct),
-                None => return vector_call(py, regs, Some(o), name, args, f.kwnames(pc)),
+/// `C(args)` where `C` is a class: when the call site's cache says that
+/// constructing a `C` is allocating it and calling its `__init__` (as
+/// CPython's `CALL_ALLOC_AND_ENTER_INIT`), do that, with the instance first;
+/// a Lizzard `__init__` runs as a frame in the interpreter's loop when it
+/// can. None: the generic `type` call.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn construct<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs, mut stack: Option<&mut Vec<u64>>, c: *mut ffi::PyObject, args: &[u32], direct: Option<&Direct>) -> Option<PyResult<Called<'py>>> {
+    let tp = c as *mut ffi::PyTypeObject;
+    // SAFETY: `tp` is a class; a new reference to `__init__` comes back.
+    let init = unsafe { ops::ctor(&f.ctics[pc], tp, init_name(py), lizzard_function_type()) }?;
+    Some((|| {
+        let init = unsafe { Bound::from_owned_ptr(py, init) };
+        // SAFETY: the class's allocator (`object.__new__` only does this).
+        let obj = unsafe { Bound::from_owned_ptr_or_err(py, ((*tp).tp_alloc.unwrap())(tp, 0))? };
+        let o = obj.as_ptr();
+        // SAFETY: a type pointer comparison on a valid object.
+        if unsafe { ffi::Py_TYPE(init.as_ptr()) } == lizzard_function_type() {
+            // SAFETY: the type says what it is.
+            let lf = unsafe { init.clone().cast_into_unchecked::<LizzardFunction>() };
+            match lizzard_call(py, f, pc, regs, stack.as_deref_mut(), lf, Some(o), args, direct) {
+                Some(Ok(Called::Frame(lf, base, _))) => return Ok(Called::Frame(lf, base, Some(obj))),
+                Some(Ok(Called::Value(v))) => {
+                    init_returned(&v)?;
+                    return Ok(Called::Value(obj));
+                }
+                Some(Err(e)) => return Err(e),
+                // It needs the general binding: below.
+                None => {}
             }
         }
-        _ => unreachable!("call_at on another instruction"),
+        let v = vector_call(py, regs, Some(o), init.as_ptr(), args, None)?;
+        init_returned(&v)?;
+        Ok(Called::Value(obj))
+    })())
+}
+
+/// A call of Lizzard function `lf` with plain positional arguments (`slf`
+/// first): a frame on the interpreter's `stack` when it is interpreted and
+/// there is one, else its result. None when it needs the general binding.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn lizzard_call<'py>(
+    py: Python<'py>,
+    f: &FuncRt,
+    pc: usize,
+    regs: &Regs,
+    stack: Option<&mut Vec<u64>>,
+    lf: Bound<'py, LizzardFunction>,
+    slf: Option<*mut ffi::PyObject>,
+    args: &[u32],
+    direct: Option<&Direct>,
+) -> Option<PyResult<Called<'py>>> {
+    let interpreted = !jit::enabled() || jit::code(&lf.get().rt).is_none();
+    let Some(stack) = stack.filter(|_| interpreted) else {
+        return lf.get().call_regs(py, f, pc, direct, regs, slf, args).map(|r| r.map(Called::Value));
     };
-    let c = callee.as_ptr();
-    // SAFETY: a type pointer comparison on a valid object.
-    if nkw == 0 && unsafe { ffi::Py_TYPE(c) } == lizzard_function_type() {
-        // SAFETY: the type says what it is.
-        let lf = unsafe { callee.cast_unchecked::<LizzardFunction>() };
-        if let Some(r) = lf.get().call_regs(py, f, pc, direct.as_ref(), regs, slf, args) {
-            return r;
-        }
+    let n = lf.get().rt.objs.len();
+    // The stack keeps room for a frame this size (`FRAME_ROOM`), so it does
+    // not move while the caller's registers are read: bind straight into
+    // the new frame.
+    if stack.capacity() - stack.len() >= n {
+        let base = stack.len();
+        // SAFETY: room reserved; zeroed slots are unbound.
+        let out = unsafe { stack.as_mut_ptr().add(base) };
+        unsafe { std::ptr::write_bytes(out, 0, n) };
+        // SAFETY: room for the frame, after the caller's registers.
+        let r = unsafe { lf.get().bind_into(py, f, pc, direct, regs, slf, args, out) }?;
+        // SAFETY: initialized above.
+        unsafe { stack.set_len(base + n) };
+        return Some(match r {
+            Ok(()) => Ok(Called::Frame(lf, base, None)),
+            Err(e) => {
+                crate::frame::release_slots(&mut stack[base..], &lf.get().rt.objs);
+                stack.truncate(base);
+                Err(e)
+            }
+        });
     }
-    vector_call(py, regs, slf, c, args, f.kwnames(pc)).map(|v| v)
+    let a = match lf.get().args_for(py, f, pc, direct, regs, slf, args)? {
+        Ok(a) => a,
+        Err(e) => return Some(Err(e)),
+    };
+    // Growing the stack may move it, and with it the caller's registers
+    // (`regs`): the arguments were read before.
+    let base = stack.len();
+    stack.reserve(n);
+    // SAFETY: reserved; the parameters come first, the other registers
+    // start unbound.
+    unsafe {
+        let s = stack.as_mut_ptr().add(base);
+        let a = a.as_slice();
+        for (i, &o) in a.iter().enumerate() {
+            crate::rc::incref(o);
+            *s.add(i) = o as u64;
+        }
+        std::ptr::write_bytes(s.add(a.len()), 0, n - a.len());
+        stack.set_len(base + n);
+    }
+    Some(Ok(Called::Frame(lf, base, None)))
+}
+
+/// `__init__` must return None (CPython's message otherwise).
+#[inline]
+fn init_returned(v: &Bound<'_, PyAny>) -> PyResult<()> {
+    if v.is_none() {
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!("__init__() should return None, not '{}'", v.get_type().name()?)))
+}
+
+/// The interned string `"__init__"`.
+fn init_name(py: Python<'_>) -> *mut ffi::PyObject {
+    static NAME: PyOnceLock<Py<PyString>> = PyOnceLock::new();
+    NAME.get_or_init(py, || PyString::intern(py, "__init__").unbind()).as_ptr()
+}
+
+/// `Call` or `CallMethod` at `pc`: its result.
+pub(crate) fn call_at<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs) -> PyResult<Bound<'py, PyAny>> {
+    match call_or_frame(py, f, pc, regs, None)? {
+        Called::Value(v) => Ok(v),
+        Called::Frame(..) => unreachable!("no frames without the interpreter's stack"),
+    }
 }
 
 /// Call `callee` with `argv` (`nargs` positional, then keyword values named

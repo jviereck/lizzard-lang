@@ -263,6 +263,8 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
   - **in the instance's inline values**, CPython 3.13+'s storage for a plain class's instance attributes: an array right after the object, in the order of the type's shared keys. The attribute is at a fixed offset, read and written there directly, as CPython's own `LOAD_ATTR_INSTANCE_VALUE` / `STORE_ATTR_INSTANCE_VALUE` do and with their guards: the type has no attribute of that name and uses the generic getattr/setattr; on a read, the values are still valid (no detached `__dict__`) and a missing value takes the generic path (AttributeError, `__getattr__`); in the free-threaded build the reference is taken with `PyUnstable_TryIncRef` and a re-check of the slot (CPython's `_Py_TryIncrefCompare`); a store replaces an existing value only, under the object's critical section, with no `__dict__` object (first assignments take the generic path, which records the insertion order). This reads CPython-internal layouts (`Include/internal/pycore_dict.h`, `pycore_object.h`, 3.14): at start-up a probe class's attributes are read both ways, and the path stays off unless they agree (`lizzard._lizzard._stats()["inline_values"]`);
   - **in a `__slots__` member**, read and written with `PyMember_GetOne`/`SetOne`. The checker accepts `__slots__` and requires the attributes a class adds to be listed;
   - else nowhere it can reach: `PyObject_GetAttr`/`SetAttr`.
+- **Constructor caches.** A call site whose callee is a class caches, per `(class, version)`, that constructing an instance is allocating it and calling its `__init__`, as CPython's `CALL_ALLOC_AND_ENTER_INIT`: the class is a plain heap type whose metaclass is `type`, not abstract, with `object`'s `__new__` and allocator, and an `__init__` that is a Lizzard or Python function. The site then allocates (`tp_alloc`, all `object.__new__` does) and calls `__init__` with the instance first: a Lizzard `__init__` runs as a frame in the interpreter's loop, and the call's result is the instance (after checking that `__init__` returned None, with CPython's message). The checker resolves `C(args)` to `C.__init__`, so its proven argument checks are skipped too. Anything else (a custom `__new__`, a metaclass `__call__`, keyword arguments) takes `type.__call__`. Construction of `V(x, y)`: 4958 -> 4163 instructions per `a.add(d)` (CPython: 2008).
+- **First assignments in inline values.** An attribute store whose name is in the class's shared keys but not yet set on the instance (the assignments in `__init__`) also writes the inline value directly, appending the attribute's index to the values' insertion order as CPython's `STORE_ATTR_INSTANCE_VALUE` does, so `vars()` and `__dict__` list attributes in assignment order. The start-up probe checks this too. A store site does not cache "generic" while the class's shared keys lack the name (they gain it from the first instance's generic store without changing the class's version).
 - **Method caches.** A `CallMethod` site caches the method of one `(type, version)` when CPython's `LOAD_ATTR_METHOD_NO_DICT` / `..._WITH_VALUES` reasoning proves no instance attribute shadows it: the instances have no `__dict__`, or their attributes are in valid inline values whose shared keys lacked the name and have not grown since (keys only grow). The method (a method descriptor: a Lizzard or Python function, `list.append`, ...) is called with the object first; a Lizzard function directly.
 - **Checks are prepared once per site** (the class of a check is resolved once, not by name on every call), and pass on an exact type-pointer comparison before trying `isinstance`.
 - Cranelift is built optimized even in debug builds (workspace `Cargo.toml`); compiling then costs about a millisecond per function.
@@ -270,13 +272,13 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
   | | CPython | interpreter | JIT |
   |---|---|---|---|
-  | int loop (2M) | 0.107 s | 0.153 s | 0.140 s |
-  | `fib(25)` | 0.012 s | 0.027 s | 0.050 s |
-  | vector objects (500k `a.add(d)`) | 0.092 s | 0.230 s | 0.324 s |
-  | same, `__slots__` | 0.080 s | 0.204 s | 0.289 s |
-  | method calls updating attributes (500k) | 0.037 s | 0.077 s | 0.120 s |
-  | same, `__slots__` | 0.036 s | 0.078 s | 0.120 s |
-  | list build and scan (1M) | 0.105 s | 0.176 s | 0.135 s |
+  | int loop (2M) | 0.106 s | 0.149 s | 0.138 s |
+  | `fib(25)` | 0.008 s | 0.029 s | 0.045 s |
+  | vector objects (500k `a.add(d)`) | 0.080 s | 0.189 s | 0.290 s |
+  | same, `__slots__` | 0.076 s | 0.182 s | 0.255 s |
+  | method calls updating attributes (500k) | 0.036 s | 0.084 s | 0.113 s |
+  | same, `__slots__` | 0.035 s | 0.081 s | 0.114 s |
+  | list build and scan (1M) | 0.099 s | 0.168 s | 0.135 s |
 
 **Interpreter performance.** `crates/lizzard-py/bench/count.sh` counts machine instructions per unit of work with Valgrind (deterministic, unlike timings). At first the interpreter needed 3.9x CPython's instructions per loop iteration, 5.0x per method call and 6.8x per `fib` call. The causes, measured, and what was done:
 - **Dispatch was half the time.** Each instruction went through `step`, one large function returning `PyResult<Option<Exit>>`: about 45 machine instructions of overhead each. The interpreter loop now runs the common instructions itself on the raw slots, with the helpers compiled code uses (`ops.rs`), and handles exceptions only when one is raised; the rest still go through `step`.
@@ -293,7 +295,7 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
   4. **Calls without C recursion**: the interpreter runs calls between interpreted Lizzard functions in one loop. A callee's registers are a window on a stack of slots the loop owns (room for the next frame is reserved before the caller's registers are read, so binding never moves them); a return or an exception leaving the callee pops it and continues in the caller. Recursion is bounded by `sys.getrecursionlimit()` with CPython's `RecursionError: maximum recursion depth exceeded`, not by the C stack. Its cost per call matches the native recursion it replaces (Rust's calls were already cheap), so the gain is depth and CPython's limit, not speed.
   What remains:
   - **The JIT** uses none of steps 2-4 yet (it runs the IR, recurses through `call_at`), so on call-heavy code it is now slower than the interpreter; it should compile from the bytecode and push frames the same way.
-  - **Constructing instances** (`V(x, y)`) goes through `type.__call__`, `__new__` and a lookup of `__init__`; CPython specializes the whole sequence.
+  - **Constructing instances** cost twice CPython's (`a.add(d)`, which builds a `V`: 4163 instructions against 2008), the allocation and its `__init__` frame. See below for what changed.
   - **Result checks** after operations whose operands are not exact builtins (a `float` attribute read from an instance is checked when read).
 - Every test program runs compiled and interpreted, and both must match CPython.
 

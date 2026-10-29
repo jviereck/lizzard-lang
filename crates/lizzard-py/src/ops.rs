@@ -124,6 +124,24 @@ mod inline {
         unsafe { (*((o as *mut u8).offset(MANAGED_DICT) as *const AtomicPtr<ffi::PyObject>)).load(Ordering::Acquire).is_null() }
     }
 
+    /// Record a first assignment of the value at `off` in the insertion
+    /// order (`_PyDictValues_AddToInsertionOrder`): the order array follows
+    /// `values[capacity]`. False when the index or the array has no room.
+    pub unsafe fn add_to_order(o: *mut ffi::PyObject, off: usize) -> bool {
+        unsafe {
+            let v = values(o);
+            let capacity = *v as usize;
+            let size = *v.add(1) as usize;
+            let ix = (off - (*ffi::Py_TYPE(o)).tp_basicsize as usize - VALUES) / 8;
+            if ix >= capacity || size >= capacity {
+                return false;
+            }
+            *v.add(VALUES + 8 * capacity + size) = ix as u8;
+            *v.add(1) = (size + 1) as u8;
+            true
+        }
+    }
+
     /// The offset of `name`'s value from an instance of `tp`, if its
     /// instances keep `name` in inline values. The caller has checked that
     /// the type has no attribute `name` and uses the generic getattr.
@@ -197,6 +215,34 @@ mod inline {
                     crate::rc::decref(name);
                 }
             }
+            // First assignments: on a fresh instance, store `b` then `a`
+            // the way compiled code does, and ask CPython what it sees.
+            if ok {
+                let q = ffi::PyObject_CallNoArgs(ffi::Py_TYPE(p) as *mut ffi::PyObject);
+                ok &= !q.is_null();
+                if ok {
+                    for (n, v) in [(c"b", c"x"), (c"a", c"y")] {
+                        let name = ffi::PyUnicode_InternFromString(n.as_ptr());
+                        let val = ffi::PyUnicode_FromString(v.as_ptr());
+                        ok &= match offset(ffi::Py_TYPE(q), name) {
+                            Some(off) => store_value(q, off, val),
+                            None => false,
+                        };
+                        crate::rc::decref(val);
+                        crate::rc::decref(name);
+                    }
+                    ffi::PyDict_SetItemString(globals, c"_q".as_ptr(), q);
+                    crate::rc::decref(q);
+                    let check = c"list(vars(_q).items()) == [('b', 'x'), ('a', 'y')] and _q.a == 'y' and not hasattr(_q, 'c')";
+                    let r = ffi::PyRun_String(check.as_ptr(), ffi::Py_eval_input, globals, globals);
+                    ok &= !r.is_null() && r == ffi::Py_True();
+                    if r.is_null() {
+                        ffi::PyErr_Clear();
+                    } else {
+                        crate::rc::decref(r);
+                    }
+                }
+            }
             crate::rc::decref(globals);
             ON.store(ok, Ordering::Relaxed);
         }
@@ -245,6 +291,12 @@ unsafe fn lookup(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject, s
             };
             match (generic && inline::ON.load(Ordering::Relaxed)).then(|| inline::offset(tp, name)).flatten() {
                 Some(off) => Where::Inline(off),
+                // The class keeps instance attributes inline but has not
+                // seen this name yet (its first instance is being set up):
+                // the generic path adds it to the shared keys, which do not
+                // change the class's version. Look again next time (the
+                // miss counts, so a name that never arrives stops this).
+                None if generic && inline::ON.load(Ordering::Relaxed) && inline::shared_keys(tp).is_some() => return Where::Generic,
                 None => Where::Generic,
             }
         } else {
@@ -352,6 +404,69 @@ pub unsafe fn method(ic: &MethodIc, o: *mut ffi::PyObject, name: *mut ffi::PyObj
     }
 }
 
+/// A construction site's cache (`C(args)` where `C` is a class), as
+/// CPython's `CALL_ALLOC_AND_ENTER_INIT`: for one class and version,
+/// creating an instance is allocating it and calling its `__init__`. That
+/// holds when the class is a heap type, not abstract, with `object`'s
+/// `__new__` (which only allocates) and allocator, and an `__init__` that is
+/// a Python or Lizzard function (so its `tp_init` calls it). The caller
+/// checks that the class's metaclass is `type` itself (no custom
+/// `__call__`). Any change to the class or a base changes its version.
+#[derive(Default)]
+pub struct CtorIc {
+    entry: AtomicPtr<CtorEntry>,
+    misses: AtomicU32,
+}
+
+struct CtorEntry {
+    tp: *mut ffi::PyTypeObject,
+    version: u32,
+    /// Borrowed from the class's dict (alive while the version holds), and
+    /// enabled for `PyUnstable_TryIncRef`.
+    init: *mut ffi::PyObject,
+}
+
+const TPFLAGS_IS_ABSTRACT: std::ffi::c_ulong = 1 << 20;
+
+/// The `__init__` (a new reference) when constructing an instance of `tp`
+/// is allocating it and calling that; else None (the generic `type` call).
+pub unsafe fn ctor(ic: &CtorIc, tp: *mut ffi::PyTypeObject, init_name: *mut ffi::PyObject, lizzard_function: *mut ffi::PyTypeObject) -> Option<*mut ffi::PyObject> {
+    unsafe {
+        let e = ic.entry.load(Ordering::Acquire);
+        if !e.is_null() && (*e).tp == tp && (*e).version == (*tp).tp_version_tag {
+            return (PyUnstable_TryIncRef((*e).init) == 1).then_some((*e).init);
+        }
+        if ic.misses.load(Ordering::Relaxed) >= IC_MAX_MISSES {
+            return None;
+        }
+        ic.misses.fetch_add(1, Ordering::Relaxed);
+        let flags = ffi::PyType_GetFlags(tp);
+        let plain = flags & ffi::Py_TPFLAGS_HEAPTYPE != 0
+            && flags & TPFLAGS_IS_ABSTRACT == 0
+            && (*tp).tp_new.map(|f| f as *const () as usize) == ffi::PyBaseObject_Type.tp_new.map(|f| f as *const () as usize)
+            && (*tp).tp_alloc.map(|f| f as *const () as usize) == Some(ffi::PyType_GenericAlloc as *const () as usize);
+        if !plain || PyUnstable_Type_AssignVersionTag(tp) == 0 {
+            return None;
+        }
+        let version = (*tp).tp_version_tag;
+        let init = _PyType_LookupRef(tp, init_name);
+        if init.is_null() {
+            return None;
+        }
+        let it = ffi::Py_TYPE(init);
+        if it != lizzard_function && it != &raw mut ffi::PyFunction_Type {
+            ffi::Py_DecRef(init);
+            return None;
+        }
+        PyUnstable_EnableTryIncRef(init);
+        // As for the other caches, replaced entries are not freed.
+        ic.entry.store(Box::into_raw(Box::new(CtorEntry { tp, version, init })), Ordering::Release);
+        // `init` is the new reference returned; the entry's is borrowed from
+        // the class's dict.
+        Some(init)
+    }
+}
+
 /// A new reference to the value at `slot` (an inline value of a live
 /// object), or null. In the free-threaded build another thread may replace
 /// and release it meanwhile: as CPython's `_Py_TryIncrefCompare`, take the
@@ -386,9 +501,11 @@ unsafe extern "C" {
     fn PyCriticalSection_End(c: *mut [usize; 2]);
 }
 
-/// Replace an existing inline value (not a first assignment, which also
-/// records the insertion order: that is the generic path's job). Returns
-/// false to take the generic path.
+/// Store an inline value at `off`, as CPython's `STORE_ATTR_INSTANCE_VALUE`:
+/// replace the existing value, or (a first assignment) set it and append its
+/// index to the values' insertion order, which `vars()` and `__dict__`
+/// follow. Returns false to take the generic path (a `__dict__` object
+/// exists, the values are detached, or no room for the index).
 #[inline]
 unsafe fn store_value(o: *mut ffi::PyObject, off: usize, v: *mut ffi::PyObject) -> bool {
     unsafe {
@@ -399,14 +516,17 @@ unsafe fn store_value(o: *mut ffi::PyObject, off: usize, v: *mut ffi::PyObject) 
         PyCriticalSection_Begin(&mut cs, o);
         let slot = (o as *mut u8).add(off) as *const AtomicPtr<ffi::PyObject>;
         let old = (*slot).load(Ordering::Relaxed);
-        let ok = !old.is_null() && inline::valid(o) && inline::no_dict(o);
+        let mut ok = inline::valid(o) && inline::no_dict(o);
+        if ok && old.is_null() {
+            ok = inline::add_to_order(o, off);
+        }
         if ok {
             crate::rc::incref(v);
             (*slot).store(v, Ordering::Release);
         }
         #[cfg(Py_GIL_DISABLED)]
         PyCriticalSection_End(&mut cs);
-        if ok {
+        if ok && !old.is_null() {
             crate::rc::decref(old);
         }
         ok

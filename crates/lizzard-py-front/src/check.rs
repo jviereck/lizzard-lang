@@ -3192,6 +3192,15 @@ impl<'a> Lower<'a> {
         let (f, recv) = match callee {
             Ty::Func(FuncRef::Def(f)) => (*f, None),
             Ty::Func(FuncRef::Bound(f, r)) => (*f, Some((**r).clone())),
+            // `C(args)`: the runtime calls `C.__init__` with the new
+            // instance first, when the class is constructed plainly.
+            Ty::Type(inner) => match &**inner {
+                Ty::Inst(c, _) if self.db.is_user_class(*c) => match self.db.find_member(*c, "__init__") {
+                    Some((_, Member::Method(f))) => (f, Some((**inner).clone())),
+                    _ => return None,
+                },
+                _ => return None,
+            },
             _ => return None,
         };
         let (m, owner, name) = (self.db.funcs[f].m, self.db.funcs[f].owner, self.db.funcs[f].name.clone());

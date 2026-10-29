@@ -37,6 +37,7 @@ REBINDING = HERE / "programs" / "rebinding.py"
 NUMBERS = HERE / "programs" / "arith_edges.py"
 INSTANCE_ATTRS = HERE / "programs" / "instance_attrs.py"
 FRAMES = HERE / "programs" / "frames.py"
+CONSTRUCTORS = HERE / "programs" / "constructors.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -176,7 +177,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS, FRAMES):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS, FRAMES, CONSTRUCTORS):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])
