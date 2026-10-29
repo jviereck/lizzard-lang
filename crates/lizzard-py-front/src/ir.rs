@@ -216,6 +216,9 @@ pub struct ParamIr {
 pub struct FuncIr {
     /// The qualified name: `f`, or `C.m` for a method.
     pub name: String,
+    /// How the module finds it: the name, or `C.x.setter` for a property
+    /// setter.
+    pub key: String,
     pub file: String,
     pub line: u32,
     /// Parameters occupy registers `0..params.len()` (all `Obj`).

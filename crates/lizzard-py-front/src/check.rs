@@ -604,12 +604,14 @@ impl<'a> Lower<'a> {
     fn function(&mut self, d: &ast::StmtFunctionDef, owner: Option<ClassId>) -> Option<FuncIr> {
         let off = self.at(d);
         let name = d.name.as_str();
-        if d.is_async || d.type_params.is_some() {
-            self.err(off, "async and generic functions are not supported by Lizzard yet");
+        if d.is_async {
+            self.err(off, "async functions are not supported by Lizzard yet");
             return None;
         }
+        let is_setter = is_accessor(d, name, "setter");
         for dec in &d.decorator_list {
-            let ok = owner.is_some() && matches!(&dec.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod" | "property"));
+            let ok = owner.is_some()
+                && (matches!(&dec.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod" | "property")) || is_setter);
             if !ok {
                 let what = if owner.is_some() { "decorators other than @staticmethod, @classmethod and @property" } else { "decorated functions" };
                 self.err(dec.range().start().into(), format!("{what} are not supported by Lizzard yet"));
@@ -622,6 +624,10 @@ impl<'a> Lower<'a> {
                 _ => return None,
             },
             Some(c) => match self.db.class_member(c, name) {
+                Some(Member::Property(f)) if is_setter => match self.db.property_setter(f) {
+                    Some(sf) => sf,
+                    None => return None,
+                },
                 Some(Member::Method(f) | Member::Property(f)) => f,
                 _ => return None,
             },
@@ -640,14 +646,22 @@ impl<'a> Lower<'a> {
         if owner.is_some() && name == "__init__" && sig.ret != Ty::None {
             self.err(d.name.range().start().into(), "`__init__` must return None");
         }
+        let qual_key = qual.clone();
         let line = self.db.files[self.file].line_col(off).0;
         let path = self.db.files[self.file].path.clone();
+        // Its type variables (its own, its class's, `Self`) are rigid in
+        // the body.
         let saved_rigid = self.db.rigid.clone();
+        let mut rigid = Vec::new();
         if let Some(c) = owner {
-            let mut rigid = self.db.class_params(c);
+            rigid = self.db.class_params(c);
             rigid.push(self.db.self_tv(c));
-            self.db.rigid = rigid;
         }
+        for p in &sig.params {
+            collect_vars(&p.ty, &mut rigid);
+        }
+        collect_vars(&sig.ret, &mut rigid);
+        self.db.rigid = rigid;
         let mut l = Lower::new(self.db, self.m, self.file, false, qual, sig.ret.clone());
         l.at(d);
         let mut keys = Vec::new();
@@ -685,6 +699,7 @@ impl<'a> Lower<'a> {
             names: l.names,
             checks: l.checks,
             handlers: l.handlers,
+            key: if is_setter { format!("{qual_key}.setter") } else { qual_key },
         };
         self.db.rigid = saved_rigid;
         Some(ir)
@@ -2251,8 +2266,15 @@ impl<'a> Lower<'a> {
                     self.err(off, format!("cannot assign to method `{name}`"));
                     val
                 }
-                Some((_, Member::Property(_))) => {
-                    self.err(off, format!("cannot assign to property `{name}`"));
+                Some((_, Member::Property(f))) => {
+                    match self.db.property_setter(f) {
+                        Some(sf) => {
+                            if let Err(m) = self.resolve(sf, Some(inst_ty.clone()), std::slice::from_ref(&val.ty), &[], None) {
+                                self.err(off, m.replacen(&format!("{name}()"), &format!("the setter of `{name}`"), 1));
+                            }
+                        }
+                        None => self.err(off, format!("property `{name}` has no setter")),
+                    }
                     val
                 }
                 None if self.db.has_any_base(*c) => val,
@@ -2702,7 +2724,16 @@ impl<'a> Lower<'a> {
         let mut any = false;
         for (name, want, got) in pairs {
             if !self.db.assign(&got, &want, &mut s, &mut any) {
-                let expected = self.db.erase(&deep_subst(&want, &s));
+                // Unsolved bounded variables read as their bounds.
+                let mut vars = Vec::new();
+                collect_vars(&want, &mut vars);
+                let mut shown = s.clone();
+                for v in vars {
+                    if let (false, Some(b)) = (shown.contains_key(&v), self.db.tvs[v].bound.clone()) {
+                        shown.insert(v, b);
+                    }
+                }
+                let expected = self.db.erase(&deep_subst(&want, &shown));
                 return Err(Mismatch::Arg { name, expected, got });
             }
         }

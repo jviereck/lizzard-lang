@@ -301,3 +301,27 @@ fn variadic_and_keyword_only_parameters() {
         ]
     );
 }
+
+#[test]
+fn property_setters_check_assigned_values() {
+    let d = check(
+        "class P:\n    def __init__(self) -> None:\n        self._x: int = 0\n\n    @property\n    def x(self) -> int:\n        return self._x\n\n    @x.setter\n    def x(self, v: int) -> None:\n        self._x = v\n\n    @property\n    def y(self) -> int:\n        return 1\n\ndef f(p: P) -> None:\n    p.x = 3\n    p.x = \"s\"\n    p.y = 2\n    s: str = p.x\n",
+    );
+    assert_eq!(d, ["argument `v` of the setter of `x`: expected int, got str", "property `y` has no setter", "cannot assign int to `s` of type str"]);
+}
+
+#[test]
+fn generic_functions_are_checked_in_their_body_and_at_calls() {
+    let d = check(
+        "from typing import TypeVar\nT = TypeVar(\"T\")\n\nclass Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef first[U](xs: list[U]) -> U:\n    return xs[0]\n\ndef wrong[U](x: U) -> U:\n    return 1\n\ndef ident(x: T) -> T:\n    y: int = x\n    return x\n\ndef big[S: Shape](xs: list[S]) -> S:\n    a: float = xs[0].area()\n    return xs[0]\n\ndef f() -> None:\n    n: str = first([1])\n    s: Shape = big([Shape()])\n    big([1])\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "`wrong` returns U, but this returns int",
+            "cannot assign T to `y` of type int",
+            "cannot assign int to `n` of type str",
+            "argument `xs` of big(): expected list[Shape], got list[int]",
+        ]
+    );
+}

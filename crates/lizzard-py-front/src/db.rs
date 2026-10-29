@@ -290,6 +290,8 @@ pub struct Db {
     pub rigid: Vec<TvId>,
     /// The types of Lizzard modules' globals (from their top level).
     pub globals: HashMap<(ModId, String), Ty>,
+    /// Property getters' setters.
+    setters: HashMap<FuncId, FuncId>,
 }
 
 /// Lizzard's definitions for the builtins it types (see the file's header).
@@ -302,6 +304,11 @@ fn is_name(e: &Expr, s: &str) -> bool {
         Expr::Attribute(a) => a.attr.as_str() == s,
         _ => false,
     }
+}
+
+/// Decorated `@name.which` (`@x.setter`).
+pub fn is_accessor(d: &ast::StmtFunctionDef, name: &str, which: &str) -> bool {
+    d.decorator_list.iter().any(|dec| matches!(&dec.expression, Expr::Attribute(a) if a.attr.as_str() == which && matches!(&*a.value, Expr::Name(n) if n.id.as_str() == name)))
 }
 
 fn decorated(d: &ast::StmtFunctionDef, name: &str) -> bool {
@@ -377,6 +384,7 @@ impl Db {
             warnings: Vec::new(),
             rigid: Vec::new(),
             globals: HashMap::new(),
+            setters: HashMap::new(),
         }
     }
 
@@ -1123,6 +1131,11 @@ impl Db {
         None
     }
 
+    /// The setter of property getter `f`.
+    pub fn property_setter(&self, f: FuncId) -> Option<FuncId> {
+        self.setters.get(&f).copied()
+    }
+
     pub fn method_kind(&self, f: FuncId) -> MethodKind {
         let defs = &self.funcs[f].defs;
         if defs.iter().any(|(d, _)| decorated(d, "staticmethod")) {
@@ -1166,7 +1179,14 @@ impl Db {
                 .collect();
             if !defs.is_empty() {
                 let prop = defs.iter().any(|(d, _)| decorated(d, "property"));
+                // `@name.setter` defs are the property's setter.
+                let (setters, defs): (Vec<_>, Vec<_>) = defs.into_iter().partition(|(d, _)| is_accessor(d, name, "setter"));
                 let f = self.func_for(m, Some(c), name, defs);
+                if prop && !setters.is_empty() {
+                    let sf = self.func_for(m, Some(c), &format!("{name}.setter"), setters);
+                    self.funcs[sf].name = name.to_string();
+                    self.setters.insert(f, sf);
+                }
                 found = Some(if prop { Member::Property(f) } else { Member::Method(f) });
                 break;
             }

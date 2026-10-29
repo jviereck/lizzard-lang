@@ -84,12 +84,19 @@ def run_source(source, path, module):
         namespace.pop("__lizzard_functions__", None)
 
 
+def _is_setter(dec, name):
+    return isinstance(dec, ast.Attribute) and dec.attr == "setter" and isinstance(dec.value, ast.Name) and dec.value.id == name
+
+
 def _replace_defs(body, functions, prefix):
     """Replace each checked ``def`` (and method, ``Class.name``) by its Lizzard
     function, with the same decorators applied."""
     for i, node in enumerate(body):
-        if isinstance(node, ast.FunctionDef) and prefix + node.name in functions:
-            value = ast.Subscript(ast.Name("__lizzard_functions__", ast.Load()), ast.Constant(prefix + node.name), ast.Load())
+        key = prefix + node.name if isinstance(node, ast.FunctionDef) else None
+        if key and any(_is_setter(d, node.name) for d in node.decorator_list):
+            key += ".setter"
+        if key in functions:
+            value = ast.Subscript(ast.Name("__lizzard_functions__", ast.Load()), ast.Constant(key), ast.Load())
             for dec in reversed(node.decorator_list):
                 value = ast.Call(dec, [value], [])
             body[i] = ast.copy_location(ast.Assign([ast.Name(node.name, ast.Store())], value), node)

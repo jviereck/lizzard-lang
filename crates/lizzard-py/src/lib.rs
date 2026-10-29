@@ -23,12 +23,12 @@ struct CompiledModule {
 #[pymethods]
 impl CompiledModule {
     fn function_names(&self) -> Vec<String> {
-        self.funcs.iter().map(|f| f.ir.name.clone()).collect()
+        self.funcs.iter().map(|f| f.ir.key.clone()).collect()
     }
 
     /// The function `name`, with `globals` as its module namespace.
     fn make_function(&self, name: &str, globals: Bound<'_, PyDict>) -> PyResult<LizzardFunction> {
-        let f = self.funcs.iter().find(|f| f.ir.name == name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_string()))?;
+        let f = self.funcs.iter().find(|f| f.ir.key == name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_string()))?;
         let module = match globals.get_item("__name__")? {
             Some(n) => n.extract()?,
             None => String::new(),
