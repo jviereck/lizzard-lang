@@ -83,8 +83,8 @@ fn overlay_with_wrong_version_is_ignored() {
 
 #[test]
 fn unsupported_constructs_are_reported() {
-    let d = check("def g() -> None:\n    with g():\n        pass\n\ndef f(x: int | None) -> None:\n    pass\n");
-    assert_eq!(d, ["this statement is not supported by Lizzard yet", "union types are not supported by Lizzard yet"]);
+    let d = check("def g() -> None:\n    match 1:\n        case _:\n            pass\n\ndef h() -> None:\n    x = yield 1\n");
+    assert_eq!(d, ["this statement is not supported by Lizzard yet", "this expression is not supported by Lizzard yet"]);
 }
 
 #[test]
@@ -203,4 +203,35 @@ fn iteration_comprehensions_and_membership() {
             "int is not iterable",
         ]
     );
+}
+
+#[test]
+fn optional_values_must_be_narrowed() {
+    let d = check(
+        "class N:\n    def __init__(self) -> None:\n        self.v: int = 1\n        self.next: N | None = None\n\ndef f(n: N, xs: list[int] | None, s: str | None) -> int:\n    a = n.next.v\n    b = len(xs)\n    c: int = s\n    if n.next is not None:\n        a = n.next.v\n    if xs is None:\n        return 0\n    if s:\n        a += len(s)\n    return a + len(xs)\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "cannot read attribute `v` of N | None: the value may be None (check `is not None` first)",
+            "list[int] | None has no len()",
+            "cannot assign str | None to `c` of type int",
+        ]
+    );
+}
+
+#[test]
+fn narrowing_by_isinstance_and_or_and_loops() {
+    let d = check(
+        "class A:\n    def a(self) -> int:\n        return 1\n\nclass B:\n    def b(self) -> int:\n        return 2\n\ndef f(x: A | B | None, y: int | str) -> int:\n    if x is None or isinstance(x, A):\n        return 0\n    n: int = x.b()\n    if isinstance(y, str):\n        y = len(y)\n    m: int = y\n    z: int | None = None\n    while z is None or z < 3:\n        z = (z or 0) + 1\n    w: int = z\n    for i in range(3):\n        q: int = z\n        z = None\n    return n\n",
+    );
+    assert_eq!(d, ["cannot assign int | None to `q` of type int"]);
+}
+
+#[test]
+fn unions_distribute_over_members() {
+    let d = check(
+        "class C:\n    def area(self) -> float:\n        return 1.0\n\nclass S:\n    def area(self) -> int:\n        return 1\n\ndef f(s: C | S, t: int | float, u: list[int] | list[str]) -> None:\n    a: float = s.area()\n    b: int = s.area()\n    c: float = t * 2\n    for x in u:\n        d: int = x\n    e = t if t else None\n    g: float = e\n",
+    );
+    assert_eq!(d, ["cannot assign float | int to `b` of type int", "cannot assign int | str to `d` of type int", "cannot assign int | float | None to `g` of type float"]);
 }

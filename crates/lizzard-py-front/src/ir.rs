@@ -64,6 +64,8 @@ pub enum RtCheck {
     /// A `numpy.ndarray`, optionally with a known scalar type (`dtype.type`)
     /// and number of dimensions.
     NdArray { scalar: Option<String>, ndim: Option<u32> },
+    /// Any of the checks.
+    Union(Vec<RtCheck>),
 }
 
 #[derive(Clone, Debug)]

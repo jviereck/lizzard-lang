@@ -84,6 +84,8 @@ pub enum Ty {
     Var(TvId),
     /// An instance of a builtin exception class.
     Exc(String),
+    /// `A | B`, flattened, without duplicates, two or more members.
+    Union(Vec<Ty>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -439,7 +441,7 @@ impl Db {
         }
         let top = name.split('.').next().unwrap_or(name);
         let kind = match name {
-            "typing" | "typing_extensions" => Some(ModKind::Typing),
+            "typing" | "typing_extensions" | "collections.abc" => Some(ModKind::Typing),
             "builtins" => Some(ModKind::Builtins),
             _ if self.env.stdlib.contains(top) => Some(ModKind::Opaque),
             _ => None,
@@ -763,7 +765,11 @@ impl Db {
             return Some(s.clone());
         }
         let s = match self.modules[m].kind {
-            ModKind::Typing => special_sym(name),
+            ModKind::Typing => match name {
+                "Iterable" | "Iterator" | "Sequence" => self.builtin(name),
+                "List" | "Dict" | "Set" | "FrozenSet" => self.builtin(&name.to_lowercase()),
+                _ => special_sym(name),
+            },
             ModKind::Builtins if !matches!(builtin_sym(name), Sym::Any) || !self.modules[m].decls.contains_key(name) => builtin_sym(name),
             ModKind::Opaque => Sym::Any,
             ModKind::Files | ModKind::Builtins => {
@@ -1357,10 +1363,17 @@ impl Db {
                         _ => Ty::Any,
                     },
                     Some(Sym::Special(Special::Final | Special::ClassVar)) => args.first().map_or(Ty::Any, |a| self.eval_type(a, sc)),
-                    Some(Sym::Special(Special::Union | Special::Optional)) => {
-                        self.err(sc.m, off, "union types are not supported by Lizzard yet");
-                        Ty::Any
+                    Some(Sym::Special(Special::Union)) if self.unions_ok(sc.m) => {
+                        let members = args.iter().map(|a| self.eval_type(a, sc)).collect();
+                        union(members)
                     }
+                    Some(Sym::Special(Special::Optional)) if self.unions_ok(sc.m) => {
+                        let t = args.first().map_or(Ty::Any, |a| self.eval_type(a, sc));
+                        union(vec![t, Ty::None])
+                    }
+                    // Other definition files use unions mostly for parameters
+                    // built from protocols, which are not modelled yet.
+                    Some(Sym::Special(Special::Union | Special::Optional)) => Ty::Any,
                     _ => {
                         self.err(sc.m, off, "not a generic type");
                         Ty::Any
@@ -1368,14 +1381,23 @@ impl Db {
                 }
             }
             Expr::BinOp(b) if b.op == ast::Operator::BitOr => {
-                self.err(sc.m, off, "union types are not supported by Lizzard yet");
-                Ty::Any
+                if !self.unions_ok(sc.m) {
+                    return Ty::Any;
+                }
+                let (l, r) = (self.eval_type(&b.left, sc), self.eval_type(&b.right, sc));
+                union(vec![l, r])
             }
             _ => {
                 self.err(sc.m, off, "not a type");
                 Ty::Any
             }
         }
+    }
+
+    /// Whether unions in module `m` are types (Lizzard modules and the bundled
+    /// builtins) or `Any` (other definition files).
+    fn unions_ok(&self, m: ModId) -> bool {
+        self.modules[m].user || self.modules[m].kind == ModKind::Builtins
     }
 
     fn sym_type(&mut self, s: Sym, sc: &Scope, off: u32, what: &str) -> Ty {
@@ -1432,6 +1454,26 @@ impl Db {
                     true
                 }
             };
+        }
+        if matches!(dst, Ty::Any | Ty::Object) {
+            return true;
+        }
+        if let Ty::Union(ms) = src {
+            return ms.iter().all(|m| self.assign(m, dst, s, any));
+        }
+        if let Ty::Union(ms) = dst {
+            if ms.contains(src) {
+                return true;
+            }
+            for m in ms {
+                let (mut s2, mut any2) = (s.clone(), *any);
+                if self.assign(src, m, &mut s2, &mut any2) {
+                    *s = s2;
+                    *any = any2;
+                    return true;
+                }
+            }
+            return false;
         }
         match (src, dst) {
             (_, Ty::Any | Ty::Object) => true,
@@ -1535,6 +1577,7 @@ impl Db {
             Ty::Func(_) => "function".into(),
             Ty::Var(v) => self.tvs[*v].name.clone(),
             Ty::Exc(n) => n.clone(),
+            Ty::Union(v) => v.iter().map(|x| self.display(x)).collect::<Vec<_>>().join(" | "),
         }
     }
 
@@ -1590,6 +1633,7 @@ impl Db {
             Ty::Inst(c, args) => Ty::Inst(*c, args.iter().map(|x| self.erase(x)).collect()),
             Ty::Type(x) => Ty::Type(Box::new(self.erase(x))),
             Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(self.erase(r)))),
+            Ty::Union(v) => union(v.iter().map(|x| self.erase(x)).collect()),
             t => t.clone(),
         }
     }
@@ -1640,7 +1684,41 @@ pub fn subst(t: &Ty, s: &Subst) -> Ty {
         Ty::Inst(c, args) => Ty::Inst(*c, args.iter().map(|x| subst(x, s)).collect()),
         Ty::Type(x) => Ty::Type(Box::new(subst(x, s))),
         Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(subst(r, s)))),
+        Ty::Union(v) => union(v.iter().map(|x| subst(x, s)).collect()),
         t => t.clone(),
+    }
+}
+
+/// The union of `tys`: flattened, without duplicates; `Any` absorbs the
+/// rest, and a single member is itself.
+pub fn union(tys: Vec<Ty>) -> Ty {
+    let mut out: Vec<Ty> = Vec::new();
+    for t in tys {
+        let members = match t {
+            Ty::Union(v) => v,
+            t => vec![t],
+        };
+        for m in members {
+            if m == Ty::Any {
+                return Ty::Any;
+            }
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    match out.len() {
+        0 => Ty::Any,
+        1 => out.pop().unwrap(),
+        _ => Ty::Union(out),
+    }
+}
+
+/// The members of a union, or the type itself.
+pub fn members(t: &Ty) -> Vec<Ty> {
+    match t {
+        Ty::Union(v) => v.clone(),
+        t => vec![t.clone()],
     }
 }
 
@@ -1706,6 +1784,7 @@ pub fn erase_vars(t: &Ty) -> Ty {
         Ty::TupleVar(x) => Ty::TupleVar(Box::new(erase_vars(x))),
         Ty::Inst(c, args) => Ty::Inst(*c, args.iter().map(erase_vars).collect()),
         Ty::Type(x) => Ty::Type(Box::new(erase_vars(x))),
+        Ty::Union(v) => union(v.iter().map(erase_vars).collect()),
         t => t.clone(),
     }
 }
@@ -1714,7 +1793,7 @@ pub fn erase_vars(t: &Ty) -> Ty {
 pub fn has_any(t: &Ty) -> bool {
     match t {
         Ty::Any | Ty::Var(_) => true,
-        Ty::Tuple(v) => v.iter().any(has_any),
+        Ty::Tuple(v) | Ty::Union(v) => v.iter().any(has_any),
         Ty::TupleVar(x) | Ty::Type(x) => has_any(x),
         Ty::Inst(_, args) => args.iter().any(has_any),
         _ => false,
@@ -1728,7 +1807,7 @@ pub fn collect_vars(t: &Ty, out: &mut Vec<TvId>) {
                 out.push(*v);
             }
         }
-        Ty::Tuple(v) => v.iter().for_each(|x| collect_vars(x, out)),
+        Ty::Tuple(v) | Ty::Union(v) => v.iter().for_each(|x| collect_vars(x, out)),
         Ty::TupleVar(x) | Ty::Type(x) => collect_vars(x, out),
         Ty::Inst(_, args) => args.iter().for_each(|x| collect_vars(x, out)),
         _ => {}

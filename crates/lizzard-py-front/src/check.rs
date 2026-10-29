@@ -72,6 +72,9 @@ struct Lower<'a> {
     line: u32,
     loops: Vec<Loop>,
     method: Option<MethodCtx>,
+    /// Narrowed types of locals (`x`) and their attributes (`x.attr`), where
+    /// they differ from the declared ones.
+    narrow: HashMap<String, Ty>,
 }
 
 const BUILTIN_FNS: &[&str] = &["print", "len"];
@@ -117,6 +120,7 @@ impl<'a> Lower<'a> {
             line: 0,
             loops: Vec::new(),
             method: None,
+            narrow: HashMap::new(),
         }
     }
 
@@ -285,6 +289,10 @@ impl<'a> Lower<'a> {
             Ty::Inst(c, _) => RtCheck::Instance(self.db.runtime_class(t).unwrap_or_else(|| self.db.qualname(*c).to_string())),
             // A rigid variable (`Self`, a class's type parameter) is checked
             // against its bound.
+            Ty::Union(v) => {
+                let cs: Vec<RtCheck> = v.iter().map(|m| self.rtcheck(m)).collect();
+                if cs.contains(&RtCheck::Any) { RtCheck::Any } else { RtCheck::Union(cs) }
+            }
             Ty::Var(v) if self.db.rigid.contains(v) => match self.db.tvs[*v].bound.clone() {
                 Some(b) => self.rtcheck(&b),
                 None => RtCheck::Any,
@@ -698,6 +706,7 @@ impl<'a> Lower<'a> {
                 self.emit(Instr::Raise { exc: r });
             }
             Stmt::Assert(a) => {
+                let (yes, _) = self.cond_narrow(&a.test);
                 let c = self.expr(&a.test);
                 let b = self.convert(&c, Repr::Bool);
                 let ok = self.emit(Instr::JumpIfTrue { cond: b, target: 0 });
@@ -714,6 +723,7 @@ impl<'a> Lower<'a> {
                 self.emit(Instr::Raise { exc });
                 let h = self.here();
                 self.patch(ok, h);
+                self.apply_narrow(yes);
             }
             Stmt::Delete(d) => {
                 for t in &d.targets {
@@ -847,12 +857,18 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The type of a local or `self.attr` without evaluating it.
+    /// The (narrowed) type of a local or `x.attr` without evaluating it.
     fn peek_type(&mut self, e: &Expr) -> Option<Ty> {
         match e {
-            Expr::Name(n) => self.locals.get(n.id.as_str()).map(|l| l.ty.clone()),
+            Expr::Name(n) => self.narrow.get(n.id.as_str()).cloned().or_else(|| self.locals.get(n.id.as_str()).map(|l| l.ty.clone())),
             Expr::Attribute(a) => {
+                if let Some(t) = attr_path(a).and_then(|p| self.narrow.get(&p)) {
+                    return Some(t.clone());
+                }
                 let obj_ty = self.peek_type(&a.value)?;
+                if matches!(obj_ty, Ty::Union(_)) {
+                    return self.attr_type(&obj_ty, a.attr.as_str(), &mut None).ok();
+                }
                 let Ty::Inst(c, _) = self.lookup_ty(&obj_ty) else { return None };
                 match self.db.find_member(c, a.attr.as_str()) {
                     Some((owner, Member::Attr(t))) => Some(self.member_type(&obj_ty, owner, &t)),
@@ -981,6 +997,8 @@ impl<'a> Lower<'a> {
             let v = self.coerce(v, &l.ty, off, |_, got, want| format!("cannot assign {got} to `{name}` of type {want}"));
             let r = self.convert(&v, l.repr);
             self.emit(Instr::Move { dst: l.reg, src: r });
+            self.invalidate(name);
+            self.narrow_to(name.to_string(), &l.ty, &v.ty);
             return;
         }
         let v = match &ann {
@@ -993,53 +1011,181 @@ impl<'a> Lower<'a> {
         };
         let reg = self.reg(v.repr);
         self.emit(Instr::Move { dst: reg, src: v.reg });
+        self.invalidate(name);
+        if let Some(a) = &ann {
+            self.narrow_to(name.to_string(), a, &v.ty);
+        }
         self.locals.insert(name.to_string(), Local { reg, ty: v.ty, repr: v.repr });
     }
 
-    /// `isinstance(x, C)` for a local `x`: the type `x` has where it holds.
-    fn narrowing(&mut self, test: &Expr) -> Option<(String, Ty)> {
-        let Expr::Call(c) = test else { return None };
-        if !is_builtin_call(c, "isinstance") || c.arguments.args.len() != 2 || !c.arguments.keywords.is_empty() {
-            return None;
+    /// After assigning a value of type `got` to `key` declared `declared`:
+    /// a union is narrowed to what was assigned.
+    fn narrow_to(&mut self, key: String, declared: &Ty, got: &Ty) {
+        if matches!(declared, Ty::Union(_)) && !matches!(got, Ty::Any | Ty::Union(_)) && got != declared {
+            self.narrow.insert(key, got.clone());
         }
-        let Expr::Name(n) = &c.arguments.args[0] else { return None };
-        let local = self.locals.get(n.id.as_str())?.clone();
-        let cls = match &c.arguments.args[1] {
-            Expr::Name(cn) => self.db.lookup_name(self.m, cn.id.as_str()),
+    }
+
+    /// Forget narrowing of `key` (and of `key.attr` for a local).
+    fn invalidate(&mut self, key: &str) {
+        let prefix = format!("{key}.");
+        self.narrow.retain(|k, _| k != key && !k.starts_with(&prefix));
+    }
+
+    /// The narrowing key of `x` or `x.attr` for a local `x`.
+    fn narrow_key(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Name(n) if self.locals.contains_key(n.id.as_str()) => Some(n.id.to_string()),
+            Expr::Attribute(a) => attr_path(a).filter(|p| self.locals.contains_key(p.split('.').next().unwrap())),
+            _ => None,
+        }
+    }
+
+    /// The current (narrowed) type of a narrowing key.
+    fn key_type(&mut self, key: &str, e: &Expr) -> Option<Ty> {
+        if let Some(t) = self.narrow.get(key) {
+            return Some(t.clone());
+        }
+        self.peek_type(e)
+    }
+
+    /// What a condition tells about locals and their attributes: the types
+    /// where it is true, and where it is false.
+    fn cond_narrow(&mut self, test: &Expr) -> (Vec<(String, Ty)>, Vec<(String, Ty)>) {
+        let none = (Vec::new(), Vec::new());
+        match test {
+            Expr::UnaryOp(u) if u.op == ast::UnaryOp::Not => {
+                let (t, f) = self.cond_narrow(&u.operand);
+                (f, t)
+            }
+            Expr::BoolOp(b) => {
+                // Each operand is evaluated knowing the earlier ones held
+                // (`and`) or failed (`or`).
+                let before = self.narrow.clone();
+                let mut facts = Vec::new();
+                for v in &b.values {
+                    let (t, f) = self.cond_narrow(v);
+                    let part = if b.op == ast::BoolOp::And { t } else { f };
+                    self.apply_narrow(part.clone());
+                    facts.extend(part);
+                }
+                self.narrow = before;
+                match b.op {
+                    ast::BoolOp::And => (facts, Vec::new()),
+                    ast::BoolOp::Or => (Vec::new(), facts),
+                }
+            }
+            Expr::Compare(c) if c.ops.len() == 1 && matches!(c.ops[0], ast::CmpOp::Is | ast::CmpOp::IsNot) => {
+                let subject = match (&c.operands[0], &c.operands[1]) {
+                    (e, Expr::NoneLiteral(_)) | (Expr::NoneLiteral(_), e) => e,
+                    _ => return none,
+                };
+                let Some(key) = self.narrow_key(subject) else { return none };
+                let Some(cur) = self.key_type(&key, subject) else { return none };
+                let is_none = if members(&cur).contains(&Ty::None) || matches!(cur, Ty::Any | Ty::Object) { Ty::None } else { cur.clone() };
+                let not_none = without_none(&cur);
+                let (yes, no) = (vec![(key.clone(), is_none)], vec![(key, not_none)]);
+                if c.ops[0] == ast::CmpOp::Is { (yes, no) } else { (no, yes) }
+            }
+            Expr::Call(call) if is_builtin_call(call, "isinstance") && call.arguments.args.len() == 2 && !self.locals.contains_key("isinstance") => {
+                let subject = &call.arguments.args[0];
+                let Some(key) = self.narrow_key(subject) else { return none };
+                let Some(cur) = self.key_type(&key, subject) else { return none };
+                let Some(classes) = self.class_types(&call.arguments.args[1]) else { return none };
+                let mut yes = Vec::new();
+                let mut no = Vec::new();
+                for m in members(&cur) {
+                    let mut matched = false;
+                    for c in &classes {
+                        if self.assignable(&m, c) {
+                            yes.push(m.clone());
+                            matched = true;
+                            break;
+                        }
+                        // A downcast: the class is a subtype of the member.
+                        if matches!(m, Ty::Any | Ty::Object) || self.assignable(c, &m) {
+                            yes.push(c.clone());
+                        }
+                    }
+                    if !matched {
+                        no.push(m.clone());
+                    }
+                }
+                let yes = if yes.is_empty() { union(classes) } else { union(yes) };
+                let no = if no.is_empty() { cur.clone() } else { union(no) };
+                (vec![(key.clone(), yes)], if matches!(cur, Ty::Union(_)) { vec![(key, no)] } else { Vec::new() })
+            }
+            e => {
+                // Truthiness: a true value is not None.
+                let Some(key) = self.narrow_key(e) else { return none };
+                let Some(cur) = self.key_type(&key, e) else { return none };
+                if members(&cur).contains(&Ty::None) && matches!(cur, Ty::Union(_)) {
+                    (vec![(key, without_none(&cur))], Vec::new())
+                } else {
+                    none
+                }
+            }
+        }
+    }
+
+    /// The classes an `isinstance` second argument names.
+    fn class_types(&mut self, e: &Expr) -> Option<Vec<Ty>> {
+        let sym = match e {
+            Expr::Tuple(t) => {
+                let mut out = Vec::new();
+                for x in &t.elts {
+                    out.extend(self.class_types(x)?);
+                }
+                return Some(out);
+            }
+            Expr::Name(n) => self.db.lookup_name(self.m, n.id.as_str()),
             e @ Expr::Attribute(_) => self.db.sym_of_expr(self.m, e)?,
             _ => return None,
         };
-        let t = match cls {
+        match sym {
             Sym::Class(k) => {
                 let n = self.db.class_params(k).len();
-                Ty::Inst(k, vec![Ty::Any; n])
+                Some(vec![Ty::Inst(k, vec![Ty::Any; n])])
             }
-            Sym::Builtin(t @ (Ty::Int | Ty::Float | Ty::Str | Ty::Bool | Ty::Exc(_))) => t,
-            _ => return None,
-        };
-        // Only narrow to a subtype (a downcast).
-        (local.repr == Repr::Obj && (matches!(local.ty, Ty::Any | Ty::Object) || self.assignable(&t, &local.ty))).then(|| (n.id.to_string(), t))
+            Sym::Builtin(Ty::TupleVar(_)) => Some(vec![Ty::TupleVar(Box::new(Ty::Any))]),
+            Sym::Builtin(t @ (Ty::Int | Ty::Float | Ty::Str | Ty::Bool | Ty::Exc(_) | Ty::None)) => Some(vec![t]),
+            _ => None,
+        }
+    }
+
+    fn apply_narrow(&mut self, facts: Vec<(String, Ty)>) {
+        for (k, t) in facts {
+            self.narrow.insert(k, t);
+        }
+    }
+
+    /// Forget narrowing of everything a loop body assigns: at the top of the
+    /// loop it may hold a value from the previous iteration.
+    fn invalidate_assigned(&mut self, body: &[Stmt]) {
+        let mut keys = Vec::new();
+        assigned_keys(body, &mut keys);
+        for k in keys {
+            self.invalidate(&k);
+        }
     }
 
     fn if_stmt(&mut self, test: &Expr, body: &[Stmt], rest: &[ast::ElifElseClause]) {
-        let narrow = self.narrowing(test);
+        let (yes, no) = self.cond_narrow(test);
         let c = self.expr(test);
         let b = self.convert(&c, Repr::Bool);
         let skip = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
-        match narrow {
-            Some((name, t)) => {
-                let saved = self.locals[&name].clone();
-                self.locals.get_mut(&name).unwrap().ty = t;
-                self.stmts(body);
-                if let Some(l) = self.locals.get_mut(&name) {
-                    l.ty = saved.ty;
-                }
-            }
-            None => self.stmts(body),
-        }
+        let before = self.narrow.clone();
+        self.apply_narrow(yes);
+        self.stmts(body);
+        let after_body = std::mem::replace(&mut self.narrow, before);
+        self.apply_narrow(no);
+        let body_exits = always_exits(body);
         if rest.is_empty() {
             let h = self.here();
             self.patch(skip, h);
+            if !body_exits {
+                self.narrow = merge_narrow(&after_body, &self.narrow);
+            }
             return;
         }
         let end = self.emit(Instr::Jump { target: 0 });
@@ -1048,6 +1194,12 @@ impl<'a> Lower<'a> {
         match &rest[0].test {
             Some(t) => self.if_stmt(t, &rest[0].body, &rest[1..]),
             None => self.stmts(&rest[0].body),
+        }
+        let rest_exits = rest.last().is_some_and(|c| c.test.is_none()) && rest.iter().all(|c| always_exits(&c.body));
+        match (body_exits, rest_exits) {
+            (true, _) => {}
+            (false, true) => self.narrow = after_body,
+            (false, false) => self.narrow = merge_narrow(&after_body, &self.narrow),
         }
         let h = self.here();
         self.patch(end, h);
@@ -1076,15 +1228,24 @@ impl<'a> Lower<'a> {
         if !w.orelse.is_empty() {
             return self.err(off, "`while ... else` is not supported by Lizzard yet");
         }
+        self.invalidate_assigned(&w.body);
+        let at_top = self.narrow.clone();
+        let (yes, no) = self.cond_narrow(&w.test);
         let top = self.here();
         let c = self.expr(&w.test);
         let b = self.convert(&c, Repr::Bool);
         let exit = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
+        self.apply_narrow(yes);
         let l = self.loop_body(&w.body);
         self.emit(Instr::Jump { target: top });
         let h = self.here();
         self.patch(exit, h);
+        let broke = !l.breaks.is_empty();
         self.end_loop(l, top);
+        self.narrow = at_top;
+        if !broke {
+            self.apply_narrow(no);
+        }
     }
 
     fn for_stmt(&mut self, f: &ast::StmtFor) {
@@ -1109,6 +1270,8 @@ impl<'a> Lower<'a> {
             return self.for_iter(f, off);
         };
         let Expr::Name(target) = &*f.target else { unreachable!() };
+        self.invalidate_assigned(&f.body);
+        let at_top = self.narrow.clone();
         let mut bounds = Vec::new();
         for a in range_args.iter() {
             let v = self.expr(a);
@@ -1140,11 +1303,14 @@ impl<'a> Lower<'a> {
         let h = self.here();
         self.patch(exit, h);
         self.end_loop(l, incr);
+        self.narrow = at_top;
     }
 
     /// `for target in iterable:` over any iterable.
     fn for_iter(&mut self, f: &ast::StmtFor, off: u32) {
+        self.invalidate_assigned(&f.body);
         let it = self.expr(&f.iter);
+        let at_top = self.narrow.clone();
         let elem = self.iter_elem(&it.ty, f.iter.range().start().into());
         let o = self.obj(&it);
         let iter = self.reg(Repr::Obj);
@@ -1161,6 +1327,7 @@ impl<'a> Lower<'a> {
         let h = self.here();
         self.patch(exit, h);
         self.end_loop(l, top);
+        self.narrow = at_top;
     }
 
     /// The type of the items iterating over a `t` produces.
@@ -1277,22 +1444,28 @@ impl<'a> Lower<'a> {
             Expr::Compare(c) => self.compare(c, e),
             Expr::BoolOp(b) => self.boolop(b),
             Expr::If(i) => {
+                let (yes, no) = self.cond_narrow(&i.test);
                 let c = self.expr(&i.test);
                 let b = self.convert(&c, Repr::Bool);
                 let skip = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
                 let dst = self.reg(Repr::Obj);
+                let before = self.narrow.clone();
+                self.apply_narrow(yes);
                 let x = self.expr_hint(&i.body, hint);
+                self.narrow = before.clone();
+                self.apply_narrow(no);
                 let xo = self.obj(&x);
                 self.emit(Instr::Move { dst, src: xo });
                 let end = self.emit(Instr::Jump { target: 0 });
                 let h = self.here();
                 self.patch(skip, h);
                 let y = self.expr_hint(&i.orelse, hint);
+                self.narrow = before;
                 let yo = self.obj(&y);
                 self.emit(Instr::Move { dst, src: yo });
                 let h = self.here();
                 self.patch(end, h);
-                let ty = self.join(&x.ty, &y.ty);
+                let ty = union(vec![x.ty.clone(), y.ty.clone()]);
                 Val { reg: dst, ty, repr: Repr::Obj }
             }
             Expr::List(l) => self.list_lit(&l.elts, hint, off),
@@ -1380,7 +1553,8 @@ impl<'a> Lower<'a> {
 
     fn load_name(&mut self, name: &str, off: u32) -> Val {
         if let Some(l) = self.locals.get(name) {
-            return Val { reg: l.reg, ty: l.ty.clone(), repr: l.repr };
+            let ty = self.narrow.get(name).cloned().unwrap_or_else(|| l.ty.clone());
+            return Val { reg: l.reg, ty, repr: l.repr };
         }
         let ty = match self.db.lookup_in(self.m, name) {
             Some(Sym::UserVar) if self.toplevel => {
@@ -1497,51 +1671,69 @@ impl<'a> Lower<'a> {
         Some(v)
     }
 
-    fn attr_of(&mut self, obj: &Val, a: &ast::ExprAttribute, what: String) -> Val {
-        let off: u32 = a.attr.range().start().into();
-        let name = a.attr.as_str();
-        let mut origin = None;
-        let lt = self.lookup_ty(&obj.ty);
-        let ty = match (&obj.ty, &lt) {
+    /// The type of attribute `name` of a value of type `obj_ty`, or the
+    /// error to report.
+    fn attr_type(&mut self, obj_ty: &Ty, name: &str, origin: &mut Option<String>) -> Result<Ty, String> {
+        if let Ty::Union(ms) = obj_ty {
+            if ms.contains(&Ty::None) {
+                let t = self.show(obj_ty);
+                return Err(format!("cannot read attribute `{name}` of {t}: the value may be None (check `is not None` first)"));
+            }
+            let mut tys = Vec::new();
+            for m in ms {
+                tys.push(self.attr_type(m, name, origin)?);
+            }
+            return Ok(union(tys));
+        }
+        let lt = self.lookup_ty(obj_ty);
+        match (obj_ty, &lt) {
             (Ty::Module(mm), _) => match self.db.module_attr(*mm, name) {
-                Some(s) => self.sym_value_ty(s),
-                None => {
-                    let mn = self.db.modules[*mm].name.clone();
-                    self.err(off, format!("module `{mn}` has no attribute `{name}`"));
-                    Ty::Any
-                }
+                Some(s) => Ok(self.sym_value_ty(s)),
+                None => Err(format!("module `{}` has no attribute `{name}`", self.db.modules[*mm].name)),
             },
             (_, Ty::Inst(c, _)) => match self.db.find_member(*c, name) {
-                Some((owner, m)) => self.member_value_ty(&obj.ty.clone(), owner, m, false, &mut origin),
+                Some((owner, m)) => Ok(self.member_value_ty(&obj_ty.clone(), owner, m, false, origin)),
                 // `object`'s own attributes (`__class__`, `__dict__`, ...).
-                None if self.db.has_any_base(*c) || is_dunder(name) => Ty::Any,
-                None => {
-                    let t = self.show(&lt);
-                    self.err(off, format!("{t} has no attribute `{name}`"));
-                    Ty::Any
-                }
+                None if self.db.has_any_base(*c) || is_dunder(name) => Ok(Ty::Any),
+                None => Err(format!("{} has no attribute `{name}`", self.show(&lt))),
             },
             (Ty::Type(t), _) if matches!(self.lookup_ty(t), Ty::Inst(..)) => {
                 let Ty::Inst(c, _) = self.lookup_ty(t) else { unreachable!() };
                 let inst = (**t).clone();
                 match self.db.find_member(c, name) {
-                    Some((owner, m)) => self.member_value_ty(&inst, owner, m, true, &mut origin),
+                    Some((owner, m)) => Ok(self.member_value_ty(&inst, owner, m, true, origin)),
                     // `type`'s own attributes (`__name__`, `__mro__`, ...).
-                    None if self.db.has_any_base(c) || is_dunder(name) => Ty::Any,
-                    None => {
-                        let ts = self.show(&obj.ty);
-                        self.err(off, format!("{ts} has no attribute `{name}`"));
-                        Ty::Any
-                    }
+                    None if self.db.has_any_base(c) || is_dunder(name) => Ok(Ty::Any),
+                    None => Err(format!("{} has no attribute `{name}`", self.show(obj_ty))),
                 }
             }
-            (Ty::Any, _) => Ty::Any,
-            (t, _) => {
-                let t = self.show(t);
-                self.err(off, format!("attribute `{name}` of {t} is not supported by Lizzard yet"));
+            (Ty::Exc(_), _) => match name {
+                "args" => Ok(Ty::TupleVar(Box::new(Ty::Any))),
+                n if is_dunder(n) => Ok(Ty::Any),
+                _ => Err(format!("{} has no attribute `{name}`", self.show(obj_ty))),
+            },
+            (Ty::Any, _) => Ok(Ty::Any),
+            (Ty::None, _) => Err(format!("cannot read attribute `{name}` of None")),
+            (t, _) => Err(format!("attribute `{name}` of {} is not supported by Lizzard yet", self.show(t))),
+        }
+    }
+
+    /// `obj.name`; `path` is `x.name` when `obj` is the local `x`, for
+    /// narrowing.
+    fn attr_of(&mut self, obj: &Val, a: &ast::ExprAttribute, what: String) -> Val {
+        let off: u32 = a.attr.range().start().into();
+        let name = a.attr.as_str();
+        let mut origin = None;
+        let mut ty = match self.attr_type(&obj.ty, name, &mut origin) {
+            Ok(t) => t,
+            Err(m) => {
+                self.err(off, m);
                 Ty::Any
             }
         };
+        if let Some(t) = attr_path(a).and_then(|p| self.narrow.get(&p)) {
+            ty = t.clone();
+        }
         let o = self.obj(obj);
         let dst = self.reg(Repr::Obj);
         let n = self.name(name);
@@ -1603,6 +1795,12 @@ impl<'a> Lower<'a> {
         let (o, v) = (self.obj(obj), self.obj(&val));
         let n = self.name(name);
         self.emit(Instr::StoreAttr { obj: o, name: n, val: v });
+        if let Some(p) = attr_path(a) {
+            self.invalidate(&p);
+            if let Ok(declared) = self.attr_type(&obj.ty, name, &mut None) {
+                self.narrow_to(p, &declared, &val.ty);
+            }
+        }
     }
 
     /// Argument types expected by the callee, for typing literal arguments.
@@ -1718,28 +1916,7 @@ impl<'a> Lower<'a> {
         let kw_tys: Vec<(String, Ty)> = kws.iter().map(|(n, v)| (n.clone(), v.ty.clone())).collect();
         let mut origin = None;
         let mut builtin_ctor = false;
-        let ret = match fv.ty.clone() {
-            Ty::Func(FuncRef::Builtin("print")) => Ty::None,
-            Ty::Func(FuncRef::Builtin(n)) => {
-                self.err(off, format!("{n}() is not supported here by Lizzard yet"));
-                Ty::Any
-            }
-            Ty::Type(t) if matches!(*t, Ty::Exc(_) | Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => {
-                builtin_ctor = true;
-                *t
-            }
-            Ty::Type(t) if matches!(self.lookup_ty(&t), Ty::Inst(k, _) if self.db.is_user_class(k) || self.db.is_builtin_class(k)) => {
-                self.construct(&t, &pos_tys, &kw_tys, off)
-            }
-            Ty::Func(FuncRef::Def(f)) => self.call_result(f, None, &pos_tys, &kw_tys, off, &mut origin),
-            Ty::Func(FuncRef::Bound(f, recv)) => self.call_result(f, Some(*recv), &pos_tys, &kw_tys, off, &mut origin),
-            Ty::Type(_) | Ty::Any => Ty::Any,
-            t => {
-                let t = self.show(&t);
-                self.err(off, format!("{t} is not callable"));
-                Ty::Any
-            }
-        };
+        let ret = self.call_type(fv.ty.clone(), &pos_tys, &kw_tys, off, &mut origin, &mut builtin_ctor);
         let func = self.obj(&fv);
         let mut args: Vec<Reg> = pos.iter().map(|v| self.obj(v)).collect();
         let mut kwnames = Vec::new();
@@ -1755,6 +1932,40 @@ impl<'a> Lower<'a> {
             self.check(&v, what, origin);
         }
         self.unbox_f32(v)
+    }
+
+    /// The result of calling a value of type `fty`.
+    fn call_type(&mut self, fty: Ty, pos: &[Ty], kws: &[(String, Ty)], off: u32, origin: &mut Option<String>, builtin_ctor: &mut bool) -> Ty {
+        match fty {
+            Ty::Func(FuncRef::Builtin("print")) => Ty::None,
+            Ty::Func(FuncRef::Builtin(n)) => {
+                self.err(off, format!("{n}() is not supported here by Lizzard yet"));
+                Ty::Any
+            }
+            Ty::Type(t) if matches!(*t, Ty::Exc(_) | Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => {
+                *builtin_ctor = true;
+                *t
+            }
+            Ty::Type(t) if matches!(self.lookup_ty(&t), Ty::Inst(k, _) if self.db.is_user_class(k) || self.db.is_builtin_class(k)) => {
+                self.construct(&t, &pos, &kws, off)
+            }
+            Ty::Func(FuncRef::Def(f)) => self.call_result(f, None, &pos, &kws, off, origin),
+            Ty::Func(FuncRef::Bound(f, recv)) => self.call_result(f, Some(*recv), &pos, &kws, off, origin),
+            // A union of callables (`shape.area` for `shape: Circle | Rect`).
+            Ty::Union(ms) if !ms.contains(&Ty::None) => {
+                let mut tys = Vec::new();
+                for m in ms {
+                    tys.push(self.call_type(m, pos, kws, off, origin, builtin_ctor));
+                }
+                union(tys)
+            }
+            Ty::Type(_) | Ty::Any => Ty::Any,
+            t => {
+                let t = self.show(&t);
+                self.err(off, format!("{t} is not callable"));
+                Ty::Any
+            }
+        }
     }
 
     /// The instance a call of class `t` creates, checking the arguments
@@ -1925,6 +2136,22 @@ impl<'a> Lower<'a> {
 
     /// The method `name` of `recv`, resolved for the given arguments.
     fn dunder(&mut self, recv: &Ty, name: &str, args: &[Ty]) -> Option<Result<(Ty, FileId, u32), String>> {
+        if let Ty::Union(ms) = recv {
+            // Every member must support it; the result is the union.
+            let mut tys = Vec::new();
+            let mut at = None;
+            for m in ms {
+                match self.dunder(m, name, args)? {
+                    Ok((t, f, o)) => {
+                        tys.push(t);
+                        at.get_or_insert((f, o));
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let (f, o) = at?;
+            return Some(Ok((union(tys), f, o)));
+        }
         let Ty::Inst(c, _) = self.lookup_ty(recv) else { return None };
         match self.db.find_member(c, name) {
             Some((_, Member::Method(f))) => Some(self.resolve(f, Some(recv.clone()), args, &[], None)),
@@ -2024,32 +2251,13 @@ impl<'a> Lower<'a> {
                 return self.any();
             }
         };
-        let mut origin = None;
-        let ty = match (&l.ty, &r.ty) {
-            (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
-            (Ty::Int | Ty::Bool, Ty::Int | Ty::Bool) if bop != BinOp::Div => Ty::Int,
-            (Ty::Int | Ty::Bool | Ty::Float, Ty::Int | Ty::Bool | Ty::Float) => Ty::Float,
-            (Ty::Str, Ty::Str) if bop == BinOp::Add => Ty::Str,
-            (Ty::Tuple(a), Ty::Tuple(b)) if bop == BinOp::Add => Ty::Tuple(a.iter().chain(b).cloned().collect()),
-            (lt, rt) => {
-                let (lt, rt) = (lt.clone(), rt.clone());
-                match self.dunder(&lt, dunder, std::slice::from_ref(&rt)) {
-                    Some(Ok((t, file, doff))) => {
-                        origin = self.origin(file, doff);
-                        t
-                    }
-                    _ => match self.dunder(&rt, rdunder, std::slice::from_ref(&lt)) {
-                        Some(Ok((t, file, doff))) => {
-                            origin = self.origin(file, doff);
-                            t
-                        }
-                        _ => {
-                            let (ls, rs) = (self.show(&lt), self.show(&rt));
-                            self.err(off, format!("unsupported operand types for {}: {ls} and {rs}", op.as_str()));
-                            Ty::Any
-                        }
-                    },
-                }
+        let (lt, rt) = (l.ty.clone(), r.ty.clone());
+        let (ty, origin) = match self.binop_type(bop, dunder, rdunder, &lt, &rt) {
+            Some(x) => x,
+            None => {
+                let (ls, rs) = (self.show(&lt), self.show(&rt));
+                self.err(off, format!("unsupported operand types for {}: {ls} and {rs}", op.as_str()));
+                (Ty::Any, None)
             }
         };
         // float32 arithmetic on two float32 values. (A Python float operand
@@ -2067,6 +2275,37 @@ impl<'a> Lower<'a> {
         let v = Val { reg: dst, ty, repr: Repr::Obj };
         self.check(&v, what, origin);
         self.unbox_f32(v)
+    }
+
+    /// The result type of `lt op rt`, with where the operator's method is
+    /// declared; `None` if the operands do not support it.
+    fn binop_type(&mut self, bop: BinOp, dunder: &str, rdunder: &str, lt: &Ty, rt: &Ty) -> Option<(Ty, Option<String>)> {
+        Some(match (lt, rt) {
+            (Ty::Any, _) | (_, Ty::Any) => (Ty::Any, None),
+            (Ty::Union(_), _) | (_, Ty::Union(_)) => {
+                let mut tys = Vec::new();
+                let mut origin = None;
+                for l in members(lt) {
+                    for r in members(rt) {
+                        let (t, o) = self.binop_type(bop, dunder, rdunder, &l, &r)?;
+                        tys.push(t);
+                        origin = origin.or(o);
+                    }
+                }
+                (union(tys), origin)
+            }
+            (Ty::Int | Ty::Bool, Ty::Int | Ty::Bool) if bop != BinOp::Div => (Ty::Int, None),
+            (Ty::Int | Ty::Bool | Ty::Float, Ty::Int | Ty::Bool | Ty::Float) => (Ty::Float, None),
+            (Ty::Str, Ty::Str) if bop == BinOp::Add => (Ty::Str, None),
+            (Ty::Tuple(a), Ty::Tuple(b)) if bop == BinOp::Add => (Ty::Tuple(a.iter().chain(b).cloned().collect()), None),
+            (lt, rt) => match self.dunder(lt, dunder, std::slice::from_ref(rt)) {
+                Some(Ok((t, file, doff))) => (t, self.origin(file, doff)),
+                _ => match self.dunder(rt, rdunder, std::slice::from_ref(lt)) {
+                    Some(Ok((t, file, doff))) => (t, self.origin(file, doff)),
+                    _ => return None,
+                },
+            },
+        })
     }
 
     fn compare(&mut self, c: &ast::ExprCompare, e: &Expr) -> Val {
@@ -2129,18 +2368,18 @@ impl<'a> Lower<'a> {
 
     fn boolop(&mut self, b: &ast::ExprBoolOp) -> Val {
         let dst = self.reg(Repr::Obj);
-        let mut ty: Option<Ty> = None;
+        let mut tys = Vec::new();
         let mut exits = Vec::new();
+        let before = self.narrow.clone();
         for (i, e) in b.values.iter().enumerate() {
+            let last = i + 1 == b.values.len();
+            let (yes, no) = if last { (Vec::new(), Vec::new()) } else { self.cond_narrow(e) };
             let v = self.expr(e);
-            ty = match ty {
-                None => Some(v.ty.clone()),
-                Some(t) if t == v.ty => Some(t),
-                Some(_) => Some(Ty::Any),
-            };
+            // `a or b` is `a` only when `a` is true, so not None.
+            tys.push(if b.op == ast::BoolOp::Or && !last { without_none(&v.ty) } else { v.ty.clone() });
             let o = self.obj(&v);
             self.emit(Instr::Move { dst, src: o });
-            if i + 1 < b.values.len() {
+            if !last {
                 let t = self.reg(Repr::Bool);
                 self.emit(Instr::Truthy { dst: t, src: dst });
                 let j = match b.op {
@@ -2148,13 +2387,17 @@ impl<'a> Lower<'a> {
                     ast::BoolOp::And => Instr::JumpIfFalse { cond: t, target: 0 },
                 };
                 exits.push(self.emit(j));
+                // Later operands run only when the earlier ones were true
+                // (`and`) or false (`or`).
+                self.apply_narrow(if b.op == ast::BoolOp::And { yes } else { no });
             }
         }
+        self.narrow = before;
         let h = self.here();
         for j in exits {
             self.patch(j, h);
         }
-        Val { reg: dst, ty: ty.unwrap_or(Ty::Any), repr: Repr::Obj }
+        Val { reg: dst, ty: union(tys), repr: Repr::Obj }
     }
 
     // ---- containers ----
@@ -2334,12 +2577,16 @@ impl<'a> Lower<'a> {
         let what = format!("item of {}", self.src(&g.iter));
         self.check(&item, what, None);
         self.assign_target(&g.target, item, off);
+        let before = self.narrow.clone();
         for cond in &g.ifs {
+            let (yes, _) = self.cond_narrow(cond);
             let c = self.expr(cond);
             let b = self.convert(&c, Repr::Bool);
             self.emit(Instr::JumpIfFalse { cond: b, target: top });
+            self.apply_narrow(yes);
         }
         self.comp_level(rest, body, hint, dst, elem, off);
+        self.narrow = before;
         self.emit(Instr::Jump { target: top });
         let h = self.here();
         self.patch(exit, h);
@@ -2390,6 +2637,70 @@ impl<'a> Lower<'a> {
                     parts.push(dst);
                 }
             }
+        }
+    }
+}
+
+/// `x.attr` for an attribute of a name.
+fn attr_path(a: &ast::ExprAttribute) -> Option<String> {
+    match &*a.value {
+        Expr::Name(n) => Some(format!("{}.{}", n.id.as_str(), a.attr.as_str())),
+        _ => None,
+    }
+}
+
+fn without_none(t: &Ty) -> Ty {
+    match t {
+        Ty::Union(v) => union(v.iter().filter(|m| **m != Ty::None).cloned().collect()),
+        t => t.clone(),
+    }
+}
+
+/// Narrowing after two paths join: what both narrowed, as the union.
+fn merge_narrow(a: &HashMap<String, Ty>, b: &HashMap<String, Ty>) -> HashMap<String, Ty> {
+    a.iter().filter_map(|(k, t)| b.get(k).map(|u| (k.clone(), union(vec![t.clone(), u.clone()])))).collect()
+}
+
+/// The names and `x.attr` paths a block assigns.
+fn assigned_keys(body: &[Stmt], out: &mut Vec<String>) {
+    fn target(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Name(n) => out.push(n.id.to_string()),
+            Expr::Attribute(a) => out.extend(attr_path(a)),
+            Expr::Tuple(t) => t.elts.iter().for_each(|x| target(x, out)),
+            Expr::List(l) => l.elts.iter().for_each(|x| target(x, out)),
+            _ => {}
+        }
+    }
+    for s in body {
+        match s {
+            Stmt::Assign(a) => a.targets.iter().for_each(|t| target(t, out)),
+            Stmt::AnnAssign(a) => target(&a.target, out),
+            Stmt::AugAssign(a) => target(&a.target, out),
+            Stmt::For(f) => {
+                target(&f.target, out);
+                assigned_keys(&f.body, out);
+            }
+            Stmt::While(w) => assigned_keys(&w.body, out),
+            Stmt::If(i) => {
+                assigned_keys(&i.body, out);
+                i.elif_else_clauses.iter().for_each(|c| assigned_keys(&c.body, out));
+            }
+            Stmt::Try(t) => {
+                assigned_keys(&t.body, out);
+                for h in &t.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    out.extend(h.name.as_ref().map(|n| n.to_string()));
+                    assigned_keys(&h.body, out);
+                }
+                assigned_keys(&t.orelse, out);
+                assigned_keys(&t.finalbody, out);
+            }
+            Stmt::With(w) => {
+                w.items.iter().filter_map(|i| i.optional_vars.as_deref()).for_each(|t| target(t, out));
+                assigned_keys(&w.body, out);
+            }
+            _ => {}
         }
     }
 }

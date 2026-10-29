@@ -69,6 +69,16 @@ pub fn check(py: Python<'_>, obj: &Bound<'_, PyAny>, check: &RtCheck) -> PyResul
             }
             _ => false,
         },
+        RtCheck::Union(cs) => {
+            let mut any = false;
+            for c in cs {
+                if self::check(py, obj, c)?.is_ok() {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
     };
     if ok {
         return Ok(Ok(()));
