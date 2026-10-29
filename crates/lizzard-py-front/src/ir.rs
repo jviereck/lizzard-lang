@@ -31,6 +31,12 @@ pub enum BinOp {
     Div,
     FloorDiv,
     Mod,
+    Pow,
+    BitOr,
+    BitAnd,
+    BitXor,
+    LShift,
+    RShift,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +100,10 @@ pub enum Instr {
     /// `a op b`, or `a op= b` (`__iadd__`, ...) when `inplace`.
     BinOp { dst: Reg, op: BinOp, a: Reg, b: Reg, inplace: bool },
     Neg { dst: Reg, src: Reg },
+    /// `~src`
+    Invert { dst: Reg, src: Reg },
+    /// `+src`
+    Pos { dst: Reg, src: Reg },
     Compare { dst: Reg, op: CmpOp, a: Reg, b: Reg },
     GetItem { dst: Reg, obj: Reg, key: Reg },
     SetItem { obj: Reg, key: Reg, val: Reg },
@@ -101,6 +111,9 @@ pub enum Instr {
     BuildList { dst: Reg, items: Vec<Reg> },
     BuildTuple { dst: Reg, items: Vec<Reg> },
     BuildDict { dst: Reg, keys: Vec<Reg>, vals: Vec<Reg> },
+    BuildSet { dst: Reg, items: Vec<Reg> },
+    /// `set.add(val)` for comprehensions.
+    SetAdd { set: Reg, val: Reg },
     BuildSlice { dst: Reg, lower: Reg, upper: Reg, step: Reg },
     /// `list.append(val)` for comprehensions.
     ListAppend { list: Reg, val: Reg },

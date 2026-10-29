@@ -8,7 +8,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::PyBaseException;
-use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PySet, PyString, PyTuple, PyType};
 use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, Repr};
 
 use crate::array;
@@ -250,7 +250,10 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
         }
         Instr::BinOp { dst, op, a, b, inplace } => {
             let (x, y) = (obj!(regs, *a), obj!(regs, *b));
-            let v = if *inplace {
+            let v = if *inplace && *op == BinOp::Pow {
+                // SAFETY: valid objects in, a new reference or NULL out.
+                unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyNumber_InPlacePower(x.as_ptr(), y.as_ptr(), ffi::Py_None()))? }
+            } else if *inplace {
                 let f = match op {
                     BinOp::Add => ffi::PyNumber_InPlaceAdd,
                     BinOp::Sub => ffi::PyNumber_InPlaceSubtract,
@@ -258,6 +261,12 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
                     BinOp::Div => ffi::PyNumber_InPlaceTrueDivide,
                     BinOp::FloorDiv => ffi::PyNumber_InPlaceFloorDivide,
                     BinOp::Mod => ffi::PyNumber_InPlaceRemainder,
+                    BinOp::BitOr => ffi::PyNumber_InPlaceOr,
+                    BinOp::BitAnd => ffi::PyNumber_InPlaceAnd,
+                    BinOp::BitXor => ffi::PyNumber_InPlaceXor,
+                    BinOp::LShift => ffi::PyNumber_InPlaceLshift,
+                    BinOp::RShift => ffi::PyNumber_InPlaceRshift,
+                    BinOp::Pow => unreachable!(),
                 };
                 // SAFETY: both arguments are valid objects; the result is a
                 // new reference or NULL with an exception set.
@@ -270,6 +279,12 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
                     BinOp::Div => x.div(y)?,
                     BinOp::FloorDiv => x.floor_div(y)?,
                     BinOp::Mod => x.rem(y)?,
+                    BinOp::Pow => x.pow(y, py.None())?,
+                    BinOp::BitOr => x.bitor(y)?,
+                    BinOp::BitAnd => x.bitand(y)?,
+                    BinOp::BitXor => x.bitxor(y)?,
+                    BinOp::LShift => x.lshift(y)?,
+                    BinOp::RShift => x.rshift(y)?,
                 }
             };
             regs[*dst as usize] = V::O(v);
@@ -277,6 +292,24 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
         Instr::Neg { dst, src } => {
             let v = obj!(regs, *src).neg()?;
             regs[*dst as usize] = V::O(v);
+        }
+        Instr::Invert { dst, src } => {
+            let v = obj!(regs, *src).bitnot()?;
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::Pos { dst, src } => {
+            let v = obj!(regs, *src).pos()?;
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::BuildSet { dst, items } => {
+            let set = PySet::empty(py)?;
+            for r in items {
+                set.add(obj!(regs, *r))?;
+            }
+            regs[*dst as usize] = V::O(set.into_any());
+        }
+        Instr::SetAdd { set, val } => {
+            obj!(regs, *set).cast::<PySet>().map_err(PyErr::from)?.add(obj!(regs, *val))?;
         }
         Instr::StoreAttr { obj, name, val } => obj!(regs, *obj).setattr(f.names[*name as usize].bind(py), obj!(regs, *val))?,
         Instr::DelItem { obj, key } => obj!(regs, *obj).del_item(obj!(regs, *key))?,
@@ -496,7 +529,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
                 BinOp::Sub => x - y,
                 BinOp::Mul => x * y,
                 BinOp::Div => x / y,
-                BinOp::FloorDiv | BinOp::Mod => unreachable!("no float32 floor division or modulo"),
+                _ => unreachable!("float32 arithmetic is + - * / only"),
             });
         }
         Instr::Check { reg, check } => {

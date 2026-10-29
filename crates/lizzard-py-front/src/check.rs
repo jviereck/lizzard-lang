@@ -65,6 +65,7 @@ struct Region {
 /// What a comprehension produces at its innermost level.
 enum CompBody<'e> {
     List(&'e Expr),
+    Set(&'e Expr),
     Dict(&'e Expr, &'e Expr),
 }
 
@@ -252,6 +253,44 @@ impl<'a> Lower<'a> {
             Some(c) => Ty::Inst(c, args),
             None => Ty::Any,
         }
+    }
+
+    /// The type arguments a builtin container `class` needs to be assignable
+    /// to the expected type `hint` (`Iterable[float]` gives `list[float]`'s
+    /// `[float]`), if they follow from it.
+    fn container_hint(&mut self, hint: Option<&Ty>, class: &str) -> Option<Vec<Ty>> {
+        let c = self.db.builtin_class(class)?;
+        let ps = self.db.class_params(c);
+        let me = Ty::Inst(c, ps.iter().map(|p| Ty::Var(*p)).collect());
+        for h in members(hint?) {
+            let Ty::Inst(hc, _) = &h else { continue };
+            // `class` seen as the expected class, in terms of its own type
+            // parameters; matching the hint into it solves them.
+            let Some(view) = self.upcast(&me, *hc) else { continue };
+            let mut s = Subst::new();
+            if self.db.assign(&h, &view, &mut s, &mut false) {
+                let args: Vec<Ty> = ps.iter().map(|p| s.get(p).cloned().unwrap_or(Ty::Object)).collect();
+                if !args.iter().any(mentions_any) {
+                    return Some(args);
+                }
+            }
+        }
+        None
+    }
+
+    /// `t` (a class instance) as an instance of its base class `target`.
+    fn upcast(&mut self, t: &Ty, target: ClassId) -> Option<Ty> {
+        let Ty::Inst(c, args) = t else { return None };
+        if *c == target {
+            return Some(t.clone());
+        }
+        let map: Subst = self.db.class_params(*c).into_iter().zip(args.iter().cloned()).collect();
+        for b in self.db.class_bases(*c) {
+            if let Some(v) = self.upcast(&subst(&b, &map), target) {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// The type arguments of `t` if it is the builtin class `class`.
@@ -1338,14 +1377,14 @@ impl<'a> Lower<'a> {
             Expr::Name(n) => {
                 let cur = self.load_name(n.id.as_str(), off);
                 let r = self.expr(&a.value);
-                let v = self.binop_vals(a.op, cur, r, what, off, true);
+                let v = self.binop_vals(a.op, cur, r, int_literal(&a.value), what, off, true);
                 self.assign_local(n.id.as_str(), v, None, off);
             }
             Expr::Attribute(at) => {
                 let obj = self.expr(&at.value);
                 let cur = self.attr_of(&obj, at, what.clone());
                 let r = self.expr(&a.value);
-                let v = self.binop_vals(a.op, cur, r, what, off, true);
+                let v = self.binop_vals(a.op, cur, r, int_literal(&a.value), what, off, true);
                 self.store_attr(&obj, at, v);
             }
             Expr::Subscript(sub) => {
@@ -1353,7 +1392,7 @@ impl<'a> Lower<'a> {
                 let key = self.expr(&sub.slice);
                 let cur = self.item_of(&obj, &key, sub, what.clone());
                 let r = self.expr(&a.value);
-                let v = self.binop_vals(a.op, cur, r, what, off, true);
+                let v = self.binop_vals(a.op, cur, r, int_literal(&a.value), what, off, true);
                 self.store_item(&obj, &key, v, off);
             }
             _ => self.err(off, "this assignment target is not supported by Lizzard yet"),
@@ -1824,7 +1863,7 @@ impl<'a> Lower<'a> {
                 let l = self.expr(&b.left);
                 let r = self.expr(&b.right);
                 let what = self.src(e);
-                self.binop_vals(b.op, l, r, what, off, false)
+                self.binop_vals(b.op, l, r, int_literal(&b.right), what, off, false)
             }
             Expr::Compare(c) => self.compare(c, e),
             Expr::BoolOp(b) => self.boolop(b),
@@ -1854,6 +1893,16 @@ impl<'a> Lower<'a> {
                 Val { reg: dst, ty, repr: Repr::Obj }
             }
             Expr::List(l) => self.list_lit(&l.elts, hint, off),
+            Expr::Set(st) => {
+                let want = self.container_hint(hint, "set").and_then(|a| a.into_iter().next());
+                let refs: Vec<&Expr> = st.elts.iter().collect();
+                let (items, elem) = self.items(&refs, want.as_ref(), "a set item");
+                let dst = self.reg(Repr::Obj);
+                self.emit(Instr::BuildSet { dst, items });
+                let ty = self.builtin_inst("set", vec![elem.unwrap_or(Ty::Any)]);
+                Val { reg: dst, ty, repr: Repr::Obj }
+            }
+            Expr::SetComp(sc) => self.comprehension(&sc.generators, CompBody::Set(&sc.elt), hint, off),
             Expr::Tuple(t) => self.tuple_lit(&t.elts, hint, off),
             Expr::Dict(d) => self.dict_lit(d, hint, off),
             Expr::ListComp(lc) => self.comprehension(&lc.generators, CompBody::List(&lc.elt), hint, off),
@@ -1909,9 +1958,32 @@ impl<'a> Lower<'a> {
                         self.unbox_f32(r)
                     }
                 },
-                _ => {
-                    self.err(off, "this operator is not supported by Lizzard yet");
-                    self.any()
+                ast::UnaryOp::Invert | ast::UnaryOp::UAdd => {
+                    let invert = u.op == ast::UnaryOp::Invert;
+                    let v = self.expr(&u.operand);
+                    let ty = match &v.ty {
+                        Ty::Any => Ty::Any,
+                        Ty::Int | Ty::Bool => Ty::Int,
+                        Ty::Float if !invert => Ty::Float,
+                        t => {
+                            let t = t.clone();
+                            match self.dunder(&t, if invert { "__invert__" } else { "__pos__" }, &[]) {
+                                Some(Ok((r, _, _))) => r,
+                                _ => {
+                                    let ts = self.show(&t);
+                                    self.err(off, format!("bad operand type for unary {}: {ts}", if invert { "~" } else { "+" }));
+                                    Ty::Any
+                                }
+                            }
+                        }
+                    };
+                    let src = self.obj(&v);
+                    let dst = self.reg(Repr::Obj);
+                    self.emit(if invert { Instr::Invert { dst, src } } else { Instr::Pos { dst, src } });
+                    let r = Val { reg: dst, ty, repr: Repr::Obj };
+                    let what = self.src(e);
+                    self.check(&r, what, None);
+                    self.unbox_f32(r)
                 }
             },
             _ => {
@@ -2634,7 +2706,8 @@ impl<'a> Lower<'a> {
         self.emit(Instr::SetItem { obj: o, key: k, val: v });
     }
 
-    fn binop_vals(&mut self, op: ast::Operator, l: Val, r: Val, what: String, off: u32, inplace: bool) -> Val {
+    /// `l op r`; `r_lit` is the right operand if it is an int literal.
+    fn binop_vals(&mut self, op: ast::Operator, l: Val, r: Val, r_lit: Option<i64>, what: String, off: u32, inplace: bool) -> Val {
         let (bop, dunder, rdunder) = match op {
             ast::Operator::Add => (BinOp::Add, "__add__", "__radd__"),
             ast::Operator::Sub => (BinOp::Sub, "__sub__", "__rsub__"),
@@ -2642,13 +2715,27 @@ impl<'a> Lower<'a> {
             ast::Operator::Div => (BinOp::Div, "__truediv__", "__rtruediv__"),
             ast::Operator::FloorDiv => (BinOp::FloorDiv, "__floordiv__", "__rfloordiv__"),
             ast::Operator::Mod => (BinOp::Mod, "__mod__", "__rmod__"),
+            ast::Operator::Pow => (BinOp::Pow, "__pow__", "__rpow__"),
+            ast::Operator::BitOr => (BinOp::BitOr, "__or__", "__ror__"),
+            ast::Operator::BitAnd => (BinOp::BitAnd, "__and__", "__rand__"),
+            ast::Operator::BitXor => (BinOp::BitXor, "__xor__", "__rxor__"),
+            ast::Operator::LShift => (BinOp::LShift, "__lshift__", "__rlshift__"),
+            ast::Operator::RShift => (BinOp::RShift, "__rshift__", "__rrshift__"),
             _ => {
                 self.err(off, format!("operator `{}` is not supported by Lizzard yet", op.as_str()));
                 return self.any();
             }
         };
         let (lt, rt) = (l.ty.clone(), r.ty.clone());
-        let (ty, origin) = match self.binop_type(bop, dunder, rdunder, &lt, &rt) {
+        let pow = match (bop, &lt, &rt) {
+            // `int ** int` is an int only for a non-negative exponent, and a
+            // negative float base can give a complex number, as in typeshed.
+            (BinOp::Pow, Ty::Int | Ty::Bool, Ty::Int | Ty::Bool) => Some(if r_lit.is_some_and(|n| n >= 0) { Ty::Int } else { Ty::Any }),
+            (BinOp::Pow, Ty::Float, Ty::Int | Ty::Bool) => Some(Ty::Float),
+            (BinOp::Pow, Ty::Int | Ty::Bool | Ty::Float, Ty::Float) => Some(Ty::Any),
+            _ => None,
+        };
+        let (ty, origin) = match pow.map(|t| (t, None)).or_else(|| self.binop_type(bop, dunder, rdunder, &lt, &rt)) {
             Some(x) => x,
             None => {
                 let (ls, rs) = (self.show(&lt), self.show(&rt));
@@ -2690,8 +2777,11 @@ impl<'a> Lower<'a> {
                 }
                 (union(tys), origin)
             }
+            (Ty::Bool, Ty::Bool) if matches!(bop, BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor) => (Ty::Bool, None),
             (Ty::Int | Ty::Bool, Ty::Int | Ty::Bool) if bop != BinOp::Div => (Ty::Int, None),
-            (Ty::Int | Ty::Bool | Ty::Float, Ty::Int | Ty::Bool | Ty::Float) => (Ty::Float, None),
+            (Ty::Int | Ty::Bool | Ty::Float, Ty::Int | Ty::Bool | Ty::Float) if matches!(bop, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::FloorDiv | BinOp::Mod) => {
+                (Ty::Float, None)
+            }
             (Ty::Str, Ty::Str) if bop == BinOp::Add => (Ty::Str, None),
             (Ty::Tuple(a), Ty::Tuple(b)) if bop == BinOp::Add => (Ty::Tuple(a.iter().chain(b).cloned().collect()), None),
             (lt, rt) => match self.dunder(lt, dunder, std::slice::from_ref(rt)) {
@@ -2831,7 +2921,7 @@ impl<'a> Lower<'a> {
     }
 
     fn list_lit(&mut self, elts: &[Expr], hint: Option<&Ty>, off: u32) -> Val {
-        let want = hint.and_then(|h| self.builtin_args(h, "list")).and_then(|a| a.into_iter().next());
+        let want = self.container_hint(hint, "list").and_then(|a| a.into_iter().next());
         let refs: Vec<&Expr> = elts.iter().collect();
         let (items, elem) = self.items(&refs, want.as_ref(), "a list item");
         let elem = elem.unwrap_or_else(|| {
@@ -2845,7 +2935,7 @@ impl<'a> Lower<'a> {
     }
 
     fn dict_lit(&mut self, d: &ast::ExprDict, hint: Option<&Ty>, off: u32) -> Val {
-        let want = hint.and_then(|h| self.builtin_args(h, "dict"));
+        let want = self.container_hint(hint, "dict");
         let (wk, wv) = match &want {
             Some(a) if a.len() == 2 => (Some(a[0].clone()), Some(a[1].clone())),
             _ => (None, None),
@@ -2920,6 +3010,7 @@ impl<'a> Lower<'a> {
         let dst = self.reg(Repr::Obj);
         match body {
             CompBody::List(_) => self.emit(Instr::BuildList { dst, items: Vec::new() }),
+            CompBody::Set(_) => self.emit(Instr::BuildSet { dst, items: Vec::new() }),
             CompBody::Dict(..) => self.emit(Instr::BuildDict { dst, keys: Vec::new(), vals: Vec::new() }),
         };
         let mut elem = Vec::new();
@@ -2932,6 +3023,7 @@ impl<'a> Lower<'a> {
         }
         let ty = match (body, elem.as_slice()) {
             (CompBody::List(_), [t]) => self.builtin_inst("list", vec![t.clone()]),
+            (CompBody::Set(_), [t]) => self.builtin_inst("set", vec![t.clone()]),
             (CompBody::Dict(..), [k, v]) => self.builtin_inst("dict", vec![k.clone(), v.clone()]),
             _ => Ty::Any,
         };
@@ -2942,13 +3034,19 @@ impl<'a> Lower<'a> {
         let Some((g, rest)) = gens.split_first() else {
             match body {
                 CompBody::List(e) => {
-                    let want = hint.and_then(|h| self.builtin_args(h, "list")).and_then(|a| a.into_iter().next());
+                    let want = self.container_hint(hint, "list").and_then(|a| a.into_iter().next());
                     let (regs, t) = self.items(&[e], want.as_ref(), "a list item");
                     self.emit(Instr::ListAppend { list: dst, val: regs[0] });
                     elem.extend(t);
                 }
+                CompBody::Set(e) => {
+                    let want = self.container_hint(hint, "set").and_then(|a| a.into_iter().next());
+                    let (regs, t) = self.items(&[e], want.as_ref(), "a set item");
+                    self.emit(Instr::SetAdd { set: dst, val: regs[0] });
+                    elem.extend(t);
+                }
                 CompBody::Dict(k, v) => {
-                    let want = hint.and_then(|h| self.builtin_args(h, "dict")).filter(|a| a.len() == 2);
+                    let want = self.container_hint(hint, "dict").filter(|a| a.len() == 2);
                     let (kr, kt) = self.items(&[k], want.as_ref().map(|a| &a[0]), "a dict key");
                     let (vr, vt) = self.items(&[v], want.as_ref().map(|a| &a[1]), "a dict value");
                     self.emit(Instr::SetItem { obj: dst, key: kr[0], val: vr[0] });
@@ -3034,6 +3132,16 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+    }
+}
+
+/// Whether `t` contains `Any` (type variables are not `Any` here).
+fn mentions_any(t: &Ty) -> bool {
+    match t {
+        Ty::Any => true,
+        Ty::Tuple(v) | Ty::Union(v) | Ty::Inst(_, v) => v.iter().any(mentions_any),
+        Ty::TupleVar(x) | Ty::Type(x) => mentions_any(x),
+        _ => false,
     }
 }
 

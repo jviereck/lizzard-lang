@@ -268,3 +268,18 @@ fn exceptions_are_checked() {
         ]
     );
 }
+
+#[test]
+fn sets_and_operators_are_typed() {
+    let d = check(
+        "def f(xs: list[int]) -> None:\n    s = {1, 2}\n    t: set[str] = {x for x in [\"a\"]}\n    u = s | t\n    s.add(\"x\")\n    a: int = 2 ** 3\n    b: int = 2 ** len(xs)\n    c: float = 2.0 ** 2\n    d: int = 5 & 3 | 1 << 2\n    e: bool = True ^ False\n    g = 1.5 | 2\n    h: int = ~5\n    k: bool = all([])\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "unsupported operand types for |: set[int] and set[str]",
+            "argument `element` of add(): expected int, got str",
+            "unsupported operand types for |: float and int",
+        ]
+    );
+}
