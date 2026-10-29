@@ -118,6 +118,14 @@ struct Lower<'a> {
     nonlocal_names: Vec<String>,
     /// Inner functions and lambdas lowered inside this function.
     nested: Vec<FuncIr>,
+    /// In a generator function: what it yields and what `send` gives.
+    /// (`ret` is what its `return` gives.)
+    gen: Option<(Ty, Ty)>,
+    /// Nesting depth of comprehensions being lowered (no `yield` there).
+    in_comprehension: u32,
+    /// Type parameters in scope for annotations in the body (the
+    /// function's own, its class's, and the enclosing functions').
+    tparams: Vec<(String, TvId)>,
 }
 
 /// What a function's body is: statements, or a lambda's expression.
@@ -214,6 +222,9 @@ impl<'a> Lower<'a> {
             free: Vec::new(),
             nonlocal_names: Vec::new(),
             nested: Vec::new(),
+            gen: None,
+            in_comprehension: 0,
+            tparams: Vec::new(),
         }
     }
 
@@ -737,7 +748,43 @@ impl<'a> Lower<'a> {
         let path = self.db.files[self.file].path.clone();
         let saved_rigid = std::mem::replace(&mut self.db.rigid, spec.rigid);
         let scope = NameScope::of(spec.params, spec.body);
-        let mut l = Lower::new(self.db, self.m, self.file, false, spec.qual, spec.sig.ret.clone());
+        // A generator function: `yield`s type against `Y`, `send` gives `S`,
+        // and `return` gives `R` of its `Generator[Y, S, R]` result.
+        let generator = matches!(spec.body, FnBody::Stmts(b) if contains_yield(b));
+        let mut ret = spec.sig.ret.clone();
+        let mut gen = None;
+        if generator {
+            match self.generator_types(&spec.sig.ret) {
+                Some((y, s, r)) => {
+                    gen = Some((y, s));
+                    ret = r;
+                }
+                None => {
+                    let t = self.show(&spec.sig.ret);
+                    self.err(spec.name_off, format!("a generator function returns Iterator[T], Iterable[T] or Generator[Y, S, R], not {t}"));
+                    gen = Some((Ty::Any, Ty::Any));
+                    ret = Ty::Any;
+                }
+            }
+        }
+        let mut tparams = self.tparams.clone();
+        if let Some(m) = &spec.method {
+            tparams.extend(self.db.class_tparams(m.class));
+        }
+        let mut vars = Vec::new();
+        for p in &spec.sig.params {
+            collect_vars(&p.ty, &mut vars);
+        }
+        collect_vars(&spec.sig.ret, &mut vars);
+        for v in vars {
+            let name = self.db.tvs[v].name.clone();
+            if !tparams.iter().any(|(n, _)| *n == name) {
+                tparams.push((name, v));
+            }
+        }
+        let mut l = Lower::new(self.db, self.m, self.file, false, spec.qual, ret);
+        l.gen = gen;
+        l.tparams = tparams;
         l.line = spec.line;
         l.bound = scope.local_names().into_iter().collect();
         l.method = spec.method;
@@ -800,11 +847,30 @@ impl<'a> Lower<'a> {
             handlers: l.handlers,
             key: spec.key,
             free: spec.free.into_iter().map(|(n, _)| n).collect(),
+            generator,
         };
         let nested = l.nested;
         self.nested.extend(nested);
         self.db.rigid = saved_rigid;
         (ir, body_ty)
+    }
+
+    /// What a generator function annotated as returning `t` yields, accepts
+    /// from `send` and returns.
+    fn generator_types(&mut self, t: &Ty) -> Option<(Ty, Ty, Ty)> {
+        if matches!(t, Ty::Any) {
+            return Some((Ty::Any, Ty::Any, Ty::Any));
+        }
+        let Ty::Inst(c, args) = t else { return None };
+        let name = self.db.classes[*c].name.clone();
+        if !self.db.is_builtin_class(*c) {
+            return None;
+        }
+        match (name.as_str(), args.as_slice()) {
+            ("Generator", [y, s, r]) => Some((y.clone(), s.clone(), r.clone())),
+            ("Iterator" | "Iterable", [y]) => Some((y.clone(), Ty::None, Ty::None)),
+            _ => None,
+        }
     }
 
     /// The cells to pass to an inner function whose closure needs `names`
@@ -827,6 +893,22 @@ impl<'a> Lower<'a> {
             }
         }
         (free, regs)
+    }
+
+    /// The yield and send types where a `yield` is, or an error.
+    fn yield_context(&mut self, off: u32) -> Option<(Ty, Ty)> {
+        if self.in_comprehension > 0 {
+            self.err(off, "`yield` inside a comprehension is not allowed");
+            return None;
+        }
+        match self.gen.clone() {
+            Some(g) => Some(g),
+            None => {
+                let msg = if self.toplevel { "`yield` outside a function" } else { "`yield` in a lambda is not supported by Lizzard" };
+                self.err(off, msg);
+                None
+            }
+        }
     }
 
     /// Evaluate an inner function's defaults where it is defined, in
@@ -1193,7 +1275,16 @@ impl<'a> Lower<'a> {
                             let (o, k) = (self.obj(&obj), self.obj(&key));
                             self.emit(Instr::DelItem { obj: o, key: k });
                         }
-                        _ => self.err(off, "only `del x[key]` is supported by Lizzard yet"),
+                        // `del x` for a local: it is unbound afterwards.
+                        Expr::Name(n) if self.locals.get(n.id.as_str()).is_some_and(|l| !l.cell) => {
+                            let reg = self.locals[n.id.as_str()].reg;
+                            let check = self.reg(self.reprs[reg as usize]);
+                            self.emit(Instr::Move { dst: check, src: reg });
+                            self.emit(Instr::Unbind { reg });
+                            self.emit(Instr::Unbind { reg: check });
+                            self.invalidate(n.id.as_str());
+                        }
+                        _ => self.err(off, "only `del x[key]` and `del local` are supported by Lizzard yet"),
                     }
                 }
             }
@@ -1661,12 +1752,8 @@ impl<'a> Lower<'a> {
     }
 
     fn ann_assign(&mut self, a: &ast::StmtAnnAssign, off: u32) {
-        let mut tps = Vec::new();
-        let mut self_ty = None;
-        if let Some(m) = &self.method {
-            tps = self.db.class_tparams(m.class);
-            self_ty = Some(Ty::Var(self.db.self_tv(m.class)));
-        }
+        let tps = self.tparams.clone();
+        let self_ty = self.method.as_ref().map(|m| Ty::Var(self.db.self_tv(m.class)));
         let ty = self.db.eval_type(&a.annotation, &Scope { m: self.m, tparams: &tps, self_ty: self_ty.as_ref() });
         let Some(value) = &a.value else {
             // `x: T` declares a local (or global) that is assigned later.
@@ -1782,6 +1869,9 @@ impl<'a> Lower<'a> {
             let v = self.coerce(v, &l.ty, off, |_, got, want| format!("cannot assign {got} to `{name}` of type {want}"));
             let r = self.convert(&v, l.repr);
             self.emit(Instr::Move { dst: l.reg, src: r });
+            if r == v.reg {
+                self.release_temp(&v);
+            }
             self.invalidate(name);
             self.narrow_to(name.to_string(), &l.ty, &v.ty);
             return;
@@ -1796,11 +1886,20 @@ impl<'a> Lower<'a> {
         };
         let reg = self.reg(v.repr);
         self.emit(Instr::Move { dst: reg, src: v.reg });
+        self.release_temp(&v);
         self.invalidate(name);
         if let Some(a) = &ann {
             self.narrow_to(name.to_string(), a, &v.ty);
         }
         self.locals.insert(name.to_string(), Local { reg, ty: v.ty, repr: v.repr, cell: false });
+    }
+
+    /// A temporary register's object, now held by a local, is released, so
+    /// the local holds the only reference (`del x` frees it at once).
+    fn release_temp(&mut self, v: &Val) {
+        if v.repr == Repr::Obj && !self.locals.values().any(|l| l.reg == v.reg) && !self.handlers.iter().any(|h| h.exc == v.reg) {
+            self.emit(Instr::Unbind { reg: v.reg });
+        }
     }
 
     /// After assigning a value of type `got` to `key` declared `declared`:
@@ -2181,10 +2280,7 @@ impl<'a> Lower<'a> {
             Expr::Call(c) => self.call(c),
             Expr::Subscript(s) if matches!(self.db.sym_of_expr(self.m, &s.value), Some(Sym::Class(_))) => {
                 // `C[int]`: the class with explicit type arguments.
-                let tps = match &self.method {
-                    Some(m) => self.db.class_tparams(m.class),
-                    None => Vec::new(),
-                };
+                let tps = self.tparams.clone();
                 let t = self.db.eval_type(e, &Scope { m: self.m, tparams: &tps, self_ty: None });
                 let obj = self.expr(&s.value);
                 let key = self.expr(&s.slice);
@@ -2268,6 +2364,49 @@ impl<'a> Lower<'a> {
             Expr::Dict(d) => self.dict_lit(d, hint, off),
             Expr::ListComp(lc) => self.comprehension(&lc.generators, CompBody::List(&lc.elt), hint, off),
             Expr::Lambda(l) => self.lambda(l, hint, off),
+            Expr::Yield(y) => {
+                let Some((yt, st)) = self.yield_context(off) else { return self.any() };
+                let v = match &y.value {
+                    Some(e) => self.expr_hint(e, Some(&yt)),
+                    None => self.konst(Const::None, Ty::None),
+                };
+                let fname = self.fname.clone();
+                let v = self.coerce(v, &yt, off, |_, got, want| format!("`{fname}` yields {want}, but this yields {got}"));
+                let src = self.obj(&v);
+                let dst = self.reg(Repr::Obj);
+                self.emit(Instr::Yield { dst, src });
+                // `next()` sends None whatever the send type is.
+                let checked = Val { reg: dst, ty: union(vec![st.clone(), Ty::None]), repr: Repr::Obj };
+                self.check(&checked, format!("the value sent to `{fname}`"), None);
+                Val { reg: dst, ty: st, repr: Repr::Obj }
+            }
+            Expr::YieldFrom(y) => {
+                let Some((yt, _)) = self.yield_context(off) else { return self.any() };
+                let v = self.expr(&y.value);
+                let elem = self.iter_elem(&v.ty, y.value.range().start().into());
+                if !self.assignable(&elem, &yt) {
+                    let (a, b, f) = (self.show(&elem), self.show(&yt), self.fname.clone());
+                    self.err(off, format!("`yield from` yields {a}, but `{f}` yields {b}"));
+                }
+                // The result is the sub-generator's return value (None for
+                // other iterators).
+                let ty = match self.lookup_ty(&v.ty) {
+                    Ty::Any => Ty::Any,
+                    t => match self.db.builtin_class("Generator").and_then(|g| self.upcast(&t, g)) {
+                        Some(Ty::Inst(_, args)) if args.len() == 3 => args[2].clone(),
+                        _ => Ty::None,
+                    },
+                };
+                let o = self.obj(&v);
+                let iter = self.reg(Repr::Obj);
+                self.emit(Instr::GetIter { dst: iter, obj: o });
+                let dst = self.reg(Repr::Obj);
+                self.emit(Instr::YieldFrom { dst, iter });
+                let r = Val { reg: dst, ty, repr: Repr::Obj };
+                let what = self.src(e);
+                self.check(&r, what, None);
+                r
+            }
             Expr::Generator(_) => {
                 self.err(off, "generator expressions are not supported by Lizzard yet; use a list comprehension");
                 self.any()
@@ -3606,7 +3745,9 @@ impl<'a> Lower<'a> {
             CompBody::Dict(..) => self.emit(Instr::BuildDict { dst, keys: Vec::new(), vals: Vec::new() }),
         };
         let mut elem = Vec::new();
+        self.in_comprehension += 1;
         self.comp_level(gens, &body, hint, dst, &mut elem, off);
+        self.in_comprehension -= 1;
         for (n, l) in saved {
             match l {
                 Some(l) => self.locals.insert(n, l),
@@ -3919,6 +4060,30 @@ fn assigned_keys(body: &[Stmt], out: &mut Vec<String>) {
             _ => {}
         }
     }
+}
+
+/// Whether a function body contains `yield` (not counting nested
+/// functions and lambdas): it is a generator function.
+fn contains_yield(body: &[Stmt]) -> bool {
+    struct Finder(bool);
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if !matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, s);
+            }
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Yield(_) | Expr::YieldFrom(_) => self.0 = true,
+                // Their own scopes (`yield` in a comprehension is an error).
+                Expr::Lambda(_) | Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_) => {}
+                e => walk_expr(self, e),
+            }
+        }
+    }
+    let mut f = Finder(false);
+    body.iter().for_each(|s| f.visit_stmt(s));
+    f.0
 }
 
 fn is_builtin_call(c: &ast::ExprCall, name: &str) -> bool {

@@ -161,6 +161,14 @@ pub enum Instr {
     JumpIfTrue { cond: Reg, target: u32 },
     /// `raise exc` (a class is instantiated), or `raise exc from cause`.
     Raise { exc: Reg, cause: Option<Reg> },
+    /// Suspend the generator, producing `src`; it resumes at the next
+    /// instruction with the value sent in `dst` (or with an exception
+    /// raised here, by `throw`).
+    Yield { dst: Reg, src: Reg },
+    /// `yield from iter`: the generator object delegates `send`, `throw` and
+    /// `close` to `iter` until it finishes; then `dst` is its return value
+    /// and execution continues at the next instruction.
+    YieldFrom { dst: Reg, iter: Reg },
     /// Raise a caught exception again, as it is.
     Reraise { exc: Reg },
     /// `dst: Bool = isinstance(exc, cls)` for `except cls:`
@@ -251,6 +259,8 @@ pub struct FuncIr {
     pub handlers: Vec<HandlerIr>,
     /// The variables its closure provides, in cell order.
     pub free: Vec<String>,
+    /// A generator function: calling it creates a generator object.
+    pub generator: bool,
 }
 
 #[derive(Clone, Debug, Default)]

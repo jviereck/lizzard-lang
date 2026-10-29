@@ -2,6 +2,7 @@
 //! functions inside CPython.
 
 mod array;
+mod generator;
 mod interp;
 mod rt;
 
@@ -90,6 +91,7 @@ fn _stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 fn _lizzard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledModule>()?;
     m.add_class::<LizzardFunction>()?;
+    m.add_class::<generator::LizzardGenerator>()?;
     m.add_function(wrap_pyfunction!(compile_module, m)?)?;
     m.add_function(wrap_pyfunction!(_stats, m)?)?;
     Ok(())

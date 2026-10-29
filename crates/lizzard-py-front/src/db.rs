@@ -302,6 +302,7 @@ pub struct Db {
     pub globals: HashMap<(ModId, String), Ty>,
     /// Property getters' setters.
     setters: HashMap<FuncId, FuncId>,
+    protocol_depth: u32,
 }
 
 /// Lizzard's definitions for the builtins it types (see the file's header).
@@ -395,6 +396,7 @@ impl Db {
             rigid: Vec::new(),
             globals: HashMap::new(),
             setters: HashMap::new(),
+            protocol_depth: 0,
         }
     }
 
@@ -787,7 +789,7 @@ impl Db {
         }
         let s = match self.modules[m].kind {
             ModKind::Typing => match name {
-                "Iterable" | "Iterator" | "Sequence" => self.builtin(name),
+                "Iterable" | "Iterator" | "Sequence" | "Generator" => self.builtin(name),
                 "List" | "Dict" | "Set" | "FrozenSet" => self.builtin(&name.to_lowercase()),
                 _ => special_sym(name),
             },
@@ -1734,7 +1736,14 @@ impl Db {
                         Variance::Co => self.assign(a, b, s, any),
                         Variance::Contra => {
                             let b = subst(b, s);
-                            self.assign(&b, a, &mut Subst::new(), any)
+                            match &b {
+                                // Solve an open variable from the argument.
+                                Ty::Var(v) if !self.rigid.contains(v) => {
+                                    s.insert(*v, a.clone());
+                                    true
+                                }
+                                _ => self.assign(&b, a, &mut Subst::new(), any),
+                            }
                         }
                         Variance::Inv => {
                             self.assign(a, b, s, any) && {
@@ -1762,7 +1771,46 @@ impl Db {
                 return true;
             }
         }
-        false
+        self.protocol_assign(&Ty::Inst(c, args.to_vec()), dst, s, any)
+    }
+
+    /// `Iterable[T]` and `Iterator[T]` are protocols in typeshed: a class
+    /// with `__iter__` (and `__next__`) of the right types is one.
+    fn protocol_assign(&mut self, src: &Ty, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
+        let (Ty::Inst(c, _), Ty::Inst(d, dargs)) = (src, dst) else { return false };
+        if !self.is_builtin_class(*d) || dargs.len() != 1 || self.protocol_depth > 4 {
+            return false;
+        }
+        let want = match self.classes[*d].name.as_str() {
+            "Iterable" => Ty::Inst(*d, Vec::new()),
+            "Iterator" => Ty::Any,
+            _ => return false,
+        };
+        let iterable = matches!(want, Ty::Inst(..));
+        let method = if iterable { "__iter__" } else { "__next__" };
+        if !iterable && self.find_member(*c, "__iter__").is_none() {
+            return false;
+        }
+        let Some((_, Member::Method(f))) = self.find_member(*c, method) else { return false };
+        let sigs = self.sigs(f);
+        let [sig] = sigs.as_slice() else { return false };
+        // The result for this receiver.
+        let mut sub = Subst::new();
+        if let Some(p0) = sig.params.first() {
+            self.assign(src, &p0.ty, &mut sub, &mut false);
+        }
+        let ret = deep_subst(&sig.ret, &sub);
+        self.protocol_depth += 1;
+        let ok = if iterable {
+            match self.builtin_class("Iterator") {
+                Some(it) => self.assign(&ret, &Ty::Inst(it, dargs.clone()), s, any),
+                None => false,
+            }
+        } else {
+            self.assign(&ret, &dargs[0], s, any)
+        };
+        self.protocol_depth -= 1;
+        ok
     }
 
     // ---- display and runtime classes ----

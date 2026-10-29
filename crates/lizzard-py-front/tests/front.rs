@@ -83,7 +83,7 @@ fn overlay_with_wrong_version_is_ignored() {
 
 #[test]
 fn unsupported_constructs_are_reported() {
-    let d = check("def g() -> None:\n    match 1:\n        case _:\n            pass\n\ndef h() -> None:\n    x = yield 1\n");
+    let d = check("def g() -> None:\n    match 1:\n        case _:\n            pass\n\ndef h() -> None:\n    if (x := 1):\n        pass\n");
     assert_eq!(d, ["this statement is not supported by Lizzard yet", "this expression is not supported by Lizzard yet"]);
 }
 
@@ -358,6 +358,27 @@ fn dataclasses_get_an_init_from_their_fields() {
             "Q(): takes 4 positional arguments but 5 were given",
             "cannot assign int to `s` of type str",
             "cannot assign to field `a` of frozen dataclass `F`",
+        ]
+    );
+}
+
+#[test]
+fn generators_are_typed() {
+    let d = check(
+        "from typing import Generator, Iterator\n\ndef bad_ann() -> list[int]:\n    yield 1\n\ndef wrong_yield() -> Iterator[int]:\n    yield \"s\"\n\ndef wrong_return() -> Generator[int, None, str]:\n    yield 1\n    return 5\n\ndef sent() -> Generator[int, str, None]:\n    x = yield 1\n    n: int = x\n\ndef sub() -> Generator[int, None, str]:\n    yield 1\n    return \"r\"\n\ndef delegate() -> Iterator[int]:\n    yield from [\"a\"]\n    r: int = yield from sub()\n\nclass It:\n    def __iter__(self) -> Iterator[int]:\n        yield 1\n\ndef use() -> None:\n    sent().send(5)\n    xs: list[str] = list(It())\n    for s in wrong_yield():\n        t: str = s\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "a generator function returns Iterator[T], Iterable[T] or Generator[Y, S, R], not list[int]",
+            "`wrong_yield` yields int, but this yields str",
+            "`wrong_return` returns str, but this returns int",
+            "cannot assign str to `n` of type int",
+            "`yield from` yields str, but `delegate` yields int",
+            "cannot assign str to `r` of type int",
+            "argument `value` of send(): expected str, got int",
+            "cannot assign list[int] to `xs` of type list[str]",
+            "cannot assign int to `t` of type str",
         ]
     );
 }

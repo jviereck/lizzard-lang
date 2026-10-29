@@ -26,6 +26,7 @@ ARGUMENTS = HERE / "programs" / "arguments.py"
 GENERICS = HERE / "programs" / "generics.py"
 CLOSURES = HERE / "programs" / "closures.py"
 DATACLASSES = HERE / "programs" / "dataclasses_demo.py"
+GENERATORS = HERE / "programs" / "generators.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -165,7 +166,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -277,6 +278,88 @@ class Closures(unittest.TestCase):
         self.assertEqual(out.splitlines(), [
             "LizzardFunction make_counter.<locals>.inc LizzardFunction compose.<locals>.<lambda>",
             "compose.<locals>.<lambda>() argument 'x': expected int, got str",
+        ])
+
+
+class Generators(unittest.TestCase):
+    DRIVER = textwrap.dedent("""\
+        import collections.abc, sys, gc
+        import genedge as m
+
+        def show(label, f):
+            try:
+                print(label, "->", repr(f()))
+            except BaseException as e:
+                print(label, "->", type(e).__name__, e, "| cause:", type(e.__cause__).__name__ if e.__cause__ else None)
+
+        g = m.simple()
+        print(isinstance(g, collections.abc.Generator), isinstance(g, collections.abc.Iterator), iter(g) is g)
+        show("send to new", lambda: g.send(5))
+        show("next", lambda: next(g))
+        show("send 10", lambda: g.send(10))
+        show("send 20", lambda: g.send(20))
+        show("after end", lambda: next(g))
+        show("throw after end", lambda: g.throw(ValueError("late")))
+        show("pep479", lambda: list(m.leaks_stop()))
+        s = m.stubborn(); next(s)
+        show("ignored exit", lambda: s.close())
+        c = m.closer(); next(c)
+        show("close value", lambda: c.close())
+        show("close new", lambda: m.closer().close())
+        h = m.in_handler()
+        print(next(h), "| caller sees", sys.exception())
+        print(next(h), "| caller sees", sys.exception())
+        print(next(h))
+        t = m.thrower(); next(t)
+        show("throw type+val", lambda: t.throw(ValueError, "v"))
+        show("next after throw", lambda: next(t))
+        t2 = m.thrower(); next(t2)
+        show("throw instance", lambda: t2.throw(ValueError("a", "b")))
+        show("throw unstarted", lambda: m.thrower().throw(KeyError("k")))
+        show("throw non-exception", lambda: m.thrower().throw(42))
+        show("deep", lambda: list(m.deep()))
+        show("self ref", lambda: next(m.G))
+        b = m.bad_finally(); next(b)
+        show("close bad finally", lambda: b.close())
+        b2 = m.bad_finally(); next(b2)
+        del b2
+        gc.collect()
+        print("done")
+        """)
+
+    def test_protocol_matches_cpython(self):
+        # The same driver over the module compiled by Lizzard, and imported
+        # by plain CPython.
+        lizzard = run("-c", "import lizzard\n" + self.DRIVER, cwd=GENERATORS.parent)
+        plain = run("-c", self.DRIVER, cwd=GENERATORS.parent)
+        self.assertEqual(lizzard[0], 0, lizzard[2])
+        self.assertEqual(lizzard[1], plain[1])
+        self.assertIn("generator raised StopIteration", lizzard[1])
+        # Unfinished generators are closed when freed, and errors there are
+        # reported, as CPython does.
+        for err in (lizzard[2], plain[2]):
+            self.assertIn("DeprecationWarning: the (type, exc, tb) signature of throw() is deprecated", err)
+            self.assertIn("RuntimeError: finally failed", err)
+            self.assertIn("RuntimeError: generator ignored GeneratorExit", err)
+        self.assertEqual(lizzard[2].count("Exception ignored while closing generator <Lizzard generator object"), 2)
+
+    def test_generators_are_lizzard_generators(self):
+        code, out, err = run("-c", textwrap.dedent("""\
+            import lizzard, inspect
+            import generators as g
+            it = g.count(3)
+            print(type(it).__name__, it.__qualname__, it.gi_running, list(it))
+            print(type(g.Tree.__iter__).__name__)
+            try:
+                g.count("x")
+            except TypeError as e:
+                print(e)
+            """), cwd=GENERATORS.parent)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            "LizzardGenerator count False [0, 1, 2]",
+            "LizzardFunction",
+            "count() argument 'n': expected int, got str",
         ])
 
 

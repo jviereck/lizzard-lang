@@ -13,6 +13,7 @@ use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PySet, PyString, PyTuple, 
 use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, ParamKind, Repr};
 
 use crate::array;
+use crate::generator::{self, LizzardGenerator, Sent};
 use crate::rt;
 
 /// A module's functions by key, for creating inner functions and lambdas.
@@ -20,7 +21,7 @@ pub type Table = Arc<OnceLock<HashMap<String, Arc<FuncRt>>>>;
 
 pub struct FuncRt {
     pub ir: FuncIr,
-    consts: Vec<Py<PyAny>>,
+    pub(crate) consts: Vec<Py<PyAny>>,
     names: Vec<Py<PyString>>,
     table: Table,
 }
@@ -33,7 +34,7 @@ impl FuncRt {
                 Const::None => py.None().into_bound(py),
                 Const::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
                 Const::Int(i) => i.into_pyobject(py)?.into_any(),
-                Const::BigInt(s) => py.import("builtins")?.getattr("int")?.call1((s.as_str(),))?,
+                Const::BigInt(s) => builtins(py)?.getattr("int")?.call1((s.as_str(),))?,
                 Const::Float(f) => f.into_pyobject(py)?.into_any(),
                 Const::Str(s) => PyString::new(py, s).into_any(),
             };
@@ -70,6 +71,11 @@ impl LizzardFunction {
         let ir = &self.rt.ir;
         let bound = bind_args(ir, &self.rt.consts, &self.defaults, args, kwargs)?;
         check_args(py, ir, &bound)?;
+        if ir.generator {
+            // A generator function returns a generator over a new frame.
+            let g = LizzardGenerator::new(self.rt.clone(), self.globals.clone_ref(py), self.closure.iter().map(|c| c.clone_ref(py)).collect(), bound);
+            return Ok(Py::new(py, g)?.into_any());
+        }
         run(py, &self.rt, self.globals.bind(py), bound, &self.closure)
     }
 
@@ -240,7 +246,8 @@ fn check_args(py: Python<'_>, ir: &FuncIr, bound: &[Bound<'_, PyAny>]) -> PyResu
     Ok(())
 }
 
-enum V<'py> {
+/// A register.
+pub(crate) enum V<'py> {
     Empty,
     O(Bound<'py, PyAny>),
     I(i64),
@@ -248,32 +255,67 @@ enum V<'py> {
     B(bool),
 }
 
+/// How execution leaves a function's frame. The frame (registers and pc) is
+/// left as it was, so a generator can resume it: these exits and the entry
+/// of `exec` (a pc, with an exception raised there or not) are the
+/// transitions a compiled function needs too.
+pub(crate) enum Exit<'py> {
+    Return(Bound<'py, PyAny>),
+    /// `yield value` at the current pc; the sent value goes to `dst`.
+    Yield { value: Bound<'py, PyAny>, dst: u32 },
+    /// `yield from iter` at the current pc, which produced `value`; `iter`
+    /// takes over until it finishes and its return value goes to `dst`.
+    YieldFrom { value: Bound<'py, PyAny>, dst: u32, iter: Bound<'py, PyAny> },
+}
+
 fn unbound() -> PyErr {
     PyUnboundLocalError::new_err("local variable referenced before assignment")
 }
 
 fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>, closure: &[Py<PyAny>]) -> PyResult<Py<PyAny>> {
-    let ir = &f.ir;
-    let mut regs: Vec<V<'py>> = (0..ir.reprs.len()).map(|_| V::Empty).collect();
+    let mut regs: Vec<V<'py>> = (0..f.ir.reprs.len()).map(|_| V::Empty).collect();
     for (i, a) in args.into_iter().enumerate() {
         regs[i] = V::O(a);
     }
     let mut pc = 0usize;
+    match exec(py, f, globals, closure, &mut regs, &mut pc, None)? {
+        Exit::Return(v) => Ok(v.unbind()),
+        Exit::Yield { .. } | Exit::YieldFrom { .. } => unreachable!("yield in a function that is not a generator"),
+    }
+}
+
+/// Run a frame from `pc` until it returns or yields. With `pending`, the
+/// instruction at `pc` raises it (a generator's `throw`).
+pub(crate) fn exec<'py>(
+    py: Python<'py>,
+    f: &FuncRt,
+    globals: &Bound<'py, PyDict>,
+    closure: &[Py<PyAny>],
+    regs: &mut [V<'py>],
+    pc: &mut usize,
+    mut pending: Option<PyErr>,
+) -> PyResult<Exit<'py>> {
+    let ir = &f.ir;
     loop {
-        match step(py, f, globals, closure, &mut regs, &mut pc) {
-            Ok(Some(ret)) => return Ok(ret),
+        let r = match pending.take() {
+            Some(e) => Err(e),
+            None => step(py, f, globals, closure, regs, pc),
+        };
+        match r {
+            Ok(Some(exit)) => return Ok(exit),
             Ok(None) => {}
             Err(e) => {
+                let pc = &mut *pc;
                 // The innermost handler covering the instruction: regions
                 // nest, and an inner handler is created after its outer one.
-                let at = pc as u32;
+                let at = *pc as u32;
                 let handler = ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e));
                 if let Some(h) = handler {
                     regs[h.exc as usize] = V::O(e.into_value(py).into_bound(py).into_any());
-                    pc = h.target as usize;
+                    *pc = h.target as usize;
                     continue;
                 }
-                let line = ir.lines.get(pc).copied().unwrap_or(ir.line);
+                let line = ir.lines.get(*pc).copied().unwrap_or(ir.line);
                 let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
                 return Err(e);
             }
@@ -299,6 +341,13 @@ macro_rules! scalar {
             _ => unreachable!("register {} has the wrong representation", $r),
         }
     };
+}
+
+/// The `builtins` module, found once (also usable while the interpreter
+/// shuts down and imports no longer work).
+fn builtins(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static BUILTINS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(BUILTINS.get_or_try_init(py, || py.import("builtins").map(|m| m.into_any().unbind()))?.bind(py))
 }
 
 fn cell_get<'py>(py: Python<'py>, cell: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -332,7 +381,7 @@ fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>
 }
 
 /// Execute one instruction; `Some` when the function returns.
-fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut [V<'py>], pc: &mut usize) -> PyResult<Option<Py<PyAny>>> {
+fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut [V<'py>], pc: &mut usize) -> PyResult<Option<Exit<'py>>> {
     let ir = &f.ir;
     let instr = &ir.code[*pc];
     let mut next = *pc + 1;
@@ -342,7 +391,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             let n = f.names[*name as usize].bind(py);
             let v = match globals.get_item(n)? {
                 Some(v) => v,
-                None => py.import("builtins")?.getattr(n).map_err(|_| PyNameError::new_err(format!("name '{n}' is not defined")))?,
+                None => builtins(py)?.getattr(n).map_err(|_| PyNameError::new_err(format!("name '{n}' is not defined")))?,
             };
             regs[*dst as usize] = V::O(v);
         }
@@ -551,10 +600,20 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             regs[*dst as usize] = V::O(it.into_any());
         }
         Instr::ForIter { dst, iter, target } => {
-            let mut it = obj!(regs, *iter).cast::<PyIterator>().map_err(PyErr::from)?.clone();
-            match it.next() {
-                Some(v) => regs[*dst as usize] = V::O(v?),
-                None => next = *target as usize,
+            let it = obj!(regs, *iter);
+            // A Lizzard generator is resumed directly, without an exception
+            // at the end.
+            if let Ok(g) = it.cast::<LizzardGenerator>() {
+                match g.get().resume(py, generator::Op::Send(py.None().into_bound(py)))? {
+                    Sent::Next(v) => regs[*dst as usize] = V::O(v),
+                    Sent::Return(_) => next = *target as usize,
+                }
+            } else {
+                let mut it = it.cast::<PyIterator>().map_err(PyErr::from)?.clone();
+                match it.next() {
+                    Some(v) => regs[*dst as usize] = V::O(v?),
+                    None => next = *target as usize,
+                }
             }
         }
         Instr::Unpack { src, dsts } => {
@@ -692,7 +751,17 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             };
             regs[*dst as usize] = V::O(v);
         }
-        Instr::Return { src } => return Ok(Some(obj!(regs, *src).clone().unbind())),
+        Instr::Return { src } => return Ok(Some(Exit::Return(obj!(regs, *src).clone()))),
+        // Both leave `pc` at the instruction: the generator resumes after it,
+        // or raises there.
+        Instr::Yield { dst, src } => return Ok(Some(Exit::Yield { value: obj!(regs, *src).clone(), dst: *dst })),
+        Instr::YieldFrom { dst, iter } => {
+            let it = obj!(regs, *iter).clone();
+            match generator::send_to(&it, &py.None().into_bound(py))? {
+                Sent::Next(value) => return Ok(Some(Exit::YieldFrom { value, dst: *dst, iter: it })),
+                Sent::Return(v) => regs[*dst as usize] = V::O(v),
+            }
+        }
         Instr::I64Const { dst, value } => regs[*dst as usize] = V::I(*value),
         Instr::I64Lt { dst, a, b } => regs[*dst as usize] = V::B(scalar!(regs, *a, I) < scalar!(regs, *b, I)),
         Instr::I64Add { dst, a, b } => regs[*dst as usize] = V::I(scalar!(regs, *a, I) + scalar!(regs, *b, I)),

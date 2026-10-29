@@ -1,10 +1,11 @@
 # Lizzard's definitions for the builtins it types: the containers (`list`,
-# `dict`, `tuple`), `str` methods, iteration and a few builtin functions.
-# Bundled into the front end until it bundles typeshed. `int`, `float`,
-# `bool`, `str`, `tuple`, `object`, `type`, `None` and the exception classes
-# are built into the checker; the `str` and `tuple` classes here only supply
-# their methods. Unions are not supported yet, so a few signatures that
-# return `X | None` in typeshed are split into overloads or return `Any`.
+# `dict`, `set`, `tuple`), `str` methods, iteration and generators, and
+# builtin functions. Bundled into the front end until it bundles typeshed.
+# `int`, `float`, `bool`, `str`, `tuple`, `object`, `type`, `None` and the
+# exception classes are built into the checker; the `str` and `tuple`
+# classes here only supply their methods. A few signatures that return
+# `X | None` in typeshed return `Any` instead, so that ordinary use needs no
+# narrowing (`dict.get(key)`).
 from typing import Any, Callable, Generic, TypeVar, overload
 
 _T = TypeVar("_T")
@@ -14,6 +15,9 @@ _V = TypeVar("_V")
 _T_co = TypeVar("_T_co", covariant=True)
 _K_co = TypeVar("_K_co", covariant=True)
 _V_co = TypeVar("_V_co", covariant=True)
+_Y_co = TypeVar("_Y_co", covariant=True)
+_S_contra = TypeVar("_S_contra", contravariant=True)
+_R_co = TypeVar("_R_co", covariant=True)
 
 class Iterable(Generic[_T_co]):
     def __iter__(self) -> Iterator[_T_co]: ...
@@ -21,6 +25,15 @@ class Iterable(Generic[_T_co]):
 class Iterator(Iterable[_T_co]):
     def __next__(self) -> _T_co: ...
     def __iter__(self) -> Iterator[_T_co]: ...
+
+# What a generator function returns: it yields `_Y_co`, accepts `_S_contra`
+# from `send()`, and its `return` value is `_R_co` (`StopIteration.value`).
+class Generator(Iterator[_Y_co], Generic[_Y_co, _S_contra, _R_co]):
+    def __next__(self) -> _Y_co: ...
+    def __iter__(self) -> Generator[_Y_co, _S_contra, _R_co]: ...
+    def send(self, value: _S_contra, /) -> _Y_co: ...
+    def throw(self, exc: BaseException, /) -> _Y_co: ...
+    def close(self) -> None: ...
 
 class Sequence(Iterable[_T_co]):
     def __len__(self) -> int: ...

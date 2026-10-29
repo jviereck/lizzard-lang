@@ -6,6 +6,7 @@ top level runs on CPython as usual.
 """
 
 import ast
+import collections.abc
 import importlib.abc
 import importlib.machinery
 import os
@@ -15,6 +16,9 @@ import warnings
 from . import _lizzard
 
 MARKER = "# lizzard: module"
+
+# Lizzard generators implement the generator protocol.
+collections.abc.Generator.register(_lizzard.LizzardGenerator)
 
 
 class CheckError(Exception):
