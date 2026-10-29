@@ -110,7 +110,7 @@ How the compiler keeps them fast:
 **Standard stub features:**
 - `@overload` is resolved statically, falling back to `Any` when ambiguous.
 - `TypeVar` and generics are supported.
-- `ParamSpec`, `TypedDict`, `Literal` and `Protocol` are checked at the boundary or treated as `Any`.
+- `Protocol` and `Literal` are modelled (below); `ParamSpec` and `TypedDict` are treated as `Any`.
 
 **Tooling:**
 - `lizzard stubgen m` bootstraps a definition file from runtime introspection plus any existing `.pyi`.
@@ -190,7 +190,7 @@ A first end-to-end slice runs the float32 NumPy example (`examples/numpy_add/add
   - runtime checks and qualified-name resolution (`rt.rs`);
   - direct float32 element access with a layout check (`array.rs`).
 - **The Python package** (`crates/lizzard-py/python/lizzard`): the import hook, `python -m lizzard`, and the NumPy overlay `stubs/numpy/__init__.pyi`.
-- **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `set`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and builtin functions (`isinstance`, `enumerate`, `zip`, `map`, `filter`, `sorted`, `min`/`max` with `key=`, `sum`, `any`, `all`, `iter`, `next`, `open`, ...). They stand in for typeshed until it is bundled. `typing`/`collections.abc` names such as `Iterable`, `Sequence`, `Callable` map to them.
+- **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `set`, `tuple` and `str` methods, the standard protocols (`SupportsIndex`, `Sized`, `Hashable`, `Collection`, ...), `Iterable`/`Iterator`/`Sequence`, `range`, and builtin functions (`isinstance`, `enumerate`, `zip`, `map`, `filter`, `sorted`, `min`/`max` with `key=`, `sum`, `any`, `all`, `iter`, `next`, `open`, ...). They stand in for typeshed until it is bundled. `typing`/`collections.abc` names such as `Iterable`, `Sequence`, `Callable` map to them.
 - **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. Each program in `tests/programs/` (classes, containers, unions, globals, exceptions, sets and operators, arguments, generics, closures, dataclasses, generators, operator overloading, properties) must print exactly what plain CPython prints.
 
 **Supported language subset:**
@@ -217,6 +217,18 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Operator overloading** through dunders: arithmetic, bitwise and `@` operators with their reflected forms (`__radd__`, ...) and in-place forms (`a += b` uses `__iadd__` if defined), unary `-`/`+`/`~`, rich comparisons (a comparison uses the left operand's method, else the right one's reflected method, as Python does; ordering objects that define neither is an error, `==`/`!=` fall back to identity), chained comparisons, `__getitem__`/`__setitem__`/`__delitem__`, `__contains__`, `__iter__`, `__len__`, `__bool__`, `__call__`, and builtins that dispatch to dunders (`abs()`, `min`/`max`, `float()`, `hash()`, ...).
 - **Properties:** `@property` with `@x.getter`, `@x.setter` and `@x.deleter`, each compiled. Reads use the getter, assignments are checked against the setter, `del obj.x` needs a deleter; a property without a setter is read-only. `del obj.attr` also deletes plain attributes.
 - **`typing.Protocol`:** a class matches a protocol structurally, by the types of the members the protocol declares. Protocol-typed values are not `isinstance`-checked at runtime (Python allows that only for `@runtime_checkable` protocols), and a protocol's own methods stay Python functions.
+  - **Builtin values match protocols too.** `int`, `float`, `bool`, `str`, tuples and the containers match by their builtins classes' methods, so `SupportsIndex`, `SupportsInt`, `SupportsFloat`, `SupportsAbs[T]`, `Sized`, `Hashable`, `Container`, `Collection[T]` and `Reversible[T]` (from `typing` or `collections.abc`) take what typeshed's do: `list` is not `Hashable` (its `__hash__` is None), nor is a class that defines `__eq__` without `__hash__`.
+  - **Callback protocols:** a function, lambda or class matches a protocol whose only member is `__call__`, by its signature; a lambda takes its parameter types from the protocol.
+  - **Recursive protocols** (`_NestedSequence[T]`, whose items are `T | _NestedSequence[T]`) are checked assuming the check in progress holds.
+  - **Nominal first:** a class that names a protocol among its bases matches it as a subclass (`str` is a `Collection[str]` through `Sequence[str]`, although its `__contains__` takes only `str`).
+  - Forward references in quotes (`list["Node"]`) are types.
+- **`Literal` types.** `Literal["r", "w"]` is a union of literal types; its aliases (`type Mode = ...`, or `Mode = Literal[...]`) work as in mypy.
+  - A literal expression has a literal type where one is expected (an annotation, a `Literal` parameter, a default, a return), and a literal argument picks `Literal` overloads (`load(path, "binary")`). Elsewhere it is its base type, and an unannotated variable takes the base type (`n = one()` is an `int`).
+  - Literal types are subtypes of their base types; arithmetic, methods and comparisons use the base type.
+  - `x == "r"` and `x != "r"` narrow a literal union to that member, or to the others.
+  - At the boundary, a literal-typed value is checked against its base type only.
+- **Unions in definition files are types** everywhere, now that their protocol and literal parameters are modelled. NumPy's own overloads then type `np.arange(10)` (`ndarray[tuple[int], dtype[intp]]`), `np.zeros((2, 3), dtype=np.float32)` and `np.empty_like(a)` precisely, so the overlay no longer declares them.
+- **`reveal_type(x)`** reports x's static type as a note (`note: revealed type is ...`), as mypy does, without failing the check. Imported from `typing`, it is also called at runtime.
 - Overrides must be compatible: the same arguments with parameter types at least as wide, and a return type at least as narrow. A redeclared attribute keeps its type.
 - `@dataclass` (from `dataclasses`): the checker builds `__init__` from the annotated fields (inherited dataclass fields first; defaults from values, `field(default=...)` and `field(default_factory=...)`; `kw_only=True`, `init=False`, `order=True`). Assigning a field of a frozen dataclass is an error. CPython generates the methods at runtime.
 - PEP 695 generic classes (`class Stack[T]:`), with explicit arguments (`Stack[int]()`) or inferred from `__init__` (`Pair("a", 1)` is `Pair[str, int]`). Inside the class, `T` and `Self` are *rigid*: only values of that type itself are assignable to them, so `return 5` in a method returning `T` is an error.
@@ -248,7 +260,6 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **A local keeps the type of its first assignment.** Reusing a name for a value of another type is an error, as in mypy.
 - **`dict.get(key)` is `Any`**; `get(key, default)` is `V`. (Typeshed has `V | None`; that would make every `get` need a check.)
 - **Generator expressions are rejected** rather than compiled eagerly as lists, which would change when their items are computed. List comprehensions work.
-- **Unions in third-party definition files are `Any`.** NumPy's stubs use them mostly for parameters built from protocols, which the checker does not model yet; real unions there would reject valid calls. Lizzard modules and the bundled builtins have real unions.
 - **A type variable is fixed by its first argument.** `same(1, "a")` for `def same[T](a: T, b: T)` is an error rather than `T = int | str` (widening could be unsound with invariant containers).
 - **A lambda needs an expected `Callable` type** for its parameters (an annotation, a parameter, `key=`); `f = lambda x: ...` alone is an error, like an unannotated `def`.
 - **A name is local to a function if it is assigned anywhere in it**, as in Python: reading it before the assignment is an error rather than a read of the global.
@@ -264,7 +275,7 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
 **Deferred:**
 - checking that overlays only refine the base declarations;
-- bundled typeshed (stdlib modules without a definition file are `Any`), `@runtime_checkable` protocols and `Literal` types;
+- bundled typeshed (stdlib modules without a definition file are `Any`), `@runtime_checkable` protocols, `Literal` enum members, `ParamSpec` and `TypedDict`;
 - `threading.local`, whose instances take arbitrary attributes;
 - generator expressions, `async` (coroutines, async generators), `match`, `except*`, the walrus operator, `del` of globals;
 - `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;

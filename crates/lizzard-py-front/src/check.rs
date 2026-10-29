@@ -332,17 +332,7 @@ impl<'a> Lower<'a> {
 
     /// `t` (a class instance) as an instance of its base class `target`.
     fn upcast(&mut self, t: &Ty, target: ClassId) -> Option<Ty> {
-        let Ty::Inst(c, args) = t else { return None };
-        if *c == target {
-            return Some(t.clone());
-        }
-        let map: Subst = self.db.class_params(*c).into_iter().zip(args.iter().cloned()).collect();
-        for b in self.db.class_bases(*c) {
-            if let Some(v) = self.upcast(&subst(&b, &map), target) {
-                return Some(v);
-            }
-        }
-        None
+        self.db.base_view(t, target)
     }
 
     /// The type arguments of `t` if it is the builtin class `class`.
@@ -355,6 +345,7 @@ impl<'a> Lower<'a> {
     fn lookup_ty(&mut self, t: &Ty) -> Ty {
         match t {
             Ty::Var(_) => self.db.upper(t),
+            Ty::Lit(_) | Ty::Union(_) if has_lit(t) => self.lookup_ty(&decay(t)),
             Ty::Str | Ty::Tuple(_) | Ty::TupleVar(_) => self.db.nominal(t).unwrap_or(Ty::Any),
             t => t.clone(),
         }
@@ -365,6 +356,14 @@ impl<'a> Lower<'a> {
     fn join(&mut self, a: &Ty, b: &Ty) -> Ty {
         if a == b {
             return a.clone();
+        }
+        // Literals join to their union (`"r" if c else "w"` where a literal
+        // type is expected), or with anything else to their base type.
+        if has_lit(a) && has_lit(b) {
+            return union(vec![a.clone(), b.clone()]);
+        }
+        if has_lit(a) || has_lit(b) {
+            return self.join(&decay(a), &decay(b));
         }
         if matches!(a, Ty::Any) || matches!(b, Ty::Any) {
             return Ty::Any;
@@ -407,6 +406,9 @@ impl<'a> Lower<'a> {
     fn rtcheck(&mut self, t: &Ty) -> RtCheck {
         match t {
             Ty::Int => RtCheck::Int,
+            // The value itself is not checked: a literal type is a promise
+            // about Lizzard code, which the checker keeps.
+            Ty::Lit(l) => self.rtcheck(&l.base()),
             Ty::Float => RtCheck::Float,
             Ty::Bool => RtCheck::Bool,
             Ty::Str => RtCheck::Str,
@@ -1015,7 +1017,16 @@ impl<'a> Lower<'a> {
         // The expected `Callable` gives the parameters without defaults (or
         // all of them); the others take their default's type.
         let required = defaults.iter().filter(|d| !**d).count();
-        let expected = hint.into_iter().flat_map(members).find_map(|m| match m {
+        // A callback protocol stands for its `__call__`.
+        let cands: Vec<Ty> = hint.into_iter().flat_map(members).collect();
+        let cands: Vec<Ty> = cands
+            .into_iter()
+            .map(|m| match &m {
+                Ty::Inst(c, _) if self.db.is_protocol(*c) => self.db.callable_of(&m).unwrap_or(m),
+                _ => m,
+            })
+            .collect();
+        let expected = cands.into_iter().find_map(|m| match m {
             Ty::Callable(Some(ps), r) if ps.len() == required || ps.len() == names.len() => Some((ps, *r)),
             Ty::Callable(None, r) if required == 0 => Some((Vec::new(), *r)),
             _ => None,
@@ -1151,6 +1162,10 @@ impl<'a> Lower<'a> {
             self.err(off, format!("parameter `{pname}`: only literal default values are supported by Lizzard yet"));
             return None;
         }
+        let t = match literal_value(e) {
+            Some(l) if has_lit(ty) => Ty::Lit(l),
+            _ => t,
+        };
         if !self.assignable(&t, ty) {
             let (got, want) = (self.show(&t), self.show(ty));
             self.err(off, format!("the default of `{pname}` is {got}, but the parameter is {want}"));
@@ -1891,6 +1906,9 @@ impl<'a> Lower<'a> {
                 let v = self.coerce(v, &t, off, |_, got, want| format!("cannot assign {got} to `{name}` of type {want}"));
                 Val { ty: t, ..v }
             }
+            // An unannotated variable takes a literal's base type, as in mypy
+            // (`n = one()` for `def one() -> Literal[1]` is an int).
+            None if matches!(v.ty, Ty::Lit(_)) => Val { ty: decay(&v.ty), ..v },
             None => v,
         };
         let reg = self.reg(v.repr);
@@ -1979,6 +1997,27 @@ impl<'a> Lower<'a> {
                 let not_none = without_none(&cur);
                 let (yes, no) = (vec![(key.clone(), is_none)], vec![(key, not_none)]);
                 if c.ops[0] == ast::CmpOp::Is { (yes, no) } else { (no, yes) }
+            }
+            // `x == "r"` for x of a literal type: x is `Literal["r"]`, and
+            // otherwise one of the other members.
+            Expr::Compare(c) if c.ops.len() == 1 && matches!(c.ops[0], ast::CmpOp::Eq | ast::CmpOp::NotEq) => {
+                let (subject, lit) = match (literal_value(&c.operands[0]), literal_value(&c.operands[1])) {
+                    (None, Some(l)) => (&c.operands[0], l),
+                    (Some(l), None) => (&c.operands[1], l),
+                    _ => return none,
+                };
+                let Some(key) = self.narrow_key(subject) else { return none };
+                let Some(cur) = self.key_type(&key, subject) else { return none };
+                let ms = members(&cur);
+                if !ms.contains(&Ty::Lit(lit.clone())) {
+                    return none;
+                }
+                let yes = vec![(key.clone(), Ty::Lit(lit.clone()))];
+                // Only literal members can be ruled out: a `str` member may
+                // still equal "r".
+                let rest: Vec<Ty> = ms.iter().filter(|m| **m != Ty::Lit(lit.clone())).cloned().collect();
+                let no = if !rest.is_empty() { vec![(key, union(rest))] } else { Vec::new() };
+                if c.ops[0] == ast::CmpOp::Eq { (yes, no) } else { (no, yes) }
             }
             Expr::Call(call) if is_builtin_call(call, "isinstance") && call.arguments.args.len() == 2 && !self.locals.contains_key("isinstance") => {
                 let subject = &call.arguments.args[0];
@@ -2261,6 +2300,13 @@ impl<'a> Lower<'a> {
     /// literals take their item types from it.
     fn expr_hint(&mut self, e: &Expr, hint: Option<&Ty>) -> Val {
         let off = self.at(e);
+        // Where a `Literal` type is expected, a literal is its literal type.
+        if let (Some(h), Some(l)) = (hint, literal_value(e)) {
+            if has_lit(h) {
+                let v = self.expr_hint(e, None);
+                return Val { ty: Ty::Lit(l), ..v };
+            }
+        }
         match e {
             Expr::NumberLiteral(n) => match &n.value {
                 ast::Number::Int(i) => match i.as_i64() {
@@ -2443,7 +2489,7 @@ impl<'a> Lower<'a> {
                     },
                     operand => {
                         let v = self.expr(operand);
-                        let ty = match &v.ty {
+                        let ty = match &decay(&v.ty) {
                             Ty::Any => Ty::Any,
                             Ty::Int | Ty::Bool => Ty::Int,
                             Ty::Float => Ty::Float,
@@ -2471,7 +2517,7 @@ impl<'a> Lower<'a> {
                 ast::UnaryOp::Invert | ast::UnaryOp::UAdd => {
                     let invert = u.op == ast::UnaryOp::Invert;
                     let v = self.expr(&u.operand);
-                    let ty = match &v.ty {
+                    let ty = match &decay(&v.ty) {
                         Ty::Any => Ty::Any,
                         Ty::Int | Ty::Bool => Ty::Int,
                         Ty::Float if !invert => Ty::Float,
@@ -2935,6 +2981,15 @@ impl<'a> Lower<'a> {
             self.emit(Instr::Len { dst, obj: o });
             return Val { reg: dst, ty: Ty::Int, repr: Repr::I64 };
         }
+        // `reveal_type(x)` reports x's static type as a note, like mypy's, and
+        // evaluates to x. Imported from `typing`, it is also called (and
+        // prints x's runtime type); otherwise it is only a note.
+        let reveal = is_builtin_call(c, "reveal_type") && !self.locals.contains_key("reveal_type") && c.arguments.args.len() == 1 && c.arguments.keywords.is_empty();
+        if reveal && self.db.lookup_in(self.m, "reveal_type").is_none() {
+            let v = self.expr(&c.arguments.args[0]);
+            self.reveal(&v.ty, off);
+            return v;
+        }
         let fv = self.expr(&c.func);
         if c.arguments.args.iter().any(|a| matches!(a, Expr::Starred(_))) || c.arguments.keywords.iter().any(|k| k.arg.is_none()) {
             return self.star_call(c, fv, off);
@@ -2974,11 +3029,18 @@ impl<'a> Lower<'a> {
         }
         let pos: Vec<Val> = pos.into_iter().map(Option::unwrap).collect();
         let kws: Vec<(String, Val)> = kws.into_iter().map(|(n, v)| (n, v.unwrap())).collect();
-        let pos_tys: Vec<Ty> = pos.iter().map(|v| v.ty.clone()).collect();
-        let kw_tys: Vec<(String, Ty)> = kws.iter().map(|(n, v)| (n.clone(), v.ty.clone())).collect();
+        // A literal argument is its literal type, so that it matches a
+        // `Literal` parameter (and picks a `Literal` overload).
+        let lit_ty = |e: &Expr, v: &Val| literal_value(e).map_or_else(|| v.ty.clone(), Ty::Lit);
+        let pos_tys: Vec<Ty> = pos.iter().zip(c.arguments.args.iter()).map(|(v, e)| lit_ty(e, v)).collect();
+        let kw_tys: Vec<(String, Ty)> = kws.iter().zip(c.arguments.keywords.iter()).map(|((n, v), k)| (n.clone(), lit_ty(&k.value, v))).collect();
         let mut origin = None;
         let mut builtin_ctor = false;
-        let ret = self.call_type(fv.ty.clone(), &pos_tys, &kw_tys, off, &mut origin, &mut builtin_ctor);
+        let mut ret = self.call_type(fv.ty.clone(), &pos_tys, &kw_tys, off, &mut origin, &mut builtin_ctor);
+        if reveal {
+            self.reveal(&pos[0].ty, off);
+            ret = pos[0].ty.clone();
+        }
         let func = self.obj(&fv);
         let mut args: Vec<Reg> = pos.iter().map(|v| self.obj(v)).collect();
         let mut kwnames = Vec::new();
@@ -2994,6 +3056,12 @@ impl<'a> Lower<'a> {
             self.check(&v, what, origin);
         }
         self.unbox_f32(v)
+    }
+
+    fn reveal(&mut self, t: &Ty, off: u32) {
+        let (line, col) = self.db.files[self.file].line_col(off);
+        let note = format!("{}:{line}:{col}: note: revealed type is `{}`", self.db.files[self.file].path, self.show(t));
+        self.db.warnings.push(note);
     }
 
     /// The parameter types the arguments of a call bind to, with the
@@ -3190,7 +3258,8 @@ impl<'a> Lower<'a> {
                     } else {
                         for (i, (p, a)) in ps.iter().zip(pos).enumerate() {
                             if !self.assignable(a, p) {
-                                let (a, p) = (self.show(a), self.show(p));
+                                let a = if has_lit(p) { a.clone() } else { decay(a) };
+                                let (a, p) = (self.show(&a), self.show(p));
                                 self.err(off, format!("argument {}: expected {p}, got {a}", i + 1));
                             }
                         }
@@ -3382,6 +3451,10 @@ impl<'a> Lower<'a> {
         let mut s = Subst::new();
         let mut any = false;
         for (name, want, got) in pairs {
+            // A literal argument (`f(1)`) is its literal type only for a
+            // `Literal` parameter: elsewhere it solves type variables to its
+            // base type (`max("a", "b")` is a str).
+            let got = if matches!(got, Ty::Lit(_)) && !has_lit(&want) { decay(&got) } else { got };
             if !self.db.assign(&got, &want, &mut s, &mut any) {
                 // Unsolved bounded variables read as their bounds.
                 let mut vars = Vec::new();
@@ -3520,6 +3593,8 @@ impl<'a> Lower<'a> {
             ast::Operator::LShift => (BinOp::LShift, "__lshift__", "__rlshift__"),
             ast::Operator::RShift => (BinOp::RShift, "__rshift__", "__rrshift__"),
         };
+        // Arithmetic on literals is arithmetic on their base types.
+        let (l, r) = (Val { ty: decay(&l.ty), ..l }, Val { ty: decay(&r.ty), ..r });
         let (lt, rt) = (l.ty.clone(), r.ty.clone());
         let pow = match (bop, &lt, &rt) {
             // `int ** int` is an int only for a non-negative exponent, and a
@@ -3638,6 +3713,7 @@ impl<'a> Lower<'a> {
 
     /// `l op r` for evaluated operands.
     fn compare_vals(&mut self, cop: ast::CmpOp, l: Val, r: Val, off: u32, what: String) -> Val {
+        let (l, r) = (Val { ty: decay(&l.ty), ..l }, Val { ty: decay(&r.ty), ..r });
         let (op, dunder, reflected) = match cop {
             ast::CmpOp::Eq => (CmpOp::Eq, "__eq__", "__eq__"),
             ast::CmpOp::NotEq => (CmpOp::Ne, "__ne__", "__ne__"),
@@ -3687,17 +3763,6 @@ impl<'a> Lower<'a> {
             Ty::Inst(c, _) => l.db.is_user_class(c),
             _ => false,
         };
-        let mut first_err = None;
-        match self.dunder(lt, dunder, std::slice::from_ref(rt)) {
-            Some(Ok((t, _, _))) => return t,
-            Some(Err(m)) => first_err = Some(m),
-            None => {}
-        }
-        match self.dunder(rt, reflected, std::slice::from_ref(lt)) {
-            Some(Ok((t, _, _))) => return t,
-            Some(Err(m)) => first_err = first_err.or(Some(m)),
-            None => {}
-        }
         // Ordering builtin values of unrelated kinds raises TypeError.
         let kind = |t: &Ty| match t {
             Ty::Int | Ty::Float | Ty::Bool => Some(0),
@@ -3705,6 +3770,20 @@ impl<'a> Lower<'a> {
             Ty::None => Some(2),
             _ => None,
         };
+        let mut first_err = None;
+        // Builtin values compare by the rules below, not their methods.
+        if kind(lt).is_none() || kind(rt).is_none() {
+            match self.dunder(lt, dunder, std::slice::from_ref(rt)) {
+                Some(Ok((t, _, _))) => return t,
+                Some(Err(m)) => first_err = Some(m),
+                None => {}
+            }
+            match self.dunder(rt, reflected, std::slice::from_ref(lt)) {
+                Some(Ok((t, _, _))) => return t,
+                Some(Err(m)) => first_err = first_err.or(Some(m)),
+                None => {}
+            }
+        }
         let mismatched = matches!((kind(lt), kind(rt)), (Some(a), Some(b)) if a != b || a == 2);
         if matches!(op, CmpOp::Eq | CmpOp::Ne) || !(user(self, lt) || user(self, rt) || mismatched) {
             return Ty::Bool;

@@ -457,3 +457,54 @@ fn exception_subclasses_have_the_builtin_attributes() {
     );
     assert_eq!(d, ["E has no attribute `code`"]);
 }
+
+#[test]
+fn literal_types() {
+    let d = check(
+        "from typing import Literal\n\ntype Mode = Literal[\"r\", \"w\"]\n\ndef f(m: Mode, s: str) -> Literal[1]:\n    a: str = mini.load(\"x\")\n    b: int = mini.load(\"x\", \"binary\")\n    c: int = mini.load(\"x\", mode=\"binary\")\n    mini.load(\"x\", \"hex\")\n    mini.load(\"x\", s)\n    mini.reshape(3, \"F\")\n    mini.reshape(3, order=\"K\")\n    if m == \"r\":\n        r: Literal[\"r\"] = m\n    else:\n        w: Literal[\"w\"] = m\n    x: Mode = \"x\"\n    n = len(m) + 1\n    return 2\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "no overload of load() accepts (Literal['x'], Literal['hex'])",
+            "no overload of load() accepts (Literal['x'], str)",
+            "argument `order` of reshape(): expected Literal['C', 'F'], got Literal['K']",
+            "cannot assign Literal['x'] to `x` of type Literal['r', 'w']",
+            "`f` returns Literal[1], but this returns Literal[2]",
+        ]
+    );
+}
+
+#[test]
+fn protocols_and_unions_in_definition_files() {
+    let d = check(
+        "class Arr:\n    def __array__(self) -> mini.Box[mini.f64]:\n        return mini.make_box()\n\ndef f() -> None:\n    mini.reshape(True)\n    mini.reshape(2.5)\n    mini.as_box(Arr())\n    mini.as_box(1.5)\n    mini.as_box(\"x\")\n    n: int = mini.maybe()\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "argument `n` of reshape(): expected SupportsIndex, got float",
+            "argument `x` of as_box(): expected _SupportsArray | float, got str",
+            "cannot assign int | None to `n` of type int",
+        ]
+    );
+}
+
+#[test]
+fn builtin_values_match_protocols() {
+    let d = check(
+        "from typing import Hashable, Protocol, Sized, SupportsFloat, SupportsIndex\n\nclass P:\n    def __eq__(self, other: object) -> bool:\n        return True\n\nclass H(Protocol):\n    def __call__(self, code: int) -> bool: ...\n\ndef ok(code: int) -> bool:\n    return True\n\ndef bad(code: str) -> bool:\n    return True\n\ndef f(a: SupportsFloat, b: SupportsIndex, c: Sized, d: Hashable, h: H) -> None:\n    pass\n\ndef g() -> None:\n    f(1, True, \"\", (1, 2), ok)\n    f(\"x\", 1, \"\", 1, ok)\n    f(1, 1.5, \"\", 1, ok)\n    f(1, 1, 3, 1, ok)\n    f(1, 1, \"\", [1], ok)\n    f(1, 1, \"\", P(), ok)\n    f(1, 1, \"\", 1, bad)\n    f(1, 1, [1], \"s\", lambda c: c > 0)\n    f(1, 1, \"\", {1: 2}.keys(), ok)\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "argument `a` of f(): expected SupportsFloat, got str",
+            "argument `b` of f(): expected SupportsIndex, got float",
+            "argument `c` of f(): expected Sized, got int",
+            "argument `d` of f(): expected Hashable, got list[int]",
+            "argument `d` of f(): expected Hashable, got P",
+            "argument `h` of f(): expected H, got function",
+            "argument `d` of f(): expected Hashable, got dict_keys[int]",
+        ]
+    );
+}

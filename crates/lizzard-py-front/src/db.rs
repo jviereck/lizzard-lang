@@ -88,6 +88,35 @@ pub enum Ty {
     Union(Vec<Ty>),
     /// `Callable[[A, B], R]`; `None` parameters for `Callable[..., R]`.
     Callable(Option<Vec<Ty>>, Box<Ty>),
+    /// `Literal[v]`: one int, str or bool value (`Literal["r", "w"]` is a
+    /// union of two).
+    Lit(Lit),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Lit {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+impl Lit {
+    /// The type of the value: `int`, `str` or `bool`.
+    pub fn base(&self) -> Ty {
+        match self {
+            Lit::Int(_) => Ty::Int,
+            Lit::Str(_) => Ty::Str,
+            Lit::Bool(_) => Ty::Bool,
+        }
+    }
+
+    fn show(&self) -> String {
+        match self {
+            Lit::Int(n) => n.to_string(),
+            Lit::Str(v) => format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'")),
+            Lit::Bool(b) => if *b { "True".into() } else { "False".into() },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -268,9 +297,6 @@ pub struct Module {
     kind: ModKind,
     /// A Lizzard module: its declarations are checked strictly.
     pub user: bool,
-    /// Defined only by Lizzard's own definition files (a standard-library
-    /// module): written for Lizzard, so its unions are types.
-    lizzard_defs: bool,
     decls: HashMap<String, Decl>,
     syms: HashMap<String, Sym>,
 }
@@ -312,6 +338,8 @@ pub struct Db {
     /// A property's accessors by its `@property` function and kind.
     accessors: HashMap<(FuncId, &'static str), FuncId>,
     protocol_depth: u32,
+    /// The protocol checks in progress (`src` as `dst`).
+    protocol_assumed: Vec<(Ty, Ty)>,
 }
 
 /// Lizzard's definitions for the builtins it types (see the file's header).
@@ -428,6 +456,7 @@ impl Db {
             globals: HashMap::new(),
             accessors: HashMap::new(),
             protocol_depth: 0,
+            protocol_assumed: Vec::new(),
         }
     }
 
@@ -480,7 +509,6 @@ impl Db {
             is_package: false,
             kind: ModKind::Files,
             user: true,
-            lizzard_defs: false,
             decls: HashMap::new(),
             syms: HashMap::new(),
         });
@@ -561,7 +589,6 @@ impl Db {
         let base = base.and_then(|(p, _)| self.parse_file(&p));
         let overlay = overlay.and_then(|(p, _)| self.parse_file(&p));
         let m = self.push_module(name, base.as_ref().or(overlay.as_ref()).map(|(f, _)| *f), is_package, ModKind::Files);
-        self.modules[m].lizzard_defs = base.is_none() && overlay.is_some();
         let mut decls = match &base {
             Some((f, body)) => self.collect(m, *f, body, false),
             None => HashMap::new(),
@@ -589,7 +616,6 @@ impl Db {
             is_package,
             kind,
             user: false,
-            lizzard_defs: false,
             decls: HashMap::new(),
             syms: HashMap::new(),
         });
@@ -798,6 +824,9 @@ impl Db {
     pub fn nominal(&mut self, t: &Ty) -> Option<Ty> {
         match t {
             Ty::Str => Some(Ty::Inst(self.builtin_class("str")?, Vec::new())),
+            Ty::Int => Some(Ty::Inst(self.builtin_class("int")?, Vec::new())),
+            Ty::Float => Some(Ty::Inst(self.builtin_class("float")?, Vec::new())),
+            Ty::Bool => Some(Ty::Inst(self.builtin_class("bool")?, Vec::new())),
             Ty::TupleVar(x) => Some(Ty::Inst(self.builtin_class("tuple")?, vec![(**x).clone()])),
             Ty::Tuple(v) => {
                 let elem = match v.first() {
@@ -827,7 +856,8 @@ impl Db {
         }
         let s = match self.modules[m].kind {
             ModKind::Typing => match name {
-                "Iterable" | "Iterator" | "Sequence" | "Generator" | "SupportsAbs" => self.builtin(name),
+                "Iterable" | "Iterator" | "Sequence" | "Generator" | "SupportsAbs" | "SupportsInt" | "SupportsFloat" | "SupportsIndex" | "Sized"
+                | "Hashable" | "Container" | "Collection" | "Reversible" => self.builtin(name),
                 "List" | "Dict" | "Set" | "FrozenSet" => self.builtin(&name.to_lowercase()),
                 _ => special_sym(name),
             },
@@ -911,6 +941,15 @@ impl Db {
             return Sym::Value(ty);
         }
         if self.modules[m].user {
+            // `Mode = Literal["r", "w"]`: an implicit alias, as in a stub.
+            if let Some(v @ Expr::Subscript(sub)) = &a.value {
+                if matches!(
+                    self.sym_of_expr(m, &sub.value),
+                    Some(Sym::Special(Special::Literal | Special::Union | Special::Optional | Special::Callable))
+                ) {
+                    return Sym::Alias(self.make_alias(m, name, v, None));
+                }
+            }
             return Sym::UserVar;
         }
         match &a.value {
@@ -1216,7 +1255,14 @@ impl Db {
     fn structural_assign(&mut self, c: ClassId, src: &Ty, p: ClassId, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
         for name in self.protocol_members(p) {
             let Some((_, want)) = self.find_member(p, &name) else { return false };
-            let Some((cowner, got)) = self.find_member(c, &name) else { return false };
+            let Some((cowner, got)) = self.find_member(c, &name) else {
+                // `object` supplies `__hash__`, `__eq__`, `__repr__`, ...;
+                // a class that defines `__eq__` alone is unhashable.
+                if OBJECT_ATTRS.contains(&name.as_str()) && !(name == "__hash__" && self.find_member(c, "__eq__").is_some()) {
+                    continue;
+                }
+                return false;
+            };
             let ok = match (want, got) {
                 (Member::Method(fp), Member::Method(fc)) => {
                     let (w, g) = (self.callable_of(&Ty::Func(FuncRef::Bound(fp, Box::new(dst.clone())))), self.callable_of(&Ty::Func(FuncRef::Bound(fc, Box::new(src.clone())))));
@@ -1607,11 +1653,46 @@ impl Db {
 
     // ---- type expressions ----
 
+    /// One argument of `Literal[...]`: a value, `None`, a nested `Literal`
+    /// or an alias of one. Enum members are their class.
+    fn literal_type(&mut self, e: &Expr, sc: &Scope) -> Ty {
+        if let Some(l) = literal_value(e) {
+            return Ty::Lit(l);
+        }
+        match e {
+            Expr::NoneLiteral(_) => Ty::None,
+            Expr::Subscript(_) | Expr::Name(_) => self.eval_type(e, sc),
+            Expr::Attribute(a) => match self.sym_of_expr(sc.m, &a.value) {
+                Some(Sym::Class(c)) => Ty::Inst(c, Vec::new()),
+                _ => Ty::Any,
+            },
+            _ => {
+                self.err(sc.m, e.range().start().into(), "not a literal value");
+                Ty::Any
+            }
+        }
+    }
+
     pub fn eval_type(&mut self, e: &Expr, sc: &Scope) -> Ty {
         let off: u32 = e.range().start().into();
         match e {
             Expr::NoneLiteral(_) => Ty::None,
             Expr::EllipsisLiteral(_) => Ty::Any,
+            // A forward reference: `"Node"`. Parsed as if it stood where the
+            // string's text starts, so errors point into the string.
+            Expr::StringLiteral(st) => {
+                let text = st.value.to_str();
+                let start = off as usize + 1;
+                let source = format!("{}{text}", " ".repeat(start));
+                let range = ruff_text_size::TextRange::new((start as u32).into(), ((start + text.len()) as u32).into());
+                match ruff_python_parser::parse_expression_range(&source, range) {
+                    Ok(p) => self.eval_type(&p.into_expr(), sc),
+                    Err(_) => {
+                        self.err(sc.m, off, "not a type");
+                        Ty::Any
+                    }
+                }
+            }
             Expr::Name(n) => {
                 if let Some((_, tv)) = sc.tparams.iter().find(|(p, _)| p == n.id.as_str()) {
                     return Ty::Var(*tv);
@@ -1663,12 +1744,10 @@ impl Db {
                         let map: Subst = alias.params.iter().copied().zip(targs.into_iter().chain(std::iter::repeat(Ty::Any))).collect();
                         subst(&alias.target, &map)
                     }
-                    Some(Sym::Special(Special::Literal)) => match args.first() {
-                        Some(Expr::NumberLiteral(_)) => Ty::Int,
-                        Some(Expr::StringLiteral(_)) => Ty::Str,
-                        Some(Expr::BooleanLiteral(_)) => Ty::Bool,
-                        _ => Ty::Any,
-                    },
+                    Some(Sym::Special(Special::Literal)) => {
+                        let members = args.iter().map(|a| self.literal_type(a, sc)).collect();
+                        union(members)
+                    }
                     Some(Sym::Special(Special::Final | Special::ClassVar)) => args.first().map_or(Ty::Any, |a| self.eval_type(a, sc)),
                     Some(Sym::Special(Special::Callable)) => {
                         let ret = args.get(1).map_or(Ty::Any, |a| self.eval_type(a, sc));
@@ -1678,17 +1757,14 @@ impl Db {
                         };
                         Ty::Callable(params, Box::new(ret))
                     }
-                    Some(Sym::Special(Special::Union)) if self.unions_ok(sc.m) => {
+                    Some(Sym::Special(Special::Union)) => {
                         let members = args.iter().map(|a| self.eval_type(a, sc)).collect();
                         union(members)
                     }
-                    Some(Sym::Special(Special::Optional)) if self.unions_ok(sc.m) => {
+                    Some(Sym::Special(Special::Optional)) => {
                         let t = args.first().map_or(Ty::Any, |a| self.eval_type(a, sc));
                         union(vec![t, Ty::None])
                     }
-                    // Other definition files use unions mostly for parameters
-                    // built from protocols, which are not modelled yet.
-                    Some(Sym::Special(Special::Union | Special::Optional)) => Ty::Any,
                     _ => {
                         self.err(sc.m, off, "not a generic type");
                         Ty::Any
@@ -1696,9 +1772,6 @@ impl Db {
                 }
             }
             Expr::BinOp(b) if b.op == ast::Operator::BitOr => {
-                if !self.unions_ok(sc.m) {
-                    return Ty::Any;
-                }
                 let (l, r) = (self.eval_type(&b.left, sc), self.eval_type(&b.right, sc));
                 union(vec![l, r])
             }
@@ -1707,12 +1780,6 @@ impl Db {
                 Ty::Any
             }
         }
-    }
-
-    /// Whether unions in module `m` are types (Lizzard modules and the bundled
-    /// builtins) or `Any` (other definition files).
-    fn unions_ok(&self, m: ModId) -> bool {
-        self.modules[m].user || self.modules[m].lizzard_defs || self.modules[m].kind == ModKind::Builtins
     }
 
     fn sym_type(&mut self, s: Sym, sc: &Scope, off: u32, what: &str) -> Ty {
@@ -1801,6 +1868,8 @@ impl Db {
                 *any = true;
                 true
             }
+            (Ty::Lit(a), Ty::Lit(b)) => a == b,
+            (Ty::Lit(l), _) => self.assign(&l.base(), dst, s, any),
             (Ty::None, Ty::None) | (Ty::Bool, Ty::Bool) | (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Str, Ty::Str) => true,
             (Ty::Bool, Ty::Int) | (Ty::Bool | Ty::Int, Ty::Float) => true,
             (Ty::Tuple(a), Ty::Tuple(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| self.assign(x, y, s, any)),
@@ -1831,6 +1900,19 @@ impl Db {
                 None => false,
             },
             (Ty::Inst(c, args), _) => self.inst_assign(*c, args, dst, s, any),
+            // `int`, `float` and `bool` match protocols by their builtins
+            // class's methods (`SupportsIndex`, `SupportsAbs[int]`, ...).
+            (Ty::Int | Ty::Float | Ty::Bool, Ty::Inst(d, _)) if self.is_protocol(*d) => match self.nominal(src) {
+                Some(n) => self.assign(&n, dst, s, any),
+                None => false,
+            },
+            // A callback protocol: a protocol whose only member is `__call__`.
+            (Ty::Func(_) | Ty::Type(_) | Ty::Callable(..), Ty::Inst(d, _)) if self.is_protocol(*d) && self.protocol_members(*d) == ["__call__"] => {
+                match (self.callable_of(src).or_else(|| matches!(src, Ty::Callable(..)).then(|| src.clone())), self.callable_of(dst)) {
+                    (Some(a), Some(b)) => self.assign(&a, &b, s, any),
+                    _ => false,
+                }
+            }
             (Ty::Str | Ty::Tuple(_) | Ty::TupleVar(_), Ty::Inst(..)) => match self.nominal(src) {
                 Some(n) => self.assign(&n, dst, s, any),
                 None => false,
@@ -1878,10 +1960,13 @@ impl Db {
         let mut sub = Subst::new();
         // A bound method's `self` and its class's parameters come from
         // the receiver.
-        if let Ty::Func(FuncRef::Bound(_, recv)) = t {
-            if let Some(p0) = sig.params.first() {
-                self.assign(recv, &p0.ty, &mut sub, &mut false);
-            }
+        let recv = match t {
+            Ty::Func(FuncRef::Bound(_, recv)) => Some((**recv).clone()),
+            Ty::Inst(..) => Some(t.clone()),
+            _ => None,
+        };
+        if let (Some(recv), Some(p0)) = (recv, sig.params.first()) {
+            self.assign(&recv, &p0.ty, &mut sub, &mut false);
         }
         let ret = ret.unwrap_or_else(|| deep_subst(&sig.ret, &sub));
         Some(Ty::Callable(Some(params.iter().map(|p| deep_subst(p, &sub)).collect()), Box::new(ret)))
@@ -1920,6 +2005,19 @@ impl Db {
                 return true;
             }
         }
+        // A protocol is matched by the class's own members, which include
+        // what its bases declare; a base alone can match a protocol its
+        // subclass does not (`Hashable` for `list`, whose `__hash__` is None).
+        // A class that names the protocol among its bases matches it
+        // nominally (`str` is a `Collection[str]` through `Sequence[str]`).
+        if let Ty::Inst(d, _) = dst {
+            if self.is_protocol(*d) {
+                if let Some(view) = self.base_view(&Ty::Inst(c, args.to_vec()), *d) {
+                    return self.assign(&view, dst, s, any);
+                }
+                return self.protocol_assign(&Ty::Inst(c, args.to_vec()), dst, s, any);
+            }
+        }
         let params = self.class_params(c);
         let map: Subst = params.into_iter().zip(args.iter().cloned().chain(std::iter::repeat(Ty::Any))).collect();
         for base in self.class_bases(c) {
@@ -1935,17 +2033,40 @@ impl Db {
         self.protocol_assign(&Ty::Inst(c, args.to_vec()), dst, s, any)
     }
 
+    /// `t` (a class instance) as an instance of its base class `target`.
+    pub fn base_view(&mut self, t: &Ty, target: ClassId) -> Option<Ty> {
+        let Ty::Inst(c, args) = t else { return None };
+        if *c == target {
+            return Some(t.clone());
+        }
+        let map: Subst = self.class_params(*c).into_iter().zip(args.iter().cloned().chain(std::iter::repeat(Ty::Any))).collect();
+        for b in self.class_bases(*c) {
+            if let Some(v) = self.base_view(&subst(&b, &map), target) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// `Iterable[T]` and `Iterator[T]` are protocols in typeshed: a class
     /// with `__iter__` (and `__next__`) of the right types is one.
     fn protocol_assign(&mut self, src: &Ty, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
         let (Ty::Inst(c, _), Ty::Inst(d, dargs)) = (src, dst) else { return false };
-        if self.protocol_depth > 4 {
+        if self.protocol_depth > 8 {
             return false;
         }
         if self.is_protocol(*d) {
+            // Recursive protocols (`_NestedSequence[T]`, whose items are `T |
+            // _NestedSequence[T]`) hold if they hold assuming they do.
+            let key = (subst(src, s), subst(dst, s));
+            if self.protocol_assumed.contains(&key) {
+                return true;
+            }
+            self.protocol_assumed.push(key);
             self.protocol_depth += 1;
             let ok = self.structural_assign(*c, src, *d, dst, s, any);
             self.protocol_depth -= 1;
+            self.protocol_assumed.pop();
             return ok;
         }
         if !self.is_builtin_class(*d) || dargs.len() != 1 {
@@ -2013,7 +2134,23 @@ impl Db {
             Ty::Func(_) => "function".into(),
             Ty::Var(v) => self.tvs[*v].name.clone(),
             Ty::Exc(n) => n.clone(),
-            Ty::Union(v) => v.iter().map(|x| self.display(x)).collect::<Vec<_>>().join(" | "),
+            Ty::Union(v) => {
+                // The literals together, as `Literal['r', 'w']`.
+                let lits: Vec<String> = v.iter().filter_map(|x| if let Ty::Lit(l) = x { Some(l.show()) } else { None }).collect();
+                let mut parts: Vec<String> = Vec::new();
+                for x in v {
+                    match x {
+                        Ty::Lit(_) if !lits.is_empty() => {
+                            if !parts.iter().any(|p| p.starts_with("Literal[")) {
+                                parts.push(format!("Literal[{}]", lits.join(", ")));
+                            }
+                        }
+                        x => parts.push(self.display(x)),
+                    }
+                }
+                parts.join(" | ")
+            }
+            Ty::Lit(l) => format!("Literal[{}]", l.show()),
             Ty::Callable(None, r) => format!("Callable[..., {}]", self.display(r)),
             Ty::Callable(Some(ps), r) => format!("Callable[[{}], {}]", ps.iter().map(|x| self.display(x)).collect::<Vec<_>>().join(", "), self.display(r)),
         }
@@ -2147,10 +2284,50 @@ pub fn union(tys: Vec<Ty>) -> Ty {
             }
         }
     }
+    // `Literal['a'] | str` is `str`.
+    let bases: Vec<Ty> = out.iter().filter(|m| matches!(m, Ty::Int | Ty::Str | Ty::Bool)).cloned().collect();
+    out.retain(|m| !matches!(m, Ty::Lit(l) if bases.contains(&l.base())));
     match out.len() {
         0 => Ty::Any,
         1 => out.pop().unwrap(),
         _ => Ty::Union(out),
+    }
+}
+
+/// `t` with its literal types widened to their base types (`int`, `str`,
+/// `bool`): the type a variable takes from a literal value.
+pub fn decay(t: &Ty) -> Ty {
+    match t {
+        Ty::Lit(l) => l.base(),
+        Ty::Union(v) if v.iter().any(|m| matches!(m, Ty::Lit(_))) => union(v.iter().map(decay).collect()),
+        t => t.clone(),
+    }
+}
+
+/// Whether `t` is or contains (as a union member) a literal type.
+pub fn has_lit(t: &Ty) -> bool {
+    match t {
+        Ty::Lit(_) => true,
+        Ty::Union(v) => v.iter().any(has_lit),
+        _ => false,
+    }
+}
+
+/// The value of a literal expression: an int (possibly negated), a string
+/// or a bool.
+pub fn literal_value(e: &Expr) -> Option<Lit> {
+    match e {
+        Expr::NumberLiteral(n) => match &n.value {
+            ast::Number::Int(i) => i.as_i64().map(Lit::Int),
+            _ => None,
+        },
+        Expr::UnaryOp(u) if u.op == ast::UnaryOp::USub => match literal_value(&u.operand)? {
+            Lit::Int(n) => n.checked_neg().map(Lit::Int),
+            _ => None,
+        },
+        Expr::StringLiteral(st) => Some(Lit::Str(st.value.to_str().to_string())),
+        Expr::BooleanLiteral(b) => Some(Lit::Bool(b.value)),
+        _ => None,
     }
 }
 

@@ -72,7 +72,11 @@ def run_source(source, path, module):
     """Check ``source`` and execute it as ``module``."""
     compiled, diagnostics, warns = _lizzard.compile_module(source, path, module.__name__, _env())
     for w in warns:
-        warnings.warn(w, stacklevel=2)
+        # Notes (`reveal_type`) go to stderr as they are, like diagnostics.
+        if ": note: " in w:
+            print(w, file=sys.stderr)
+        else:
+            warnings.warn(w, stacklevel=2)
     if diagnostics:
         raise CheckError(diagnostics)
     namespace = module.__dict__

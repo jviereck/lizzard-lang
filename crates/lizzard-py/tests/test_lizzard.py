@@ -30,6 +30,8 @@ GENERATORS = HERE / "programs" / "generators.py"
 OPERATORS = HERE / "programs" / "operators.py"
 PROPERTIES = HERE / "programs" / "properties.py"
 THREADS = HERE / "programs" / "threads.py"
+PROTOCOLS = HERE / "programs" / "protocols.py"
+LITERALS = HERE / "programs" / "literals.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -169,7 +171,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -492,6 +494,19 @@ class Checker(unittest.TestCase):
             "Worker has no attribute `strat`",
             "cannot check the arguments of Jobs() (its base class `queue.Queue` has no type definitions)",
         ])
+
+    def test_reveal_type(self):
+        code, _, err = self.check("""\
+            from typing import Literal
+
+            def f(m: Literal["r", "w"]) -> None:
+                if m == "r":
+                    reveal_type(m)
+                reveal_type([m])
+            """)
+        self.assertEqual(code, 0, err)
+        lines = [l.split(": note: ", 1)[1] for l in err.splitlines()]
+        self.assertEqual(lines, ["revealed type is `Literal['r']`", "revealed type is `list[Literal['r', 'w']]`"])
 
     def test_wrong_declaration_raises_at_runtime(self):
         with Scratch() as s:
