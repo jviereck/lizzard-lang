@@ -4,7 +4,7 @@
 //! CPython's C API, without PyO3 wrappers. Each returns `NEXT` (`TAKEN` for
 //! a jump), or `ERROR` with an exception set.
 
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, Ordering};
 
 use lizzard_jit::{ERROR, NEXT, TAKEN};
 use pyo3::ffi;
@@ -37,23 +37,35 @@ unsafe fn result(slots: *mut u64, r: u32, v: *mut ffi::PyObject) -> u32 {
     NEXT
 }
 
-/// An attribute site's inline cache: the slot (`__slots__` member) an
-/// attribute was found in, for one type at one version. A type's version
-/// tag changes whenever it or a base class is modified, so a hit needs no
-/// lookup: the attribute is read or written at its offset. Instances
-/// without `__slots__` keep their attributes in CPython's internal storage,
-/// which only the generic path reaches.
+/// An attribute site's inline cache, keyed on the type and its version tag
+/// (CPython changes it whenever the type or a base class is modified, so a
+/// stale entry never hits). It remembers where the attribute lives:
+/// - in a `__slots__` member (read and written with `PyMember_GetOne`/`SetOne`);
+/// - in the instance's inline values: CPython 3.13+ keeps a plain class's
+///   instance attributes in an array right after the object, in the order
+///   of the type's shared keys, unless its `__dict__` was replaced. The
+///   attribute is then at a fixed offset from the object, as for CPython's
+///   own `LOAD_ATTR_INSTANCE_VALUE` / `STORE_ATTR_INSTANCE_VALUE`, with the
+///   same guards (see `inline`);
+/// - or nowhere it can reach (the generic path).
 #[derive(Default)]
 pub struct AttrIc {
     entry: AtomicPtr<IcEntry>,
     misses: AtomicU32,
 }
 
+#[derive(Clone, Copy)]
+enum Where {
+    Slot(*mut ffi::PyMemberDef),
+    /// Byte offset of the value pointer from the object.
+    Inline(usize),
+    Generic,
+}
+
 struct IcEntry {
     tp: *mut ffi::PyTypeObject,
     version: u32,
-    /// Null: the attribute is not a slot (the generic path).
-    member: *mut ffi::PyMemberDef,
+    at: Where,
 }
 
 /// A site that misses this often stops looking (it sees many types).
@@ -64,50 +76,340 @@ unsafe extern "C" {
     fn PyIter_NextItem(iter: *mut ffi::PyObject, item: *mut *mut ffi::PyObject) -> std::ffi::c_int;
     /// CPython 3.12+: give a type a version tag (0 if it cannot have one).
     fn PyUnstable_Type_AssignVersionTag(tp: *mut ffi::PyTypeObject) -> std::ffi::c_int;
+    /// The attribute `name` on the type or its bases (a new reference), or
+    /// null.
+    fn _PyType_LookupRef(tp: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> *mut ffi::PyObject;
 }
 
-/// The `__slots__` member `name` of `o`'s type, from the cache or found and
-/// cached; None to take the generic path.
-unsafe fn member(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject) -> Option<*mut ffi::PyMemberDef> {
+/// CPython 3.14's layout of instance inline values (`Include/internal/
+/// pycore_dict.h`, `pycore_object.h`). `inline::init` checks it against
+/// CPython's own answers at start-up and leaves the path off otherwise.
+mod inline {
+    use super::*;
+
+    pub static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub const TPFLAGS_INLINE_VALUES: std::ffi::c_ulong = 1 << 2;
+    pub const TPFLAGS_MANAGED_DICT: std::ffi::c_ulong = 1 << 4;
+    /// `struct _dictvalues { uint8 capacity, size, embedded, valid; PyObject *values[]; }`
+    const VALID: usize = 3;
+    const VALUES: usize = 8;
+    /// Where the managed `__dict__` pointer lives, before the object.
+    #[cfg(Py_GIL_DISABLED)]
+    const MANAGED_DICT: isize = -8;
+    #[cfg(not(Py_GIL_DISABLED))]
+    const MANAGED_DICT: isize = -24;
+    /// `struct _dictkeysobject`: kind at 10, entry count at 24, indices at
+    /// 32 (`1 << dk_log2_index_bytes` bytes), then `{key, value}` entries.
+    const DK_LOG2_INDEX_BYTES: usize = 9;
+    const DK_KIND: usize = 10;
+    const DK_NENTRIES: usize = 24;
+    const DK_INDICES: usize = 32;
+    const DICT_KEYS_SPLIT: u8 = 2;
+
+    #[inline]
+    pub unsafe fn values(o: *mut ffi::PyObject) -> *mut u8 {
+        unsafe { (o as *mut u8).offset((*ffi::Py_TYPE(o)).tp_basicsize) }
+    }
+
+    /// The inline values are in use (no detached `__dict__`).
+    #[inline]
+    pub unsafe fn valid(o: *mut ffi::PyObject) -> bool {
+        unsafe { (*(values(o).add(VALID) as *const std::sync::atomic::AtomicU8)).load(Ordering::Acquire) != 0 }
+    }
+
+    /// No `__dict__` object has been created for it.
+    #[inline]
+    pub unsafe fn no_dict(o: *mut ffi::PyObject) -> bool {
+        unsafe { (*((o as *mut u8).offset(MANAGED_DICT) as *const AtomicPtr<ffi::PyObject>)).load(Ordering::Acquire).is_null() }
+    }
+
+    /// The offset of `name`'s value from an instance of `tp`, if its
+    /// instances keep `name` in inline values. The caller has checked that
+    /// the type has no attribute `name` and uses the generic getattr.
+    pub unsafe fn offset(tp: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> Option<usize> {
+        unsafe {
+            let flags = ffi::PyType_GetFlags(tp);
+            if flags & TPFLAGS_INLINE_VALUES == 0 || flags & TPFLAGS_MANAGED_DICT == 0 || flags & ffi::Py_TPFLAGS_HEAPTYPE == 0 {
+                return None;
+            }
+            let keys = shared_keys(tp)?;
+            // Shared keys only grow: an index, once there, stays.
+            let i = index(keys, nentries(keys), name)?;
+            Some((*tp).tp_basicsize as usize + VALUES + 8 * i)
+        }
+    }
+
+    /// The shared keys of a heap type's instances.
+    pub unsafe fn shared_keys(tp: *mut ffi::PyTypeObject) -> Option<*const u8> {
+        unsafe {
+            if ffi::PyType_GetFlags(tp) & ffi::Py_TPFLAGS_HEAPTYPE == 0 {
+                return None;
+            }
+            let keys = (*(tp as *mut ffi::PyHeapTypeObject)).ht_cached_keys as *const u8;
+            (!keys.is_null() && *keys.add(DK_KIND) == DICT_KEYS_SPLIT).then_some(keys)
+        }
+    }
+
+    pub unsafe fn nentries(keys: *const u8) -> isize {
+        unsafe { (*(keys.add(DK_NENTRIES) as *const AtomicIsize)).load(Ordering::Acquire) }
+    }
+
+    /// The index of `name` among the first `n` entries of the keys.
+    pub unsafe fn index(keys: *const u8, n: isize, name: *mut ffi::PyObject) -> Option<usize> {
+        unsafe {
+            let entries = keys.add(DK_INDICES + (1usize << *keys.add(DK_LOG2_INDEX_BYTES))) as *const *mut ffi::PyObject;
+            (0..n.max(0) as usize).find(|&i| {
+                let k = *entries.add(2 * i);
+                !k.is_null() && (k == name || ffi::PyUnicode_Compare(k, name) == 0)
+            })
+        }
+    }
+
+    /// Check the layout with a class made for it; on success, turn the
+    /// inline-values path on.
+    pub fn init() {
+        unsafe {
+            let code = c"class _LizzardProbe:\n    pass\n_p = _LizzardProbe()\n_p.a = 1\n_p.b = 'x'\n_p.c = 2.5\n";
+            let globals = ffi::PyDict_New();
+            let builtins = ffi::PyEval_GetBuiltins();
+            ffi::PyDict_SetItemString(globals, c"__builtins__".as_ptr(), builtins);
+            let r = ffi::PyRun_String(code.as_ptr(), ffi::Py_file_input, globals, globals);
+            let mut ok = !r.is_null();
+            if r.is_null() {
+                ffi::PyErr_Clear();
+            } else {
+                ffi::Py_DecRef(r);
+            }
+            let p = if ok { ffi::PyDict_GetItemString(globals, c"_p".as_ptr()) } else { std::ptr::null_mut() };
+            ok &= !p.is_null();
+            if ok {
+                let tp = ffi::Py_TYPE(p);
+                ok &= valid(p) && no_dict(p);
+                for n in [c"a", c"b", c"c"] {
+                    let name = ffi::PyUnicode_InternFromString(n.as_ptr());
+                    let want = ffi::PyObject_GetAttr(p, name);
+                    ok &= match offset(tp, name) {
+                        Some(off) => *((p as *mut u8).add(off) as *const *mut ffi::PyObject) == want,
+                        None => false,
+                    };
+                    ffi::Py_DecRef(want);
+                    ffi::Py_DecRef(name);
+                }
+            }
+            ffi::Py_DecRef(globals);
+            ON.store(ok, Ordering::Relaxed);
+        }
+    }
+}
+
+pub use inline::init as init_inline_values;
+
+/// Whether attributes in inline values are read directly (the layout check
+/// at start-up passed).
+pub fn inline_values_on() -> bool {
+    inline::ON.load(Ordering::Relaxed)
+}
+
+/// Whether int and float operations take the fast paths.
+pub fn fast_paths_on() -> bool {
+    FAST.load(Ordering::Relaxed)
+}
+
+/// Where attribute `name` of `o` lives: from the cache, or found and cached.
+unsafe fn lookup(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject, store: bool) -> Where {
     unsafe {
         let tp = ffi::Py_TYPE(o);
         let e = ic.entry.load(Ordering::Acquire);
         if !e.is_null() && (*e).tp == tp && (*e).version == (*tp).tp_version_tag {
-            let m = (*e).member;
-            return (!m.is_null()).then_some(m);
+            return (*e).at;
         }
         // A plain load first: a site that gave up does no atomic write.
         if ic.misses.load(Ordering::Relaxed) >= IC_MAX_MISSES {
-            return None;
+            return Where::Generic;
         }
         ic.misses.fetch_add(1, Ordering::Relaxed);
         if PyUnstable_Type_AssignVersionTag(tp) == 0 {
-            return None;
+            return Where::Generic;
         }
         let version = (*tp).tp_version_tag;
-        let mut d = std::ptr::null_mut();
-        // On the type, a member descriptor is the descriptor itself.
-        let found = match ffi::PyObject_GetOptionalAttr(tp as *mut ffi::PyObject, name, &mut d) {
-            r if r < 0 => {
-                ffi::PyErr_Clear();
-                return None;
+        let d = _PyType_LookupRef(tp, name);
+        let at = if d.is_null() {
+            // Not on the type: an instance attribute. With the generic
+            // getattr / setattr, it is in the inline values if anywhere.
+            // (Addresses of libpython's exported functions: one each.)
+            let generic = if store {
+                (*tp).tp_setattro.map(|f| f as *const () as usize) == Some(ffi::PyObject_GenericSetAttr as *const () as usize)
+            } else {
+                (*tp).tp_getattro.map(|f| f as *const () as usize) == Some(ffi::PyObject_GenericGetAttr as *const () as usize)
+            };
+            match (generic && inline::ON.load(Ordering::Relaxed)).then(|| inline::offset(tp, name)).flatten() {
+                Some(off) => Where::Inline(off),
+                None => Where::Generic,
             }
-            0 => None,
-            _ => {
-                let m = (ffi::Py_TYPE(d) == &raw mut ffi::PyMemberDescr_Type).then(|| (*(d as *mut ffi::PyMemberDescrObject)).d_member);
-                ffi::Py_DecRef(d);
-                m
-            }
+        } else {
+            let m = (ffi::Py_TYPE(d) == &raw mut ffi::PyMemberDescr_Type).then(|| (*(d as *mut ffi::PyMemberDescrObject)).d_member);
+            ffi::Py_DecRef(d);
+            m.map_or(Where::Generic, Where::Slot)
         };
-        // Not a slot is cached too, so that a monomorphic site of a class
-        // without `__slots__` goes straight to the generic path.
-        let m = found.unwrap_or(std::ptr::null_mut());
         // Entries are small and a site replaces its entry at most
         // `IC_MAX_MISSES` times, so replaced ones are not freed (another
         // thread may still be reading one).
-        let new = Box::into_raw(Box::new(IcEntry { tp, version, member: m }));
+        let new = Box::into_raw(Box::new(IcEntry { tp, version, at }));
         ic.entry.store(new, Ordering::Release);
-        (!m.is_null()).then_some(m)
+        at
+    }
+}
+
+/// A method call site's cache: for one type and version, the method
+/// (a method descriptor found on the type) and why no instance attribute
+/// can shadow it, as CPython's `LOAD_ATTR_METHOD_NO_DICT` and
+/// `LOAD_ATTR_METHOD_WITH_VALUES` check: the instances have no `__dict__`,
+/// or their attributes are in inline values whose shared keys did not have
+/// the name when it was looked up and have not grown since.
+#[derive(Default)]
+pub struct MethodIc {
+    entry: AtomicPtr<MethodEntry>,
+    misses: AtomicU32,
+}
+
+struct MethodEntry {
+    tp: *mut ffi::PyTypeObject,
+    version: u32,
+    /// Borrowed from the type's dict (alive while the version holds), and
+    /// enabled for `PyUnstable_TryIncRef`.
+    func: *mut ffi::PyObject,
+    /// For inline values: the shared keys and how many entries they had;
+    /// null for instances without a `__dict__`.
+    keys: *const u8,
+    nentries: isize,
+}
+
+unsafe extern "C" {
+    fn PyUnstable_EnableTryIncRef(obj: *mut ffi::PyObject);
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn PyUnstable_TryIncRef(obj: *mut ffi::PyObject) -> std::ffi::c_int;
+}
+
+/// The method `name` of `o` (a new reference) when the cache can prove what
+/// `o.name` is, else None (the caller looks it up the generic way).
+pub unsafe fn method(ic: &MethodIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject) -> Option<*mut ffi::PyObject> {
+    unsafe {
+        let tp = ffi::Py_TYPE(o);
+        let e = ic.entry.load(Ordering::Acquire);
+        if !e.is_null() && (*e).tp == tp && (*e).version == (*tp).tp_version_tag {
+            let e = &*e;
+            let unshadowed = e.keys.is_null() || (inline::valid(o) && inline::nentries(e.keys) == e.nentries);
+            if unshadowed && PyUnstable_TryIncRef(e.func) == 1 {
+                return Some(e.func);
+            }
+            return None;
+        }
+        if ic.misses.load(Ordering::Relaxed) >= IC_MAX_MISSES || !inline::ON.load(Ordering::Relaxed) {
+            return None;
+        }
+        ic.misses.fetch_add(1, Ordering::Relaxed);
+        if PyUnstable_Type_AssignVersionTag(tp) == 0 || (*tp).tp_getattro.map(|f| f as *const () as usize) != Some(ffi::PyObject_GenericGetAttr as *const () as usize) {
+            return None;
+        }
+        let version = (*tp).tp_version_tag;
+        let d = _PyType_LookupRef(tp, name);
+        if d.is_null() {
+            return None;
+        }
+        let entry = (|| {
+            if ffi::PyType_GetFlags(ffi::Py_TYPE(d)) & ffi::Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
+                return None;
+            }
+            let flags = ffi::PyType_GetFlags(tp);
+            let (keys, nentries) = if flags & inline::TPFLAGS_MANAGED_DICT == 0 && (*tp).tp_dictoffset == 0 {
+                (std::ptr::null(), 0)
+            } else {
+                let keys = inline::shared_keys(tp)?;
+                if !inline::valid(o) {
+                    return None;
+                }
+                let n = inline::nentries(keys);
+                if inline::index(keys, n, name).is_some() {
+                    return None;
+                }
+                (keys, n)
+            };
+            PyUnstable_EnableTryIncRef(d);
+            Some(MethodEntry { tp, version, func: d, keys, nentries })
+        })();
+        let r = match entry {
+            Some(m) => {
+                ffi::Py_IncRef(d);
+                // As for attribute entries, replaced ones are not freed.
+                ic.entry.store(Box::into_raw(Box::new(m)), Ordering::Release);
+                Some(d)
+            }
+            None => None,
+        };
+        ffi::Py_DecRef(d);
+        r
+    }
+}
+
+/// A new reference to the value at `slot` (an inline value of a live
+/// object), or null. In the free-threaded build another thread may replace
+/// and release it meanwhile: as CPython's `_Py_TryIncrefCompare`, take the
+/// reference only if the count is not zero and the slot still holds it.
+#[inline]
+unsafe fn load_value(slot: *const AtomicPtr<ffi::PyObject>) -> *mut ffi::PyObject {
+    unsafe {
+        let v = (*slot).load(Ordering::Acquire);
+        if v.is_null() {
+            return v;
+        }
+        #[cfg(Py_GIL_DISABLED)]
+        {
+            if PyUnstable_TryIncRef(v) == 0 {
+                return std::ptr::null_mut();
+            }
+            if (*slot).load(Ordering::Acquire) != v {
+                ffi::Py_DecRef(v);
+                return std::ptr::null_mut();
+            }
+        }
+        #[cfg(not(Py_GIL_DISABLED))]
+        ffi::Py_IncRef(v);
+        v
+    }
+}
+
+#[cfg(Py_GIL_DISABLED)]
+unsafe extern "C" {
+    fn PyUnstable_TryIncRef(obj: *mut ffi::PyObject) -> std::ffi::c_int;
+    fn PyCriticalSection_Begin(c: *mut [usize; 2], op: *mut ffi::PyObject);
+    fn PyCriticalSection_End(c: *mut [usize; 2]);
+}
+
+/// Replace an existing inline value (not a first assignment, which also
+/// records the insertion order: that is the generic path's job). Returns
+/// false to take the generic path.
+#[inline]
+unsafe fn store_value(o: *mut ffi::PyObject, off: usize, v: *mut ffi::PyObject) -> bool {
+    unsafe {
+        // As CPython's own setattr: under the object's critical section.
+        #[cfg(Py_GIL_DISABLED)]
+        let mut cs = [0usize; 2];
+        #[cfg(Py_GIL_DISABLED)]
+        PyCriticalSection_Begin(&mut cs, o);
+        let slot = (o as *mut u8).add(off) as *const AtomicPtr<ffi::PyObject>;
+        let old = (*slot).load(Ordering::Relaxed);
+        let ok = !old.is_null() && inline::valid(o) && inline::no_dict(o);
+        if ok {
+            ffi::Py_IncRef(v);
+            (*slot).store(v, Ordering::Release);
+        }
+        #[cfg(Py_GIL_DISABLED)]
+        PyCriticalSection_End(&mut cs);
+        if ok {
+            ffi::Py_DecRef(old);
+        }
+        ok
     }
 }
 
@@ -117,9 +419,14 @@ pub extern "C" fn lz_load_attr(slots: *mut u64, dst: u32, obj: u32, name: *mut f
         if o.is_null() {
             return ERROR;
         }
-        let v = match member(&*ic, o, name) {
-            Some(m) => ffi::PyMember_GetOne(o as *const std::ffi::c_char, m),
-            None => ffi::PyObject_GetAttr(o, name),
+        let v = match lookup(&*ic, o, name, false) {
+            Where::Slot(m) => ffi::PyMember_GetOne(o as *const std::ffi::c_char, m),
+            Where::Inline(off) if inline::valid(o) => match load_value((o as *mut u8).add(off) as *const AtomicPtr<ffi::PyObject>) {
+                // Unset (or being replaced): the generic path decides.
+                v if v.is_null() => ffi::PyObject_GetAttr(o, name),
+                v => v,
+            },
+            _ => ffi::PyObject_GetAttr(o, name),
         };
         result(slots, dst, v)
     }
@@ -131,9 +438,10 @@ pub extern "C" fn lz_store_attr(slots: *mut u64, obj: u32, val: u32, name: *mut 
         if o.is_null() || v.is_null() {
             return ERROR;
         }
-        let r = match member(&*ic, o, name) {
-            Some(m) => ffi::PyMember_SetOne(o as *mut std::ffi::c_char, m, v),
-            None => ffi::PyObject_SetAttr(o, name, v),
+        let r = match lookup(&*ic, o, name, true) {
+            Where::Slot(m) => ffi::PyMember_SetOne(o as *mut std::ffi::c_char, m, v),
+            Where::Inline(off) if store_value(o, off, v) => 0,
+            _ => ffi::PyObject_SetAttr(o, name, v),
         };
         if r < 0 {
             return ERROR;

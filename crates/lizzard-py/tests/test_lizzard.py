@@ -35,6 +35,7 @@ LITERALS = HERE / "programs" / "literals.py"
 SLOTS = HERE / "programs" / "slots.py"
 REBINDING = HERE / "programs" / "rebinding.py"
 NUMBERS = HERE / "programs" / "arith_edges.py"
+INSTANCE_ATTRS = HERE / "programs" / "instance_attrs.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -174,7 +175,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])
@@ -183,6 +184,12 @@ class Programs(unittest.TestCase):
                     lizzard = run("-m", "lizzard", str(prog), env={"LIZZARD_JIT": jit})
                     self.assertEqual(lizzard[0], 0, lizzard[2])
                     self.assertEqual(lizzard[1], plain[1], f"LIZZARD_JIT={jit}")
+
+    def test_fast_paths_are_on(self):
+        # The layouts the int/float fast paths and inline attribute access
+        # read passed their start-up checks on this CPython.
+        code, out, err = run("-c", "import lizzard._lizzard as L; s = L._stats(); print(s['fast_paths'], s['inline_values'])")
+        self.assertEqual((code, out), (0, "True True\n"), err)
 
     def test_deep_recursion_raises(self):
         # Lizzard calls recurse on the C stack: CPython's stack check turns

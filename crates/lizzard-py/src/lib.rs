@@ -96,6 +96,8 @@ fn _stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("fast", array::FAST.load(Ordering::Relaxed))?;
     d.set_item("generic", array::GENERIC.load(Ordering::Relaxed))?;
+    d.set_item("inline_values", ops::inline_values_on())?;
+    d.set_item("fast_paths", ops::fast_paths_on())?;
     Ok(d)
 }
 
@@ -106,6 +108,7 @@ fn _lizzard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<generator::LizzardGenerator>()?;
     generator::init_type(m.py());
     ops::init_fast_paths();
+    ops::init_inline_values();
     m.add_function(wrap_pyfunction!(compile_module, m)?)?;
     m.add_function(wrap_pyfunction!(_stats, m)?)?;
     Ok(())

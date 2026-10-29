@@ -41,6 +41,8 @@ pub struct FuncRt {
     /// An inline cache per instruction (used by attribute loads and stores
     /// in compiled code).
     pub(crate) ics: Vec<ops::AttrIc>,
+    /// A method cache per instruction (used by `CallMethod`).
+    pub(crate) mics: Vec<ops::MethodIc>,
     /// A global-lookup cache per instruction (used by `LoadGlobal`).
     pub(crate) gics: Vec<globals::GlobalIc>,
     table: Table,
@@ -98,8 +100,9 @@ impl FuncRt {
         let cks = ir.checks.iter().map(|_| PyOnceLock::new()).collect();
         let ics = ir.code.iter().map(|_| ops::AttrIc::default()).collect();
         let gics = ir.code.iter().map(|_| globals::GlobalIc::default()).collect();
+        let mics = ir.code.iter().map(|_| ops::MethodIc::default()).collect();
         let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
-        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, gics, table })
+        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, gics, table })
     }
 }
 
@@ -610,7 +613,7 @@ fn run_interp<'py>(
                     }
                 }),
                 Instr::CallMethod { dst, obj, name, args, .. } => {
-                    Some(match regs.obj(py, *obj).map(|o| o.as_ptr()).and_then(|o| vector_call(py, regs, Some(o), f.names[*name as usize].as_ptr(), args, f.kwnames(p))) {
+                    Some(match regs.obj(py, *obj).map(|o| o.as_ptr()).and_then(|o| vector_call(py, regs, Some((o, &f.mics[p])), f.names[*name as usize].as_ptr(), args, f.kwnames(p))) {
                         Ok(v) => {
                             regs.set_obj(*dst, v);
                             NEXT
@@ -706,7 +709,14 @@ fn cell_set(cell: &Bound<'_, PyAny>, val: &Bound<'_, PyAny>) -> PyResult<()> {
 /// Call `callee` with the objects in `args` (the last `kwnames.len()` are
 /// keyword values), by vectorcall; with `slf`, call method `callee` (a name)
 /// of `slf`.
-pub(crate) fn vector_call<'py>(py: Python<'py>, regs: &Regs, slf: Option<*mut ffi::PyObject>, callee: *mut ffi::PyObject, args: &[u32], kwnames: Option<&Py<PyTuple>>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn vector_call<'py>(
+    py: Python<'py>,
+    regs: &Regs,
+    slf: Option<(*mut ffi::PyObject, &ops::MethodIc)>,
+    callee: *mut ffi::PyObject,
+    args: &[u32],
+    kwnames: Option<&Py<PyTuple>>,
+) -> PyResult<Bound<'py, PyAny>> {
     let mut small = [std::ptr::null_mut(); 8];
     let mut big = Vec::new();
     let n = args.len() + slf.is_some() as usize;
@@ -717,7 +727,7 @@ pub(crate) fn vector_call<'py>(py: Python<'py>, regs: &Regs, slf: Option<*mut ff
         &mut big
     };
     let mut k = 0;
-    if let Some(s) = slf {
+    if let Some((s, _)) = slf {
         argv[0] = s;
         k = 1;
     }
@@ -728,24 +738,37 @@ pub(crate) fn vector_call<'py>(py: Python<'py>, regs: &Regs, slf: Option<*mut ff
     let kw = kwnames.map_or(std::ptr::null_mut(), |t| t.as_ptr());
     let nkw = kwnames.map_or(0, |t| t.bind(py).len());
     let nargs = n - nkw;
-    // A Lizzard function: call it directly, without CPython's vectorcall
-    // dispatch (and its panic guard).
-    // SAFETY: a type pointer comparison on a valid object.
-    if slf.is_none() && unsafe { ffi::Py_TYPE(callee) } == lizzard_function_type() {
-        // SAFETY: the type says what it is.
-        let lf = unsafe { Bound::from_borrowed_ptr(py, callee).cast_into_unchecked::<LizzardFunction>() };
-        return lf.get().call_vector(py, argv, kw).map(|v| v.into_bound(py));
+    // A method the call site's cache knows: call it with the object first,
+    // as CPython does for a method descriptor.
+    if let Some((o, ic)) = slf {
+        // SAFETY: valid objects; a new reference to the method comes back.
+        if let Some(m) = unsafe { ops::method(ic, o, callee) } {
+            let m = unsafe { Bound::from_owned_ptr(py, m) };
+            return call_object(py, m.as_ptr(), argv, nargs, kw);
+        }
+    }
+    if slf.is_none() {
+        return call_object(py, callee, argv, nargs, kw);
     }
     // SAFETY: `argv` holds borrowed references the frame keeps alive for the
     // call; `kw` is a tuple of the keyword names or NULL. A new reference or
     // NULL comes back.
-    let r = unsafe {
-        match slf {
-            Some(_) => ffi::PyObject_VectorcallMethod(callee, argv.as_ptr(), nargs, kw),
-            None => ffi::PyObject_Vectorcall(callee, argv.as_ptr(), nargs, kw),
-        }
-    };
+    let r = unsafe { ffi::PyObject_VectorcallMethod(callee, argv.as_ptr(), nargs, kw) };
     unsafe { Bound::from_owned_ptr_or_err(py, r) }
+}
+
+/// Call `callee` with `argv` (`nargs` positional, then keyword values named
+/// by `kw`): a Lizzard function directly, without CPython's vectorcall
+/// dispatch and its panic guard, anything else by vectorcall.
+fn call_object<'py>(py: Python<'py>, callee: *mut ffi::PyObject, argv: &[*mut ffi::PyObject], nargs: usize, kw: *mut ffi::PyObject) -> PyResult<Bound<'py, PyAny>> {
+    // SAFETY: a type pointer comparison on a valid object.
+    if unsafe { ffi::Py_TYPE(callee) } == lizzard_function_type() {
+        // SAFETY: the type says what it is.
+        let lf = unsafe { Bound::from_borrowed_ptr(py, callee).cast_into_unchecked::<LizzardFunction>() };
+        return lf.get().call_vector(py, argv, kw).map(|v| v.into_bound(py));
+    }
+    // SAFETY: `argv` holds borrowed references alive for the call.
+    unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyObject_Vectorcall(callee, argv.as_ptr(), nargs, kw)) }
 }
 
 /// The exception `raise x` raises: `x`, or an instance of the class `x`.
@@ -851,7 +874,7 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
         }
         Instr::CallMethod { dst, obj, name, args, .. } => {
             let o = obj!(py, regs, *obj).as_ptr();
-            let v = vector_call(py, regs, Some(o), f.names[*name as usize].as_ptr(), args, f.kwnames.get(pc))?;
+            let v = vector_call(py, regs, Some((o, &f.mics[*pc])), f.names[*name as usize].as_ptr(), args, f.kwnames.get(pc))?;
             regs.set_obj(*dst, v);
         }
         Instr::CallEx { dst, func, args, kwargs } => {

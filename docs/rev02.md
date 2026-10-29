@@ -259,20 +259,24 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Safepoints:** every 1024 loop back-edges, compiled code runs signal handlers and detaches briefly, so Ctrl-C and the free-threaded stop-the-world GC work in tight loops.
 - **Hot instructions skip `step`:** constants, moves, attribute loads and stores, binary operators, comparisons, truthiness, boxing, checks, calls, `for` iteration and `return` call small helpers with their operands as immediates, straight into the C API.
 - **Calls use vectorcall.** `LizzardFunction` implements CPython's vectorcall protocol and is a method descriptor (PyO3 offers neither, so the type is patched once at startup): CPython and compiled code call it with the arguments in an array, and `obj.m(...)` passes `obj` first instead of creating a bound method. `obj.m(args)` compiles to `CallMethod` (`PyObject_VectorcallMethod`, which looks `m` up through CPython's type cache) when the arguments are names and literals, so that looking `m` up after them changes nothing. Keyword names are tuples built once per call site, and a frame's slots come from a per-thread pool.
-- **Attribute inline caches.** Each attribute site caches `(type, tp_version_tag) -> member` for `__slots__` attributes and reads or writes the slot with `PyMember_GetOne`/`SetOne`; any change to the class or a base gives it a new version tag, so a stale entry never hits. A site that sees more than 8 types stops caching. Instances with a `__dict__` keep their attributes in CPython's internal storage, which only `PyObject_GetAttr` reaches. The checker accepts `__slots__` and requires the attributes a class adds to be listed.
+- **Attribute inline caches** (`ops.rs`). Each attribute site caches, for one `(type, tp_version_tag)` (any change to the class or a base gives it a new version tag, so a stale entry never hits), where the attribute lives; a site that sees more than 8 types stops caching:
+  - **in the instance's inline values**, CPython 3.13+'s storage for a plain class's instance attributes: an array right after the object, in the order of the type's shared keys. The attribute is at a fixed offset, read and written there directly, as CPython's own `LOAD_ATTR_INSTANCE_VALUE` / `STORE_ATTR_INSTANCE_VALUE` do and with their guards: the type has no attribute of that name and uses the generic getattr/setattr; on a read, the values are still valid (no detached `__dict__`) and a missing value takes the generic path (AttributeError, `__getattr__`); in the free-threaded build the reference is taken with `PyUnstable_TryIncRef` and a re-check of the slot (CPython's `_Py_TryIncrefCompare`); a store replaces an existing value only, under the object's critical section, with no `__dict__` object (first assignments take the generic path, which records the insertion order). This reads CPython-internal layouts (`Include/internal/pycore_dict.h`, `pycore_object.h`, 3.14): at start-up a probe class's attributes are read both ways, and the path stays off unless they agree (`lizzard._lizzard._stats()["inline_values"]`);
+  - **in a `__slots__` member**, read and written with `PyMember_GetOne`/`SetOne`. The checker accepts `__slots__` and requires the attributes a class adds to be listed;
+  - else nowhere it can reach: `PyObject_GetAttr`/`SetAttr`.
+- **Method caches.** A `CallMethod` site caches the method of one `(type, version)` when CPython's `LOAD_ATTR_METHOD_NO_DICT` / `..._WITH_VALUES` reasoning proves no instance attribute shadows it: the instances have no `__dict__`, or their attributes are in valid inline values whose shared keys lacked the name and have not grown since (keys only grow). The method (a method descriptor: a Lizzard or Python function, `list.append`, ...) is called with the object first; a Lizzard function directly.
 - **Checks are prepared once per site** (the class of a check is resolved once, not by name on every call), and pass on an exact type-pointer comparison before trying `isinstance`.
 - Cranelift is built optimized even in debug builds (workspace `Cargo.toml`); compiling then costs about a millisecond per function.
 - **Benchmarks** (`crates/lizzard-py/bench/bench.py`, release build, best of 3, CPython 3.14t on x86-64; `/s` is the `__slots__` variant):
 
   | | CPython | interpreter | JIT |
   |---|---|---|---|
-  | int loop (2M) | 0.105 s | 0.162 s | 0.136 s |
-  | `fib(25)` | 0.008 s | 0.030 s | 0.039 s |
-  | vector objects (500k `a.add(d)`) | 0.083 s | 0.271 s | 0.333 s |
-  | same, `__slots__` | 0.077 s | 0.204 s | 0.278 s |
-  | method calls updating attributes (500k) | 0.036 s | 0.117 s | 0.127 s |
-  | same, `__slots__` | 0.035 s | 0.096 s | 0.101 s |
-  | list build and scan (1M) | 0.099 s | 0.150 s | 0.137 s |
+  | int loop (2M) | 0.105 s | 0.160 s | 0.143 s |
+  | `fib(25)` | 0.008 s | 0.033 s | 0.043 s |
+  | vector objects (500k `a.add(d)`) | 0.083 s | 0.252 s | 0.306 s |
+  | same, `__slots__` | 0.077 s | 0.222 s | 0.279 s |
+  | method calls updating attributes (500k) | 0.036 s | 0.093 s | 0.096 s |
+  | same, `__slots__` | 0.035 s | 0.092 s | 0.095 s |
+  | list build and scan (1M) | 0.099 s | 0.161 s | 0.135 s |
 
 **Interpreter performance.** `crates/lizzard-py/bench/count.sh` counts machine instructions per unit of work with Valgrind (deterministic, unlike timings). At first the interpreter needed 3.9x CPython's instructions per loop iteration, 5.0x per method call and 6.8x per `fib` call. The causes, measured, and what was done:
 - **Dispatch was half the time.** Each instruction went through `step`, one large function returning `PyResult<Option<Exit>>`: about 45 machine instructions of overhead each. The interpreter loop now runs the common instructions itself on the raw slots, with the helpers compiled code uses (`ops.rs`), and handles exceptions only when one is raised; the rest still go through `step`.
@@ -282,8 +286,8 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Int and float operations went through CPython's generic paths** (`PyObject_RichCompare` alone was about 160 instructions for `n < 2`). As in CPython's specializing interpreter, `+ - *` and comparisons of exact compact ints, and `+ - * /` and comparisons of exact floats, are computed in place (the layout read is checked against CPython's own results at start-up, else the fast paths stay off).
 - **Recursion:** calls between Lizzard functions recurse on the C stack, and nothing bounded that: deep recursion crashed. Frames now enter CPython's recursion check, which raises RecursionError before the stack runs out (the interpreter crate is built with `opt-level = 1` in debug builds so that its frames fit CPython's margin).
 
-  Now (instructions per unit, CPython / interpreter): loop iteration 577 / 1151 (2.0x), method call 936 / 2796 (3.0x), `fib(10)` 84k / 252k (3.0x). What remains:
-  - **Attribute access on instances with a `__dict__`.** CPython's specialized bytecodes read an instance's inline attribute storage directly (about 20 machine instructions); no public C API reaches it, so Lizzard goes through `PyObject_GenericGetAttr`/`SetAttr` (about 140 each). `__slots__` classes use the inline cache instead.
+  Now (instructions per unit, CPython / interpreter): loop iteration 577 / 1158 (2.0x), method call 936 / 2269 (2.4x), `fib(10)` 84k / 256k (3.0x). Reading instance attributes in inline values and caching methods took the method call from 2796 to 2269 (attribute access went from about 140 to about 50 instructions; the method lookup through `PyObject_VectorcallMethod`, about 210, is gone). What remains:
+  - **Reference counting** goes through libpython's `Py_IncRef`/`Py_DecRef` functions (the free-threaded build's per-thread counts included); CPython inlines it.
   - **Dispatch** is about 29 machine instructions per IR instruction against CPython's ~10: the IR is a Rust enum with vectors inside, matched instruction by instruction. A dense encoding would bring it down.
   - **Constructing instances** (`V(x, y)`) goes through `type.__call__`, `__new__` and a lookup of `__init__`; CPython specializes the whole sequence.
   - **Result checks** after operations whose operands are not exact builtins (a `float` attribute read from an instance is checked when read).

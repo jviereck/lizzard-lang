@@ -193,7 +193,7 @@ pub extern "C" fn lz_call(ctx: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
     let pc = pc as usize;
     let r = match &f.ir.code[pc] {
         Instr::Call { dst, func, args, .. } => regs.obj(py, *func).map(|o| o.as_ptr()).and_then(|callee| Ok((*dst, crate::interp::vector_call(py, regs, None, callee, args, f.kwnames(pc))?))),
-        Instr::CallMethod { dst, obj, name, args, .. } => regs.obj(py, *obj).map(|o| o.as_ptr()).and_then(|o| Ok((*dst, crate::interp::vector_call(py, regs, Some(o), f.names[*name as usize].as_ptr(), args, f.kwnames(pc))?))),
+        Instr::CallMethod { dst, obj, name, args, .. } => regs.obj(py, *obj).map(|o| o.as_ptr()).and_then(|o| Ok((*dst, crate::interp::vector_call(py, regs, Some((o, &f.mics[pc])), f.names[*name as usize].as_ptr(), args, f.kwnames(pc))?))),
         _ => unreachable!("lz_call on another instruction"),
     };
     match r {
