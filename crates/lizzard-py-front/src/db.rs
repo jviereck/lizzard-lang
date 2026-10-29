@@ -216,6 +216,13 @@ pub struct ClassInfo {
     any_base: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DataclassOpts {
+    pub frozen: bool,
+    pub kw_only: bool,
+    pub init: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodKind {
     Normal,
@@ -1139,6 +1146,88 @@ impl Db {
         self.setters.get(&f).copied()
     }
 
+    /// The options of `@dataclass` (from `dataclasses`) on class `c`, if
+    /// it has it.
+    pub fn dataclass_opts(&mut self, c: ClassId) -> Option<DataclassOpts> {
+        let stmt = self.header(c);
+        let m = self.classes[c].m;
+        for dec in &stmt.decorator_list {
+            let (target, kws) = match &dec.expression {
+                Expr::Call(call) => (&*call.func, Some(&call.arguments.keywords)),
+                e => (e, None),
+            };
+            // `dataclass` imported from `dataclasses` (an opaque module), not
+            // something the module defines itself.
+            if !is_name(target, "dataclass") || !matches!(self.sym_of_expr(m, target), Some(Sym::Any)) {
+                continue;
+            }
+            let flag = |name: &str, default: bool| {
+                kws.and_then(|k| k.iter().find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name)))
+                    .map_or(default, |k| matches!(k.value, Expr::BooleanLiteral(ref b) if b.value))
+            };
+            return Some(DataclassOpts { frozen: flag("frozen", false), kw_only: flag("kw_only", false), init: flag("init", true) });
+        }
+        None
+    }
+
+    /// A dataclass's fields in `__init__` order (inherited ones first): name,
+    /// type, whether it has a default, keyword-only.
+    pub fn dataclass_fields(&mut self, c: ClassId) -> Vec<(String, Ty, bool, bool)> {
+        let mut fields: Vec<(String, Ty, bool, bool)> = Vec::new();
+        let cps = self.class_params(c);
+        for k in self.mro(c).into_iter().rev() {
+            let Some(opts) = self.dataclass_opts(k) else { continue };
+            // `k`'s type parameters as `c` instantiates them.
+            let kps = self.class_params(k);
+            let mut s = Subst::new();
+            self.assign(&Ty::Inst(c, cps.iter().map(|p| Ty::Var(*p)).collect()), &Ty::Inst(k, kps.iter().map(|p| Ty::Var(*p)).collect()), &mut s, &mut false);
+            let stmt = self.header(k);
+            let m = self.classes[k].m;
+            let tps = self.class_tparams(k);
+            let self_ty = Ty::Var(self.self_tv(k));
+            let mut flat = Vec::new();
+            self.flatten(&stmt.body, &mut flat);
+            for st in flat {
+                let Stmt::AnnAssign(a) = st else { continue };
+                let Expr::Name(n) = &*a.target else { continue };
+                let head = match &*a.annotation {
+                    Expr::Subscript(sub) => &*sub.value,
+                    e => e,
+                };
+                if is_name(head, "ClassVar") {
+                    continue;
+                }
+                let ty = self.eval_type(&a.annotation, &Scope { m, tparams: &tps, self_ty: Some(&self_ty) });
+                let ty = deep_subst(&ty, &s);
+                let default = match a.value.as_deref() {
+                    None => false,
+                    // `field(...)` has a default only with `default=` or
+                    // `default_factory=`.
+                    Some(Expr::Call(call)) if is_name(&call.func, "field") => {
+                        call.arguments.keywords.iter().any(|kw| kw.arg.as_ref().is_some_and(|a| matches!(a.as_str(), "default" | "default_factory")))
+                    }
+                    Some(_) => true,
+                };
+                let name = n.id.to_string();
+                match fields.iter_mut().find(|f| f.0 == name) {
+                    Some(f) => *f = (name, ty, default, opts.kw_only),
+                    None => {
+                        if !default && !opts.kw_only && fields.iter().any(|f| f.2 && !f.3) {
+                            self.err(m, a.range().start().into(), format!("dataclass field `{name}` without a default cannot follow fields with defaults"));
+                        }
+                        fields.push((name, ty, default, opts.kw_only));
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    /// Whether `c` or a base is a frozen dataclass.
+    pub fn is_frozen(&mut self, c: ClassId) -> bool {
+        self.mro(c).into_iter().any(|k| self.dataclass_opts(k).is_some_and(|o| o.frozen))
+    }
+
     pub fn method_kind(&self, f: FuncId) -> MethodKind {
         let defs = &self.funcs[f].defs;
         if defs.iter().any(|(d, _)| decorated(d, "staticmethod")) {
@@ -1233,8 +1322,29 @@ impl Db {
                 }
             }
         }
+        if found.is_none() && name == "__init__" && self.dataclass_opts(c).is_some_and(|o| o.init) {
+            found = Some(Member::Method(self.dataclass_init(c)));
+        }
         self.classes[c].members.insert(name.to_string(), found.clone());
         found
+    }
+
+    /// The `__init__` `@dataclass` generates, as a function with a signature
+    /// and no body.
+    fn dataclass_init(&mut self, c: ClassId) -> FuncId {
+        let m = self.classes[c].m;
+        let f = self.func_for(m, Some(c), "__init__", Vec::new());
+        let self_ty = Ty::Var(self.self_tv(c));
+        let mut params = vec![Param { name: "self".into(), ty: self_ty, kind: PKind::PosOrKw, default: false }];
+        for (name, ty, default, kw_only) in self.dataclass_fields(c) {
+            params.push(Param { name, ty, kind: if kw_only { PKind::KwOnly } else { PKind::PosOrKw }, default });
+        }
+        // Keyword-only parameters come after the others.
+        params.sort_by_key(|p| matches!(p.kind, PKind::KwOnly));
+        let file = self.modules[m].file.unwrap_or(0);
+        let off = self.header(c).range().start().into();
+        self.funcs[f].sigs = Some(Rc::new(vec![Sig { params, ret: Ty::None, file, off }]));
+        f
     }
 
     /// A member of `c` or its bases, with the class that declares it.

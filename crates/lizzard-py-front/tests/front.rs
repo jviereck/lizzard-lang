@@ -10,10 +10,10 @@ fn check_with(source: &str, version: Option<&'static str>) -> Vec<String> {
         search_roots: vec![fixtures.join("site")],
         version: (3, 14),
         platform: "darwin".into(),
-        stdlib: ["sys"].iter().map(|s| s.to_string()).collect(),
+        stdlib: ["sys", "dataclasses"].iter().map(|s| s.to_string()).collect(),
         pkg_version: Box::new(move |_| version.map(String::from)),
     };
-    let src = format!("# lizzard: module\nimport mini\n\n{source}");
+    let src = format!("# lizzard: module\nimport mini\nfrom dataclasses import dataclass, field\n\n{source}");
     let c = lizzard_py_front::compile_module(env, "m", "m.py", &src);
     c.diagnostics.iter().map(|d| d.split(": error: ").nth(1).unwrap_or(d).to_string()).chain(c.warnings.iter().map(|w| format!("warning: {w}"))).collect()
 }
@@ -340,6 +340,24 @@ fn closures_and_lambdas_are_typed() {
             "cannot infer the parameter types of this lambda: use it where a `Callable[[...], ...]` is expected, or use a `def`",
             "str has no attribute `nope`",
             "argument 1: expected str, got int",
+        ]
+    );
+}
+
+#[test]
+fn dataclasses_get_an_init_from_their_fields() {
+    let d = check(
+        "@dataclass\nclass P:\n    x: int\n    y: int = 0\n    tags: list[str] = field(default_factory=list)\n\n@dataclass\nclass Q(P):\n    z: str = \"\"\n\n@dataclass(frozen=True)\nclass F:\n    a: int\n\n@dataclass\nclass Bad:\n    a: int = 1\n    b: str\n\ndef f() -> None:\n    P(1)\n    P(1, 2, [\"a\"])\n    Q(1, z=\"s\")\n    P()\n    P(\"s\")\n    Q(1, 2, [], \"z\", 5)\n    s: str = P(1).x\n    F(1).a = 2\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "dataclass field `b` without a default cannot follow fields with defaults",
+            "P(): missing argument `x`",
+            "argument `x` of P(): expected int, got str",
+            "Q(): takes 4 positional arguments but 5 were given",
+            "cannot assign int to `s` of type str",
+            "cannot assign to field `a` of frozen dataclass `F`",
         ]
     );
 }

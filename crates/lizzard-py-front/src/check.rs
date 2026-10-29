@@ -493,8 +493,13 @@ impl<'a> Lower<'a> {
             self.err(off, format!("`{name}` is defined more than once"));
             return Vec::new();
         }
-        if !cd.decorator_list.is_empty() {
-            self.err(off, "class decorators are not supported by Lizzard yet");
+        if self.db.dataclass_opts(c).is_some() {
+            if cd.decorator_list.len() > 1 {
+                self.err(off, "class decorators other than @dataclass are not supported by Lizzard yet");
+            }
+            self.db.dataclass_fields(c);
+        } else if !cd.decorator_list.is_empty() {
+            self.err(off, "class decorators other than @dataclass are not supported by Lizzard yet");
         }
         if let Some(args) = &cd.arguments {
             if !args.keywords.is_empty() {
@@ -2595,6 +2600,11 @@ impl<'a> Lower<'a> {
         }
         let val = match &lt {
             Ty::Any => val,
+            Ty::Inst(c, _) if !matches!(obj.ty, Ty::Type(_)) && self.db.is_frozen(*c) => {
+                let cn = self.db.classes[*c].name.clone();
+                self.err(off, format!("cannot assign to field `{name}` of frozen dataclass `{cn}`"));
+                val
+            }
             Ty::Inst(c, _) => match self.db.find_member(*c, name) {
                 Some((owner, Member::Attr(t))) => {
                     let want = self.member_type(&inst_ty, owner, &t);
