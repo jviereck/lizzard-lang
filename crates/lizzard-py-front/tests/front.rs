@@ -235,3 +235,18 @@ fn unions_distribute_over_members() {
     );
     assert_eq!(d, ["cannot assign float | int to `b` of type int", "cannot assign int | str to `d` of type int", "cannot assign int | float | None to `g` of type float"]);
 }
+
+#[test]
+fn functions_read_and_write_module_globals() {
+    let d = check(
+        "count = 0\nnames: list[str] = []\nlimit: int\n\ndef f() -> str:\n    global count\n    count += 1\n    names.append(\"x\")\n    count = \"s\"\n    return names[0] + str(limit)\n\ndef g() -> int:\n    n = count\n    count = 2\n    return n\n\ndef h() -> None:\n    global missing\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "cannot assign str to the global `count` of type int",
+            "local variable `count` is used before it is assigned",
+            "`missing` must be assigned at the top level of the module to be used as a global",
+        ]
+    );
+}

@@ -75,6 +75,10 @@ struct Lower<'a> {
     /// Narrowed types of locals (`x`) and their attributes (`x.attr`), where
     /// they differ from the declared ones.
     narrow: HashMap<String, Ty>,
+    /// Names declared `global` in this function.
+    global_names: Vec<String>,
+    /// Names the function assigns anywhere: they are local throughout.
+    bound: Vec<String>,
 }
 
 const BUILTIN_FNS: &[&str] = &["print", "len"];
@@ -83,6 +87,16 @@ pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
     let file = db.modules[m].file.expect("Lizzard module without file");
     let mut funcs = Vec::new();
     let mut top = Lower::new(db, m, file, true, "<module>".into(), Ty::Any);
+    // The top level first: it gives the module's globals their types.
+    for s in body {
+        if !matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            top.stmt(s);
+        }
+    }
+    let globals: Vec<(String, Ty)> = top.locals.iter().map(|(n, l)| (n.clone(), l.ty.clone())).collect();
+    for (n, t) in globals {
+        top.db.globals.insert((m, n), t);
+    }
     for s in body {
         match s {
             Stmt::FunctionDef(d) => {
@@ -91,7 +105,7 @@ pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
                 }
             }
             Stmt::ClassDef(c) => funcs.extend(top.class_def(c)),
-            s => top.stmt(s),
+            _ => {}
         }
     }
     funcs
@@ -121,6 +135,8 @@ impl<'a> Lower<'a> {
             loops: Vec::new(),
             method: None,
             narrow: HashMap::new(),
+            global_names: Vec::new(),
+            bound: Vec::new(),
         }
     }
 
@@ -564,6 +580,9 @@ impl<'a> Lower<'a> {
         }
         let mut l = Lower::new(self.db, self.m, self.file, false, qual, sig.ret.clone());
         l.at(d);
+        let mut keys = Vec::new();
+        assigned_keys(&d.body, &mut keys);
+        l.bound = keys.into_iter().filter(|k| !k.contains('.')).collect();
         let has_receiver = owner.is_some() && kind != MethodKind::Static;
         l.method = owner.map(|c| MethodCtx { class: c, receiver: if has_receiver { sig.params.first().map(|p| p.name.clone()) } else { None }, is_init: name == "__init__" });
         // Literal defaults, in order of the parameters that have them.
@@ -673,6 +692,18 @@ impl<'a> Lower<'a> {
                 self.assign_target(target, v, off);
             }
             Stmt::AnnAssign(a) => self.ann_assign(a, off),
+            Stmt::Global(g) if !self.toplevel => {
+                for n in &g.names {
+                    let n = n.as_str();
+                    if self.locals.contains_key(n) {
+                        self.err(off, format!("`{n}` is assigned before its `global` declaration"));
+                    } else if !self.db.globals.contains_key(&(self.m, n.to_string())) {
+                        self.err(off, format!("`{n}` must be assigned at the top level of the module to be used as a global"));
+                    }
+                    self.global_names.push(n.to_string());
+                }
+            }
+            Stmt::Global(_) => {}
             Stmt::AugAssign(a) => self.aug_assign(a, off),
             Stmt::If(i) => self.if_stmt(&i.test, &i.body, &i.elif_else_clauses),
             Stmt::For(f) => self.for_stmt(f),
@@ -930,7 +961,17 @@ impl<'a> Lower<'a> {
         }
         let ty = self.db.eval_type(&a.annotation, &Scope { m: self.m, tparams: &tps, self_ty: self_ty.as_ref() });
         let Some(value) = &a.value else {
-            return self.err(off, "a declaration without a value is not supported by Lizzard yet");
+            // `x: T` declares a local (or global) that is assigned later.
+            let Expr::Name(n) = &*a.target else {
+                return self.err(off, "a declaration without a value is only supported for names");
+            };
+            let name = n.id.as_str();
+            if self.locals.contains_key(name) || self.global_names.iter().any(|g| g == name) {
+                return self.err(off, format!("`{name}` is already declared"));
+            }
+            let reg = self.reg(Repr::Obj);
+            self.locals.insert(name.to_string(), Local { reg, ty, repr: Repr::Obj });
+            return;
         };
         match &*a.target {
             Expr::Name(n) => {
@@ -987,6 +1028,17 @@ impl<'a> Lower<'a> {
     }
 
     fn assign_local(&mut self, name: &str, v: Val, ann: Option<Ty>, off: u32) {
+        if self.global_names.iter().any(|g| g == name) {
+            let Some(t) = self.db.globals.get(&(self.m, name.to_string())).cloned() else { return };
+            if ann.is_some() {
+                return self.err(off, format!("the global `{name}` cannot be annotated in a function"));
+            }
+            let v = self.coerce(v, &t, off, |_, got, want| format!("cannot assign {got} to the global `{name}` of type {want}"));
+            let r = self.obj(&v);
+            let n = self.name(name);
+            self.emit(Instr::StoreGlobal { name: n, val: r });
+            return;
+        }
         if let Some(l) = self.locals.get(name).cloned() {
             if let Some(a) = &ann {
                 if *a != l.ty {
@@ -1561,9 +1613,16 @@ impl<'a> Lower<'a> {
                 self.err(off, format!("`{name}` is used before it is assigned"));
                 Ty::Any
             }
-            Some(Sym::UserVar) => {
-                self.err(off, format!("Lizzard functions cannot use the module variable `{name}` yet"));
+            _ if self.bound.iter().any(|b| b == name) && !self.global_names.iter().any(|g| g == name) => {
+                self.err(off, format!("local variable `{name}` is used before it is assigned"));
                 Ty::Any
+            }
+            Some(Sym::UserVar) => {
+                // A module global: anything may rebind it, so it is checked.
+                let t = self.db.globals.get(&(self.m, name.to_string())).cloned().unwrap_or(Ty::Any);
+                let v = self.load_global(name, t);
+                self.check(&v, format!("global `{name}`"), None);
+                return self.unbox_f32(v);
             }
             Some(s) => self.sym_value_ty(s),
             None => match name {

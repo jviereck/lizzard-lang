@@ -196,6 +196,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
             };
             regs[*dst as usize] = V::O(v);
         }
+        Instr::StoreGlobal { name, val } => globals.set_item(f.names[*name as usize].bind(py), obj!(regs, *val))?,
         Instr::Move { dst, src } => {
             let v = match &regs[*src as usize] {
                 V::Empty => return Err(unbound()),

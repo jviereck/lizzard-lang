@@ -85,6 +85,7 @@ pub enum Instr {
     Const { dst: Reg, idx: u32 },
     /// Module globals, then builtins.
     LoadGlobal { dst: Reg, name: u32 },
+    StoreGlobal { name: u32, val: Reg },
     Move { dst: Reg, src: Reg },
     LoadAttr { dst: Reg, obj: Reg, name: u32 },
     StoreAttr { obj: Reg, name: u32, val: Reg },

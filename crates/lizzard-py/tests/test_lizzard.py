@@ -19,6 +19,7 @@ VEC32 = HERE / "programs" / "vec32.py"
 CLASSES = HERE / "programs" / "classes.py"
 CONTAINERS = HERE / "programs" / "containers.py"
 UNIONS = HERE / "programs" / "unions.py"
+GLOBALS = HERE / "programs" / "globals.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -158,7 +159,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))

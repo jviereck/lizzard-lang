@@ -288,6 +288,8 @@ pub struct Db {
     /// parameters and `Self`): they stand for one unknown type, so only
     /// themselves (or `Any`) are assignable to them.
     pub rigid: Vec<TvId>,
+    /// The types of Lizzard modules' globals (from their top level).
+    pub globals: HashMap<(ModId, String), Ty>,
 }
 
 /// Lizzard's definitions for the builtins it types (see the file's header).
@@ -374,6 +376,7 @@ impl Db {
             diags: Vec::new(),
             warnings: Vec::new(),
             rigid: Vec::new(),
+            globals: HashMap::new(),
         }
     }
 
