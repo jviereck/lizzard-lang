@@ -6,7 +6,9 @@
 //! releases them when it is dropped.
 //!
 //! Small frames keep their slots inline (a call's frame lives on the Rust
-//! stack: no allocation), larger ones on the heap.
+//! stack: no allocation), larger ones on the heap. A window views slots
+//! someone else keeps (the interpreter's stack of callee frames), and owns
+//! nothing: the interpreter releases those frames itself.
 
 use pyo3::exceptions::PyUnboundLocalError;
 use pyo3::ffi;
@@ -17,12 +19,18 @@ const _: () = assert!(std::mem::size_of::<*mut ffi::PyObject>() == std::mem::siz
 const INLINE: usize = 24;
 
 pub struct Regs {
-    inline: [u64; INLINE],
-    heap: Vec<u64>,
+    store: Store,
     len: usize,
     /// Which registers hold objects: the function's `FuncRt::objs`, which
     /// outlives its frames (a generator holds its `FuncRt`).
     objs: *const [bool],
+}
+
+enum Store {
+    Inline([u64; INLINE]),
+    Heap(Vec<u64>),
+    /// A window's slots, kept elsewhere.
+    External(*mut u64),
 }
 
 // SAFETY: the objects are owned references, released with the thread
@@ -37,8 +45,17 @@ impl Regs {
     /// A frame for a function with registers `objs` (which must outlive it).
     pub fn new(objs: &[bool]) -> Regs {
         let len = objs.len();
-        let heap = if len > INLINE { vec![0; len] } else { Vec::new() };
-        Regs { inline: [0; INLINE], heap, len, objs: objs as *const [bool] }
+        let store = if len > INLINE { Store::Heap(vec![0; len]) } else { Store::Inline([0; INLINE]) };
+        Regs { store, len, objs: objs as *const [bool] }
+    }
+
+    /// A view of `objs.len()` slots at `slots`, kept elsewhere.
+    ///
+    /// # Safety
+    /// The slots stay valid and are only reached through the view while it
+    /// is used.
+    pub unsafe fn window(slots: *mut u64, objs: &[bool]) -> Regs {
+        Regs { store: Store::External(slots), len: objs.len(), objs: objs as *const [bool] }
     }
 
     fn objs(&self) -> &[bool] {
@@ -47,11 +64,21 @@ impl Regs {
     }
 
     fn slots(&self) -> &[u64] {
-        if self.len <= INLINE { &self.inline[..self.len] } else { &self.heap }
+        match &self.store {
+            // SAFETY: see `window`.
+            Store::External(p) => unsafe { std::slice::from_raw_parts(*p, self.len) },
+            Store::Inline(a) => &a[..self.len],
+            Store::Heap(v) => &v[..self.len],
+        }
     }
 
     fn slots_mut(&mut self) -> &mut [u64] {
-        if self.len <= INLINE { &mut self.inline[..self.len] } else { &mut self.heap }
+        match &mut self.store {
+            // SAFETY: see `window`.
+            Store::External(p) => unsafe { std::slice::from_raw_parts_mut(*p, self.len) },
+            Store::Inline(a) => &mut a[..self.len],
+            Store::Heap(v) => &mut v[..self.len],
+        }
     }
 
     /// The slots, for compiled code and the interpreter's fast paths. The
@@ -74,18 +101,12 @@ impl Regs {
     /// first have to make sure it is).
     pub fn release(&mut self, _py: Python<'_>) {
         let objs = self.objs;
-        let objs = unsafe { &*objs };
-        let slots = self.slots_mut();
-        for i in 0..slots.len() {
-            if objs[i] && slots[i] != 0 {
-                // SAFETY: the frame owns these references; attached.
-                unsafe { crate::rc::decref(std::mem::take(&mut slots[i]) as *mut ffi::PyObject) };
-            }
-        }
+        // SAFETY: see `objs`.
+        release_slots(self.slots_mut(), unsafe { &*objs });
         // Nothing left for `Drop`.
         self.len = 0;
-        self.heap = Vec::new();
     }
+
 
     fn ptr(&self, r: u32) -> &*mut ffi::PyObject {
         debug_assert!(self.objs()[r as usize], "register {r} is not an object");
@@ -164,12 +185,26 @@ impl Regs {
     }
 }
 
+/// Release the objects in `slots` (`objs` says which hold objects), leaving
+/// them unbound. The thread is attached.
+pub fn release_slots(slots: &mut [u64], objs: &[bool]) {
+    for (s, &o) in slots.iter_mut().zip(objs) {
+        if o && *s != 0 {
+            // SAFETY: the frame owns these references; attached.
+            unsafe { crate::rc::decref(std::mem::take(s) as *mut ffi::PyObject) };
+        }
+    }
+}
+
 impl Drop for Regs {
     fn drop(&mut self) {
+        if let Store::External(_) = self.store {
+            return;
+        }
         let objs = self.objs;
+        // SAFETY: see `objs`.
         let objs = unsafe { &*objs };
-        let slots = self.slots();
-        if (0..slots.len()).any(|i| objs[i] && slots[i] != 0) {
+        if self.slots().iter().zip(objs).any(|(s, &o)| o && *s != 0) {
             Python::attach(|py| self.release(py));
         }
     }

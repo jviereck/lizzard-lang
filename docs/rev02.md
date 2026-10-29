@@ -270,13 +270,13 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
   | | CPython | interpreter | JIT |
   |---|---|---|---|
-  | int loop (2M) | 0.105 s | 0.160 s | 0.143 s |
-  | `fib(25)` | 0.008 s | 0.033 s | 0.043 s |
-  | vector objects (500k `a.add(d)`) | 0.083 s | 0.252 s | 0.306 s |
-  | same, `__slots__` | 0.077 s | 0.222 s | 0.279 s |
-  | method calls updating attributes (500k) | 0.036 s | 0.093 s | 0.096 s |
-  | same, `__slots__` | 0.035 s | 0.092 s | 0.095 s |
-  | list build and scan (1M) | 0.099 s | 0.161 s | 0.135 s |
+  | int loop (2M) | 0.107 s | 0.153 s | 0.140 s |
+  | `fib(25)` | 0.012 s | 0.027 s | 0.050 s |
+  | vector objects (500k `a.add(d)`) | 0.092 s | 0.230 s | 0.324 s |
+  | same, `__slots__` | 0.080 s | 0.204 s | 0.289 s |
+  | method calls updating attributes (500k) | 0.037 s | 0.077 s | 0.120 s |
+  | same, `__slots__` | 0.036 s | 0.078 s | 0.120 s |
+  | list build and scan (1M) | 0.105 s | 0.176 s | 0.135 s |
 
 **Interpreter performance.** `crates/lizzard-py/bench/count.sh` counts machine instructions per unit of work with Valgrind (deterministic, unlike timings). At first the interpreter needed 3.9x CPython's instructions per loop iteration, 5.0x per method call and 6.8x per `fib` call. The causes, measured, and what was done:
 - **Dispatch was half the time.** Each instruction went through `step`, one large function returning `PyResult<Option<Exit>>`: about 45 machine instructions of overhead each. The interpreter loop now runs the common instructions itself on the raw slots, with the helpers compiled code uses (`ops.rs`), and handles exceptions only when one is raised; the rest still go through `step`.
@@ -286,9 +286,13 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Int and float operations went through CPython's generic paths** (`PyObject_RichCompare` alone was about 160 instructions for `n < 2`). As in CPython's specializing interpreter, `+ - *` and comparisons of exact compact ints, and `+ - * /` and comparisons of exact floats, are computed in place (the layout read is checked against CPython's own results at start-up, else the fast paths stay off).
 - **Recursion:** calls between Lizzard functions recurse on the C stack, and nothing bounded that: deep recursion crashed. Frames now enter CPython's recursion check, which raises RecursionError before the stack runs out (the interpreter crate is built with `opt-level = 1` in debug builds so that its frames fit CPython's margin).
 
-  Now (instructions per unit, CPython / interpreter): loop iteration 577 / 1158 (2.0x), method call 936 / 2269 (2.4x), `fib(10)` 84k / 256k (3.0x). Reading instance attributes in inline values and caching methods took the method call from 2796 to 2269 (attribute access went from about 140 to about 50 instructions; the method lookup through `PyObject_VectorcallMethod`, about 210, is gone). What remains:
-  - **Reference counting** goes through libpython's `Py_IncRef`/`Py_DecRef` functions (the free-threaded build's per-thread counts included); CPython inlines it.
-  - **Dispatch** is about 29 machine instructions per IR instruction against CPython's ~10: the IR is a Rust enum with vectors inside, matched instruction by instruction. A dense encoding would bring it down.
+  Now (instructions per unit, CPython / interpreter): loop iteration 577 / 1010 (1.75x), method call 936 / 1908 (2.0x), `fib(10)` 84k / 229k (2.7x). The four steps after the inline-values work, each measured:
+  1. **Inline reference counting** (`rc.rs`): `Py_INCREF`/`Py_DECREF` as CPython's headers do them (the free-threaded build's owner-thread local count via the thread pointer, else the atomic shared count), checked against `Py_REFCNT` at start-up; and a liveness pass (with exception edges) that turns an object `Move` whose source is not read again into a `Take`. Small: most remaining reference counting is inside CPython (method call 2269 -> 2226).
+  2. **Specialized call sites**: a call of a positional Lizzard function builds the callee's frame straight from the caller's registers, and the checker records (`Direct`) which parameter checks the arguments' static types prove; the site skips them when the function called is the one it resolved (a rebound global or an override gets every check). Method call 2226 -> 2133, `fib(10)` 256k -> 246k.
+  3. **Compact bytecode** (`bytecode.rs`): fixed-size records with operands validated at load (unchecked indexing in the loop), variants decided once, and `BinOp+Check`, `LoadAttr+Check`, `CompareBool+JumpIfFalse` fused. Dispatch went from about 29 to about 16 machine instructions per instruction; loop iteration 1147 -> 1001, method call 2133 -> 1920, `fib(10)` 246k -> 226k.
+  4. **Calls without C recursion**: the interpreter runs calls between interpreted Lizzard functions in one loop. A callee's registers are a window on a stack of slots the loop owns (room for the next frame is reserved before the caller's registers are read, so binding never moves them); a return or an exception leaving the callee pops it and continues in the caller. Recursion is bounded by `sys.getrecursionlimit()` with CPython's `RecursionError: maximum recursion depth exceeded`, not by the C stack. Its cost per call matches the native recursion it replaces (Rust's calls were already cheap), so the gain is depth and CPython's limit, not speed.
+  What remains:
+  - **The JIT** uses none of steps 2-4 yet (it runs the IR, recurses through `call_at`), so on call-heavy code it is now slower than the interpreter; it should compile from the bytecode and push frames the same way.
   - **Constructing instances** (`V(x, y)`) goes through `type.__call__`, `__new__` and a lookup of `__init__`; CPython specializes the whole sequence.
   - **Result checks** after operations whose operands are not exact builtins (a `float` attribute read from an instance is checked when read).
 - Every test program runs compiled and interpreted, and both must match CPython.

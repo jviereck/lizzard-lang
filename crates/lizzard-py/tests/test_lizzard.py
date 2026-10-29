@@ -36,6 +36,7 @@ SLOTS = HERE / "programs" / "slots.py"
 REBINDING = HERE / "programs" / "rebinding.py"
 NUMBERS = HERE / "programs" / "arith_edges.py"
 INSTANCE_ATTRS = HERE / "programs" / "instance_attrs.py"
+FRAMES = HERE / "programs" / "frames.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -175,7 +176,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS, FRAMES):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])
@@ -241,6 +242,33 @@ class Programs(unittest.TestCase):
             for jit in ("1", "0"):
                 code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": jit})
                 self.assertEqual((code, out), (0, "RecursionError\n"), err)
+
+    def test_interpreted_calls_do_not_use_the_c_stack(self):
+        # The interpreter runs calls between Lizzard functions in one loop:
+        # recursion as deep as sys.getrecursionlimit() allows, then
+        # CPython's RecursionError.
+        with Scratch() as s:
+            p = s.write("m.py", """\
+                # lizzard: module
+                import sys
+
+                def depth(n: int) -> int:
+                    if n == 0:
+                        return 0
+                    return 1 + depth(n - 1)
+
+                if __name__ == "__main__":
+                    sys.setrecursionlimit(100000)
+                    print(depth(90000))
+                    sys.setrecursionlimit(50)
+                    try:
+                        depth(100)
+                    except RecursionError as e:
+                        print("RecursionError:", e)
+                """)
+            code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": "0"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.splitlines(), ["90000", "RecursionError: maximum recursion depth exceeded"])
 
     def test_methods_are_compiled(self):
         code, out, err = run("-c", textwrap.dedent("""\

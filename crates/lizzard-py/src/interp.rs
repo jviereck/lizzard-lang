@@ -182,6 +182,94 @@ impl LizzardFunction {
     /// function needs the general binding (other parameter kinds, another
     /// count, a generator).
     pub(crate) fn call_regs<'py>(&self, py: Python<'py>, site: &FuncRt, pc: usize, direct: Option<&Direct>, regs: &Regs, slf: Option<*mut ffi::PyObject>, args: &[u32]) -> Option<PyResult<Bound<'py, PyAny>>> {
+        let frame = self.frame_for(py, site, pc, direct, regs, slf, args)?;
+        Some(frame.and_then(|mut frame| run_frame(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame).map(|v| v.into_bound(py))))
+    }
+
+    /// The frame `call_regs` runs: its parameters bound to the arguments.
+    fn frame_for(&self, py: Python<'_>, site: &FuncRt, pc: usize, direct: Option<&Direct>, regs: &Regs, slf: Option<*mut ffi::PyObject>, args: &[u32]) -> Option<PyResult<Regs>> {
+        let a = self.args_for(py, site, pc, direct, regs, slf, args)?;
+        Some(a.map(|a| {
+            let mut frame = Regs::new(&self.rt.objs);
+            for (i, &o) in a.as_slice().iter().enumerate() {
+                // SAFETY: a new reference for the frame.
+                unsafe { crate::rc::incref(o) };
+                frame.init_obj(i as u32, o);
+            }
+            frame
+        }))
+    }
+
+    /// The checks a call site may skip for this function (see `Direct`).
+    fn proven(&self, site: &FuncRt, pc: usize, direct: Option<&Direct>) -> u64 {
+        let rt = &self.rt;
+        match direct {
+            Some(d) => match site.cics[pc].get() {
+                Some(known) if Arc::ptr_eq(known, rt) => d.skip,
+                Some(_) => 0,
+                None if rt.ir.key == d.key && Arc::ptr_eq(&rt.table, &site.table) => {
+                    let _ = site.cics[pc].set(rt.clone());
+                    d.skip
+                }
+                None => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// Bind a call with plain positional arguments in the caller's
+    /// registers (`slf` first) into the new frame's slots at `out` (all
+    /// `objs.len()` of them, unbound): Some(Ok) when done, None when this
+    /// function needs the general binding. On an error the slots written so
+    /// far hold references the caller releases.
+    ///
+    /// # Safety
+    /// `out` has room for this function's registers and does not overlap
+    /// the caller's.
+    pub(crate) unsafe fn bind_into(&self, py: Python<'_>, site: &FuncRt, pc: usize, direct: Option<&Direct>, regs: &Regs, slf: Option<*mut ffi::PyObject>, args: &[u32], out: *mut u64) -> Option<PyResult<()>> {
+        let rt = &self.rt;
+        let ir = &rt.ir;
+        let n = args.len() + slf.is_some() as usize;
+        if !rt.positional || ir.generator || ir.params.len() != n {
+            return None;
+        }
+        let skip = self.proven(site, pc, direct);
+        let first = slf.is_some() as usize;
+        for (i, p) in ir.params.iter().enumerate() {
+            let o = match slf {
+                Some(s) if i == 0 => s,
+                _ => match regs.obj(py, args[i - first]) {
+                    Ok(o) => o.as_ptr(),
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            // SAFETY: a valid object.
+            if skip & (1 << i) == 0 && !unsafe { rt::quick(o, rt.ck(py, p.check)) } {
+                // SAFETY: borrowed from the caller's frame.
+                match rt.check(py, p.check, unsafe { &Bound::from_borrowed_ptr(py, o) }) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(got)) => {
+                        let c = &ir.checks[p.check as usize];
+                        return Some(Err(PyTypeError::new_err(format!("{}() argument '{}': expected {}, got {got}", ir.name, p.name, c.expected))));
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            // SAFETY: a new reference for the frame, in its slot.
+            unsafe {
+                crate::rc::incref(o);
+                *out.add(i) = o as u64;
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// The arguments of a call with plain positional arguments in the
+    /// caller's registers (`slf` first), checked (but for those the call
+    /// site proved): borrowed from the caller. None when this function
+    /// needs the general binding (other parameter kinds, another count, a
+    /// generator).
+    pub(crate) fn args_for(&self, py: Python<'_>, site: &FuncRt, pc: usize, direct: Option<&Direct>, regs: &Regs, slf: Option<*mut ffi::PyObject>, args: &[u32]) -> Option<PyResult<ArgList>> {
         let rt = &self.rt;
         let ir = &rt.ir;
         let n = args.len() + slf.is_some() as usize;
@@ -202,7 +290,7 @@ impl LizzardFunction {
             None => 0,
         };
         Some((|| {
-            let mut frame = Regs::new(&rt.objs);
+            let mut out = ArgList::new(n);
             let first = slf.is_some() as usize;
             for (i, p) in ir.params.iter().enumerate() {
                 let o = match slf {
@@ -217,11 +305,9 @@ impl LizzardFunction {
                         return Err(PyTypeError::new_err(format!("{}() argument '{}': expected {}, got {got}", ir.name, p.name, c.expected)));
                     }
                 }
-                // SAFETY: a new reference for the frame.
-                unsafe { crate::rc::incref(o) };
-                frame.init_obj(i as u32, o);
+                out.set(i, o);
             }
-            run_frame(py, rt, self.globals.bind(py), &self.closure, &mut frame).map(|v| v.into_bound(py))
+            Ok(out)
         })())
     }
 
@@ -544,195 +630,310 @@ pub(crate) fn exec<'py>(
 /// with the same helpers compiled code calls (`ops`); the rest go to `step`.
 /// The loop keeps its state in locals and handles exceptions only when one
 /// is raised, so an instruction costs a dispatch and its own work.
+///
+/// Calls of interpreted Lizzard functions do not recurse: the callee's
+/// frame goes on `frames` and the loop continues in it; its return (or an
+/// exception leaving it) pops it and continues in the caller. Only the base
+/// frame (the one `exec` was given) can be a generator's, so only it yields.
 fn run_interp<'py>(
     py: Python<'py>,
-    f: &FuncRt,
-    globals: &Bound<'py, PyDict>,
-    closure: &[Py<PyAny>],
-    regs: &mut Regs,
+    f0: &FuncRt,
+    globals0: &Bound<'py, PyDict>,
+    closure0: &[Py<PyAny>],
+    regs0: &mut Regs,
     pc: &mut usize,
     pending: Option<PyErr>,
 ) -> PyResult<Exit<'py>> {
     use lizzard_jit::{NEXT, TAKEN};
-    let ir = &f.ir;
-    let ops = &f.ops[..];
-    let slots = regs.as_mut_ptr();
-    // SAFETY (for the unchecked accesses below): `bytecode::lower` checked
-    // every register, constant, name and check index and every jump target
-    // of the records that use them; `step` never reallocates the slots.
-    let get = |r: u32| unsafe { *slots.add(r as usize) };
-    let set = |r: u32, v: u64| unsafe { *slots.add(r as usize) = v };
-    let consts = f.consts.as_ptr() as *const *mut ffi::PyObject;
-    let names = f.names.as_ptr() as *const *mut ffi::PyObject;
-    let konst = |i: u32| unsafe { *consts.add(i as usize) };
-    let name = |i: u32| unsafe { *names.add(i as usize) };
+    let mut frames: Vec<Callee<'py>> = Vec::new();
+    // The callee frames' registers, one window each.
+    let mut stack: Vec<u64> = Vec::new();
     let mut p = *pc;
     let mut err = pending;
-    loop {
-        if let Some(e) = err.take() {
-            // The innermost handler covering the instruction: regions nest,
-            // and an inner handler is created after its outer one.
-            let at = p as u32;
-            match ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
-                Some(h) => {
-                    regs.set_obj(h.exc, e.into_value(py).into_bound(py).into_any());
-                    p = h.target as usize;
-                }
-                None => {
-                    *pc = p;
-                    let line = ir.lines.get(p).copied().unwrap_or(ir.line);
-                    let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
-                    return Err(e);
+    // A value returned by a callee frame, for the caller's register.
+    let mut ret: Option<(u32, Bound<'py, PyAny>)> = None;
+    'frame: loop {
+        // The current frame. Raw pointers: a call grows the stack (which may
+        // move it), and the loop below re-derives all of this before using
+        // the frame again (`continue 'frame`).
+        let mut window;
+        let (fp, gp, cp, rp): (*const FuncRt, *const Bound<'py, PyDict>, *const [Py<PyAny>], *mut Regs) = match frames.last() {
+            None => (f0, globals0, closure0, &mut *regs0),
+            Some(t) => {
+                let lf = t.func.get();
+                // SAFETY: the frame's slots are on the stack from `base`.
+                window = unsafe { Regs::window(stack.as_mut_ptr().add(t.base), &lf.rt.objs) };
+                (&*lf.rt as *const FuncRt, lf.globals.bind(py) as *const Bound<'py, PyDict>, &lf.closure[..] as *const [Py<PyAny>], &mut window)
+            }
+        };
+        // SAFETY: the function object of a callee frame (or the caller, for
+        // the base frame) keeps these alive while the frame runs.
+        let (f, globals, closure, regs) = unsafe { (&*fp, &*gp, &*cp, &mut *rp) };
+        if let Some((dst, v)) = ret.take() {
+            regs.set_obj(dst, v);
+        }
+        let ir = &f.ir;
+        let ops = &f.ops[..];
+        let slots = regs.as_mut_ptr();
+        // SAFETY (for the unchecked accesses below): `bytecode::lower` checked
+        // every register, constant, name and check index and every jump
+        // target of the records that use them; `step` never reallocates the
+        // slots.
+        let get = |r: u32| unsafe { *slots.add(r as usize) };
+        let set = |r: u32, v: u64| unsafe { *slots.add(r as usize) = v };
+        let consts = f.consts.as_ptr() as *const *mut ffi::PyObject;
+        let names = f.names.as_ptr() as *const *mut ffi::PyObject;
+        let konst = |i: u32| unsafe { *consts.add(i as usize) };
+        let name = |i: u32| unsafe { *names.add(i as usize) };
+        loop {
+            if let Some(e) = err.take() {
+                // The innermost handler covering the instruction: regions
+                // nest, and an inner handler is created after its outer one.
+                let at = p as u32;
+                match ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
+                    Some(h) => {
+                        regs.set_obj(h.exc, e.into_value(py).into_bound(py).into_any());
+                        p = h.target as usize;
+                    }
+                    None => {
+                        let line = ir.lines.get(p).copied().unwrap_or(ir.line);
+                        let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
+                        match frames.pop() {
+                            // It leaves a callee: raise it at the caller's call.
+                            Some(t) => {
+                                pop_frame(&mut stack, &t);
+                                p = t.ret_pc;
+                                err = Some(e);
+                                continue 'frame;
+                            }
+                            None => {
+                                *pc = p;
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
             }
-        }
-        loop {
-            // SAFETY: `p` is a valid pc: 0, a checked jump target, a handler
-            // target, or the one after an instruction that falls through.
-            let o = unsafe { *ops.get_unchecked(p) };
-            let status = match o.op {
-                Opc::Jump => {
-                    p = o.x as usize;
-                    continue;
-                }
-                Opc::JumpIfFalse => {
-                    p = if get(o.x) == 0 { o.y as usize } else { p + 1 };
-                    continue;
-                }
-                Opc::JumpIfTrue => {
-                    p = if get(o.x) != 0 { o.y as usize } else { p + 1 };
-                    continue;
-                }
-                Opc::I64Const => {
-                    set(o.x, o.y as u64 | (o.z as u64) << 32);
-                    NEXT
-                }
-                Opc::I64Lt => {
-                    set(o.x, ((get(o.y) as i64) < (get(o.z) as i64)) as u64);
-                    NEXT
-                }
-                Opc::I64Add => {
-                    set(o.x, (get(o.y) as i64).wrapping_add(get(o.z) as i64) as u64);
-                    NEXT
-                }
-                Opc::Not => {
-                    set(o.x, get(o.y) ^ 1);
-                    NEXT
-                }
-                Opc::Nop => NEXT,
-                Opc::Const => {
-                    ops::lz_const(slots, o.x, konst(o.y));
-                    NEXT
-                }
-                Opc::MoveObj => ops::lz_move(slots, o.x, o.y),
-                Opc::MoveScalar => {
-                    set(o.x, get(o.y));
-                    NEXT
-                }
-                Opc::TakeObj => ops::lz_take(slots, o.x, o.y),
-                Opc::UnbindObj => {
-                    let old = get(o.x) as *mut ffi::PyObject;
-                    set(o.x, 0);
-                    if !old.is_null() {
-                        // SAFETY: the frame owned it.
-                        unsafe { crate::rc::decref(old) };
-                    }
-                    NEXT
-                }
-                Opc::LoadAttr => ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
-                Opc::LoadAttrCheck => {
-                    let st = ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]);
-                    if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
-                        p += 2;
+            loop {
+                // SAFETY: `p` is a valid pc: 0, a checked jump target, a
+                // handler target, or the one after an instruction that falls
+                // through.
+                let o = unsafe { *ops.get_unchecked(p) };
+                let status = match o.op {
+                    Opc::Jump => {
+                        p = o.x as usize;
                         continue;
                     }
-                    st
-                }
-                Opc::StoreAttr => ops::lz_store_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
-                Opc::LoadGlobal => match builtins_dict(py).and_then(|b| globals::load(py, &f.gics[p], globals, b, f.names[o.y as usize].bind(py))) {
-                    Ok(v) => {
-                        regs.set_obj(o.x, v);
+                    Opc::JumpIfFalse => {
+                        p = if get(o.x) == 0 { o.y as usize } else { p + 1 };
+                        continue;
+                    }
+                    Opc::JumpIfTrue => {
+                        p = if get(o.x) != 0 { o.y as usize } else { p + 1 };
+                        continue;
+                    }
+                    Opc::I64Const => {
+                        set(o.x, o.y as u64 | (o.z as u64) << 32);
                         NEXT
                     }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
-                    }
-                },
-                Opc::BinOp => ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32),
-                Opc::BinOpCheck => {
-                    let st = ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32);
-                    if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
-                        p += 2;
-                        continue;
-                    }
-                    st
-                }
-                Opc::Compare => ops::lz_compare(slots, o.x, o.y, o.z, o.sub as u32),
-                Opc::CompareBool => ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32),
-                Opc::CompareBoolJump => {
-                    let st = ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32);
-                    if st == NEXT {
-                        p = if get(o.x) == 0 { o.w as usize } else { p + 2 };
-                        continue;
-                    }
-                    st
-                }
-                Opc::Truthy => ops::lz_truthy(slots, o.x, o.y),
-                Opc::BoxI64 => ops::lz_box_i64(slots, o.x, o.y),
-                Opc::Check if quick_ok(f, py, get(o.x), o.y) => NEXT,
-                // The frame ends: its reference is the return value.
-                Opc::Return if get(o.x) != 0 => {
-                    *pc = p;
-                    let v = regs.take_obj(o.x);
-                    // SAFETY: an owned reference out of the frame.
-                    return Ok(Exit::Return(unsafe { Bound::from_owned_ptr(py, v) }));
-                }
-                Opc::Call => match call_at(py, f, p, regs) {
-                    Ok(v) => {
-                        regs.set_obj(o.x, v);
+                    Opc::I64Lt => {
+                        set(o.x, ((get(o.y) as i64) < (get(o.z) as i64)) as u64);
                         NEXT
                     }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
+                    Opc::I64Add => {
+                        set(o.x, (get(o.y) as i64).wrapping_add(get(o.z) as i64) as u64);
+                        NEXT
                     }
-                },
-                Opc::ForIter if get(o.y) != 0 && unsafe { ffi::Py_TYPE(get(o.y) as *mut ffi::PyObject) } != generator::type_ptr() => {
-                    match ops::lz_for_iter_py(slots, o.x, get(o.y) as *mut ffi::PyObject) {
-                        TAKEN => {
-                            p = o.z as usize;
+                    Opc::Not => {
+                        set(o.x, get(o.y) ^ 1);
+                        NEXT
+                    }
+                    Opc::Nop => NEXT,
+                    Opc::Const => {
+                        ops::lz_const(slots, o.x, konst(o.y));
+                        NEXT
+                    }
+                    Opc::MoveObj => ops::lz_move(slots, o.x, o.y),
+                    Opc::MoveScalar => {
+                        set(o.x, get(o.y));
+                        NEXT
+                    }
+                    Opc::TakeObj => ops::lz_take(slots, o.x, o.y),
+                    Opc::UnbindObj => {
+                        let old = get(o.x) as *mut ffi::PyObject;
+                        set(o.x, 0);
+                        if !old.is_null() {
+                            // SAFETY: the frame owned it.
+                            unsafe { crate::rc::decref(old) };
+                        }
+                        NEXT
+                    }
+                    Opc::LoadAttr => ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
+                    Opc::LoadAttrCheck => {
+                        let st = ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]);
+                        if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
+                            p += 2;
                             continue;
                         }
-                        st => st,
+                        st
                     }
-                }
-                _ => {
-                    let mut q = p;
-                    match step(py, f, globals, closure, regs, &mut q) {
-                        Ok(None) => {
-                            p = q;
-                            continue;
-                        }
-                        Ok(Some(exit)) => {
-                            *pc = q;
-                            return Ok(exit);
+                    Opc::StoreAttr => ops::lz_store_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
+                    Opc::LoadGlobal => match builtins_dict(py).and_then(|b| globals::load(py, &f.gics[p], globals, b, f.names[o.y as usize].bind(py))) {
+                        Ok(v) => {
+                            regs.set_obj(o.x, v);
+                            NEXT
                         }
                         Err(e) => {
                             err = Some(e);
                             break;
                         }
+                    },
+                    Opc::BinOp => ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32),
+                    Opc::BinOpCheck => {
+                        let st = ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32);
+                        if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
+                            p += 2;
+                            continue;
+                        }
+                        st
                     }
+                    Opc::Compare => ops::lz_compare(slots, o.x, o.y, o.z, o.sub as u32),
+                    Opc::CompareBool => ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32),
+                    Opc::CompareBoolJump => {
+                        let st = ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32);
+                        if st == NEXT {
+                            p = if get(o.x) == 0 { o.w as usize } else { p + 2 };
+                            continue;
+                        }
+                        st
+                    }
+                    Opc::Truthy => ops::lz_truthy(slots, o.x, o.y),
+                    Opc::BoxI64 => ops::lz_box_i64(slots, o.x, o.y),
+                    Opc::Check if quick_ok(f, py, get(o.x), o.y) => NEXT,
+                    // The frame ends: its reference is the return value.
+                    Opc::Return if get(o.x) != 0 => {
+                        let v = regs.take_obj(o.x);
+                        // SAFETY: an owned reference out of the frame.
+                        let v = unsafe { Bound::from_owned_ptr(py, v) };
+                        match frames.pop() {
+                            Some(t) => {
+                                pop_frame(&mut stack, &t);
+                                p = t.ret_pc + 1;
+                                ret = Some((t.ret_dst, v));
+                                continue 'frame;
+                            }
+                            None => {
+                                *pc = p;
+                                return Ok(Exit::Return(v));
+                            }
+                        }
+                    }
+                    // Room for a callee frame first, so that binding it
+                    // cannot move the stack under the caller's registers
+                    // (growing it moves them: start this frame over).
+                    Opc::Call if stack.capacity() - stack.len() < FRAME_ROOM => {
+                        stack.reserve(FRAME_ROOM);
+                        continue 'frame;
+                    }
+                    Opc::Call => match call_or_frame(py, f, p, regs, &mut stack) {
+                        Ok(Called::Value(v)) => {
+                            regs.set_obj(o.x, v);
+                            NEXT
+                        }
+                        // An interpreted Lizzard function: run it here.
+                        Ok(Called::Frame(func, base)) => {
+                            let t = Callee { func, base, ret_pc: p, ret_dst: o.x };
+                            if frames.len() >= recursion_limit() {
+                                pop_frame(&mut stack, &t);
+                                err = Some(pyo3::exceptions::PyRecursionError::new_err("maximum recursion depth exceeded"));
+                                continue 'frame;
+                            }
+                            frames.push(t);
+                            p = 0;
+                            continue 'frame;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    },
+                    Opc::ForIter if get(o.y) != 0 && unsafe { ffi::Py_TYPE(get(o.y) as *mut ffi::PyObject) } != generator::type_ptr() => {
+                        match ops::lz_for_iter_py(slots, o.x, get(o.y) as *mut ffi::PyObject) {
+                            TAKEN => {
+                                p = o.z as usize;
+                                continue;
+                            }
+                            st => st,
+                        }
+                    }
+                    _ => {
+                        let mut q = p;
+                        match step(py, f, globals, closure, regs, &mut q) {
+                            Ok(None) => {
+                                p = q;
+                                continue;
+                            }
+                            Ok(Some(Exit::Return(v))) => match frames.pop() {
+                                Some(t) => {
+                                    pop_frame(&mut stack, &t);
+                                    p = t.ret_pc + 1;
+                                    ret = Some((t.ret_dst, v));
+                                    continue 'frame;
+                                }
+                                None => {
+                                    *pc = q;
+                                    return Ok(Exit::Return(v));
+                                }
+                            },
+                            Ok(Some(exit)) => {
+                                // Only the base frame can be a generator's.
+                                debug_assert!(frames.is_empty());
+                                *pc = q;
+                                return Ok(exit);
+                            }
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                };
+                if status == NEXT {
+                    p += 1;
+                } else {
+                    err = Some(PyErr::fetch(py));
+                    break;
                 }
-            };
-            if status == NEXT {
-                p += 1;
-            } else {
-                err = Some(PyErr::fetch(py));
-                break;
             }
         }
     }
+}
+
+/// A Lizzard function's frame running in the caller's interpreter loop.
+struct Callee<'py> {
+    /// Keeps the function (its code, globals and closure) alive.
+    func: Bound<'py, LizzardFunction>,
+    /// Where its registers start on the interpreter's stack.
+    base: usize,
+    /// The caller's call instruction, and the register for the result.
+    ret_pc: usize,
+    ret_dst: u32,
+}
+
+/// Slots kept free on the interpreter's stack for the next callee frame.
+const FRAME_ROOM: usize = 256;
+
+/// End a callee frame: release its registers and give back its stack.
+fn pop_frame(stack: &mut Vec<u64>, t: &Callee<'_>) {
+    let objs = &t.func.get().rt.objs;
+    crate::frame::release_slots(&mut stack[t.base..t.base + objs.len()], objs);
+    stack.truncate(t.base);
+}
+
+/// `sys.getrecursionlimit()`: how deep interpreted calls nest in one loop.
+fn recursion_limit() -> usize {
+    // SAFETY: attached.
+    unsafe { ffi::Py_GetRecursionLimit() }.max(1) as usize
 }
 
 /// Whether the object in a slot passes check `idx` by type pointers alone.
@@ -828,6 +1029,110 @@ pub(crate) fn vector_call<'py>(
     // NULL comes back.
     let r = unsafe { ffi::PyObject_VectorcallMethod(callee, argv.as_ptr(), nargs, kw) };
     unsafe { Bound::from_owned_ptr_or_err(py, r) }
+}
+
+/// Borrowed argument objects, checked, for a new frame.
+pub(crate) struct ArgList {
+    small: [*mut ffi::PyObject; 8],
+    big: Vec<*mut ffi::PyObject>,
+    n: usize,
+}
+
+impl ArgList {
+    fn new(n: usize) -> ArgList {
+        ArgList { small: [std::ptr::null_mut(); 8], big: if n > 8 { vec![std::ptr::null_mut(); n] } else { Vec::new() }, n }
+    }
+
+    fn set(&mut self, i: usize, o: *mut ffi::PyObject) {
+        if self.n > 8 { self.big[i] = o } else { self.small[i] = o }
+    }
+
+    fn as_slice(&self) -> &[*mut ffi::PyObject] {
+        if self.n > 8 { &self.big } else { &self.small[..self.n] }
+    }
+}
+
+/// What the interpreter does for a call: its result, or (calling an
+/// interpreted Lizzard function) the callee's frame, set up at `base` on the
+/// interpreter's stack, to run in the same loop.
+pub(crate) enum Called<'py> {
+    Value(Bound<'py, PyAny>),
+    Frame(Bound<'py, LizzardFunction>, usize),
+}
+
+/// `Call` or `CallMethod` at `pc`, for the interpreter: an interpreted
+/// Lizzard function with plain positional parameters comes back as a frame.
+pub(crate) fn call_or_frame<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs, stack: &mut Vec<u64>) -> PyResult<Called<'py>> {
+    let (callee, slf, args, nkw, direct) = match &f.ir.code[pc] {
+        Instr::Call { func, args, kwnames, direct, .. } => (regs.obj(py, *func)?.clone(), None, args, kwnames.len(), direct),
+        Instr::CallMethod { obj, name, args, kwnames, direct, .. } => {
+            let o = regs.obj(py, *obj)?.as_ptr();
+            let name = f.names[*name as usize].as_ptr();
+            // SAFETY: valid objects; a new reference to the method comes back.
+            match unsafe { ops::method(&f.mics[pc], o, name) } {
+                Some(m) => (unsafe { Bound::from_owned_ptr(py, m) }, Some(o), args, kwnames.len(), direct),
+                None => return vector_call(py, regs, Some(o), name, args, f.kwnames(pc)).map(Called::Value),
+            }
+        }
+        _ => unreachable!("call_or_frame on another instruction"),
+    };
+    let c = callee.as_ptr();
+    // SAFETY: a type pointer comparison on a valid object.
+    if nkw == 0 && unsafe { ffi::Py_TYPE(c) } == lizzard_function_type() {
+        // SAFETY: the type says what it is.
+        let lf = unsafe { callee.clone().cast_into_unchecked::<LizzardFunction>() };
+        let interpreted = !jit::enabled() || jit::code(&lf.get().rt).is_none();
+        let n = lf.get().rt.objs.len();
+        // The stack keeps room for a frame this size (`FRAME_ROOM`), so it
+        // does not move while the caller's registers are read: bind
+        // straight into the new frame.
+        if interpreted && stack.capacity() - stack.len() >= n {
+            let base = stack.len();
+            // SAFETY: room reserved; zeroed slots are unbound.
+            let out = unsafe { stack.as_mut_ptr().add(base) };
+            unsafe { std::ptr::write_bytes(out, 0, n) };
+            // SAFETY: room for the frame, after the caller's registers.
+            if let Some(r) = unsafe { lf.get().bind_into(py, f, pc, direct.as_ref(), regs, slf, args, out) } {
+                // SAFETY: initialized above.
+                unsafe { stack.set_len(base + n) };
+                return match r {
+                    Ok(()) => Ok(Called::Frame(lf, base)),
+                    Err(e) => {
+                        let objs = &lf.get().rt.objs;
+                        crate::frame::release_slots(&mut stack[base..], objs);
+                        stack.truncate(base);
+                        Err(e)
+                    }
+                };
+            }
+        }
+        if interpreted {
+            if let Some(a) = lf.get().args_for(py, f, pc, direct.as_ref(), regs, slf, args) {
+                let a = a?;
+                // Growing the stack may move it, and with it the caller's
+                // registers (`regs`): the arguments were read before.
+                let base = stack.len();
+                let n = lf.get().rt.objs.len();
+                stack.reserve(n);
+                // SAFETY: reserved; the parameters come first, the other
+                // registers start unbound.
+                unsafe {
+                    let s = stack.as_mut_ptr().add(base);
+                    let a = a.as_slice();
+                    for (i, &o) in a.iter().enumerate() {
+                        crate::rc::incref(o);
+                        *s.add(i) = o as u64;
+                    }
+                    std::ptr::write_bytes(s.add(a.len()), 0, n - a.len());
+                    stack.set_len(base + n);
+                }
+                return Ok(Called::Frame(lf, base));
+            }
+        } else if let Some(r) = lf.get().call_regs(py, f, pc, direct.as_ref(), regs, slf, args) {
+            return r.map(Called::Value);
+        }
+    }
+    vector_call(py, regs, slf, c, args, f.kwnames(pc)).map(Called::Value)
 }
 
 /// `Call` or `CallMethod` at `pc`: its result.
