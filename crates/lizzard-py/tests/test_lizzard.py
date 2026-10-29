@@ -29,6 +29,7 @@ DATACLASSES = HERE / "programs" / "dataclasses_demo.py"
 GENERATORS = HERE / "programs" / "generators.py"
 OPERATORS = HERE / "programs" / "operators.py"
 PROPERTIES = HERE / "programs" / "properties.py"
+THREADS = HERE / "programs" / "threads.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -168,7 +169,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
@@ -456,6 +457,41 @@ class Checker(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("cannot find module `no_such_module`", err)
         self.assertIn("module `numpy` has no attribute `no_such_function`", err)
+
+    def test_strict_attributes(self):
+        # Every attribute must be declared: in the class, a base class, or
+        # the definitions of a standard-library base such as threading.Thread.
+        code, _, err = self.check("""\
+            import queue
+            import threading
+
+            class Worker(threading.Thread):
+                def __init__(self, n: int) -> None:
+                    super().__init__(name=f"w{n}", daemon=True)
+                    self.total: int = 0
+
+                def run(self) -> None:
+                    self.total = 1
+
+                def typo(self) -> None:
+                    self.totl = 1
+
+            class Jobs(queue.Queue):
+                def size(self) -> int:
+                    return self.maxsize
+
+            def f() -> None:
+                Worker(1).strat()
+                Jobs()
+            """)
+        self.assertEqual(code, 1)
+        lines = [l.split(": error: ", 1)[1] for l in err.splitlines()]
+        self.assertEqual(lines, [
+            "Worker has no attribute `totl`; declare it in the class body (`totl: T`) or in `__init__` (`self.totl: T = ...`)",
+            "Jobs has no attribute `maxsize` (its base class `queue.Queue` has no type definitions)",
+            "Worker has no attribute `strat`",
+            "cannot check the arguments of Jobs() (its base class `queue.Queue` has no type definitions)",
+        ])
 
     def test_wrong_declaration_raises_at_runtime(self):
         with Scratch() as s:

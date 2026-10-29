@@ -212,8 +212,9 @@ pub struct ClassInfo {
     /// `Self` in this class's methods: a variable bounded by the class.
     self_tv: Option<TvId>,
     mro: Option<Vec<ClassId>>,
-    /// A base class is untyped (`Any`): unknown members are `Any`.
-    any_base: bool,
+    /// Its base classes that are untyped (`Any`), as written: nothing is
+    /// known about what they define.
+    untyped_bases: Vec<String>,
     /// Declared with `Protocol` among its bases: other classes match it
     /// structurally.
     protocol: bool,
@@ -267,6 +268,9 @@ pub struct Module {
     kind: ModKind,
     /// A Lizzard module: its declarations are checked strictly.
     pub user: bool,
+    /// Defined only by Lizzard's own definition files (a standard-library
+    /// module): written for Lizzard, so its unions are types.
+    lizzard_defs: bool,
     decls: HashMap<String, Decl>,
     syms: HashMap<String, Sym>,
 }
@@ -321,6 +325,25 @@ fn is_name(e: &Expr, s: &str) -> bool {
         _ => false,
     }
 }
+
+/// `a.b.c` as written (a base class, for messages).
+fn dotted(e: &Expr) -> String {
+    match e {
+        Expr::Name(n) => n.id.to_string(),
+        Expr::Attribute(a) => format!("{}.{}", dotted(&a.value), a.attr.as_str()),
+        Expr::Subscript(s) => dotted(&s.value),
+        _ => "?".to_string(),
+    }
+}
+
+/// The attributes every object has (from `object`), and every class (from
+/// `type`).
+pub const OBJECT_ATTRS: &[&str] = &[
+    "__class__", "__dict__", "__doc__", "__module__", "__hash__", "__repr__", "__str__", "__eq__", "__ne__", "__init__", "__new__",
+    "__getattribute__", "__setattr__", "__delattr__", "__dir__", "__sizeof__", "__format__", "__reduce__", "__reduce_ex__",
+    "__init_subclass__", "__subclasshook__", "__getstate__", "__annotations__",
+];
+pub const TYPE_ATTRS: &[&str] = &["__name__", "__qualname__", "__mro__", "__bases__", "__base__", "mro", "__subclasses__", "__type_params__"];
 
 /// A property's accessor decorators (`@x.getter`, ...).
 pub const ACCESSORS: [&str; 3] = ["getter", "setter", "deleter"];
@@ -457,6 +480,7 @@ impl Db {
             is_package: false,
             kind: ModKind::Files,
             user: true,
+            lizzard_defs: false,
             decls: HashMap::new(),
             syms: HashMap::new(),
         });
@@ -485,9 +509,6 @@ impl Db {
             self.modules[m].decls = decls;
             return Some(m);
         }
-        if let Some(kind) = kind {
-            return Some(self.push_module(name, None, false, kind));
-        }
         let rel: PathBuf = name.split('.').collect();
         let find = |roots: &[PathBuf], exts: &[&str]| -> Option<(PathBuf, bool)> {
             for root in roots {
@@ -504,7 +525,14 @@ impl Db {
             }
             None
         };
-        let base = find(&self.env.search_roots, &["pyi", "py"]);
+        // A standard-library module is opaque unless Lizzard has a definition
+        // file for it, which then defines it alone (CPython's own sources
+        // have no annotations).
+        let stdlib_defs = kind == Some(ModKind::Opaque) && find(&self.env.overlay_roots, &["pyi"]).is_some();
+        if let Some(kind) = kind.filter(|_| !stdlib_defs) {
+            return Some(self.push_module(name, None, false, kind));
+        }
+        let base = if stdlib_defs { None } else { find(&self.env.search_roots, &["pyi", "py"]) };
         let mut overlay = find(&self.env.overlay_roots, &["pyi"]);
         if let Some((path, _)) = &overlay {
             if let Some(spec) = std::fs::read_to_string(path).ok().and_then(|t| {
@@ -533,6 +561,7 @@ impl Db {
         let base = base.and_then(|(p, _)| self.parse_file(&p));
         let overlay = overlay.and_then(|(p, _)| self.parse_file(&p));
         let m = self.push_module(name, base.as_ref().or(overlay.as_ref()).map(|(f, _)| *f), is_package, ModKind::Files);
+        self.modules[m].lizzard_defs = base.is_none() && overlay.is_some();
         let mut decls = match &base {
             Some((f, body)) => self.collect(m, *f, body, false),
             None => HashMap::new(),
@@ -560,6 +589,7 @@ impl Db {
             is_package,
             kind,
             user: false,
+            lizzard_defs: false,
             decls: HashMap::new(),
             syms: HashMap::new(),
         });
@@ -985,7 +1015,7 @@ impl Db {
             members: HashMap::new(),
             self_tv: None,
             mro: None,
-            any_base: false,
+            untyped_bases: Vec::new(),
             protocol: false,
         });
         let c = self.classes.len() - 1;
@@ -1062,7 +1092,7 @@ impl Db {
                 let tps = self.class_tparams(c);
                 let ty = self.eval_type(base, &Scope { m, tparams: &tps, self_ty: None });
                 if matches!(ty, Ty::Any) {
-                    self.classes[c].any_base = true;
+                    self.classes[c].untyped_bases.push(dotted(base));
                 } else {
                     bases.push(ty);
                 }
@@ -1081,9 +1111,9 @@ impl Db {
         self.class_params(c).into_iter().map(|tv| (self.tvs[tv].name.clone(), tv)).collect()
     }
 
-    /// Whether `c` or a class in its MRO has an untyped base.
-    pub fn has_any_base(&mut self, c: ClassId) -> bool {
-        self.mro(c).iter().any(|k| self.classes[*k].any_base)
+    /// The untyped base classes of `c` and of the classes in its MRO.
+    pub fn untyped_bases(&mut self, c: ClassId) -> Vec<String> {
+        self.mro(c).iter().flat_map(|k| self.classes[*k].untyped_bases.clone()).collect()
     }
 
     pub fn is_builtin_class(&self, c: ClassId) -> bool {
@@ -1682,7 +1712,7 @@ impl Db {
     /// Whether unions in module `m` are types (Lizzard modules and the bundled
     /// builtins) or `Any` (other definition files).
     fn unions_ok(&self, m: ModId) -> bool {
-        self.modules[m].user || self.modules[m].kind == ModKind::Builtins
+        self.modules[m].user || self.modules[m].lizzard_defs || self.modules[m].kind == ModKind::Builtins
     }
 
     fn sym_type(&mut self, s: Sym, sc: &Scope, off: u32, what: &str) -> Ty {
@@ -2282,7 +2312,7 @@ pub fn is_exception_name(n: &str) -> bool {
     EXCEPTION_TREE.iter().any(|(e, _)| *e == n)
 }
 
-fn exc_sub(a: &str, b: &str) -> bool {
+pub fn exc_sub(a: &str, b: &str) -> bool {
     let mut cur = a;
     loop {
         if cur == b {

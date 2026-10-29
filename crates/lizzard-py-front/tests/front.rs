@@ -10,7 +10,7 @@ fn check_with(source: &str, version: Option<&'static str>) -> Vec<String> {
         search_roots: vec![fixtures.join("site")],
         version: (3, 14),
         platform: "darwin".into(),
-        stdlib: ["sys", "dataclasses"].iter().map(|s| s.to_string()).collect(),
+        stdlib: ["sys", "dataclasses", "sched", "minithread"].iter().map(|s| s.to_string()).collect(),
         pkg_version: Box::new(move |_| version.map(String::from)),
     };
     let src = format!("# lizzard: module\nimport mini\nfrom dataclasses import dataclass, field\n\n{source}");
@@ -431,4 +431,29 @@ fn property_getters_and_deleters() {
             "P has no attribute `nope`",
         ]
     );
+}
+
+#[test]
+fn undeclared_attributes_are_errors() {
+    let d = check(
+        "import sched\nimport minithread\n\nclass W(minithread.Worker):\n    def __init__(self) -> None:\n        super().__init__(name=\"w\")\n        self.total: int = 0\n\n    def typo(self) -> None:\n        self.totl = 1\n        print(self.__class__.__name__, self.__dict__)\n\nclass S(sched.scheduler):\n    def f(self) -> None:\n        self.run()\n\ndef g() -> None:\n    W().start()\n    W().strat()\n    W(1)\n    S()\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "W has no attribute `totl`; declare it in the class body (`totl: T`) or in `__init__` (`self.totl: T = ...`)",
+            "S has no attribute `run` (its base class `sched.scheduler` has no type definitions)",
+            "W has no attribute `strat`",
+            "W(): takes 0 positional arguments but 1 were given",
+            "cannot check the arguments of S() (its base class `sched.scheduler` has no type definitions)",
+        ]
+    );
+}
+
+#[test]
+fn exception_subclasses_have_the_builtin_attributes() {
+    let d = check(
+        "class E(ValueError):\n    pass\n\ndef f(e: E) -> None:\n    print(e.args, e.__cause__, e.__suppress_context__)\n    print(e.code)\n",
+    );
+    assert_eq!(d, ["E has no attribute `code`"]);
 }

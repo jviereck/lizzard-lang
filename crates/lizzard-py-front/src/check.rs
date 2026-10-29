@@ -188,10 +188,6 @@ pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
     funcs
 }
 
-fn is_dunder(name: &str) -> bool {
-    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
-}
-
 impl<'a> Lower<'a> {
     fn new(db: &'a mut Db, m: ModId, file: FileId, toplevel: bool, fname: String, ret: Ty) -> Lower<'a> {
         Lower {
@@ -2643,9 +2639,10 @@ impl<'a> Lower<'a> {
         let mut origin = None;
         let ty = match self.db.find_member_after(class, Some(class), name) {
             Some((owner, m)) => self.member_value_ty(&inst_ty, owner, m, on_class, &mut origin),
-            None if is_dunder(name) || self.db.has_any_base(class) => Ty::Any,
+            None if OBJECT_ATTRS.contains(&name) => Ty::Any,
             None => {
-                self.err(a.attr.range().start().into(), format!("no base class of `{cname}` has an attribute `{name}`"));
+                let hint = self.untyped_hint(class);
+                self.err(a.attr.range().start().into(), format!("no base class of `{cname}` has an attribute `{name}`{hint}"));
                 Ty::Any
             }
         };
@@ -2683,8 +2680,12 @@ impl<'a> Lower<'a> {
             (_, Ty::Inst(c, _)) => match self.db.find_member(*c, name) {
                 Some((owner, m)) => Ok(self.member_value_ty(&obj_ty.clone(), owner, m, false, origin)),
                 // `object`'s own attributes (`__class__`, `__dict__`, ...).
-                None if self.db.has_any_base(*c) || is_dunder(name) => Ok(Ty::Any),
-                None => Err(format!("{} has no attribute `{name}`", self.show(&lt))),
+                None if OBJECT_ATTRS.contains(&name) => Ok(Ty::Any),
+                // A builtin exception base's attributes (`args`, `__cause__`, ...).
+                None => match self.db.exc_base(*c).and_then(|e| exc_attr(&e, name)) {
+                    Some(t) => Ok(t),
+                    None => Err(format!("{} has no attribute `{name}`{}", self.show(&lt), self.untyped_hint(*c))),
+                },
             },
             (Ty::Type(t), _) if matches!(self.lookup_ty(t), Ty::Inst(..)) => {
                 let Ty::Inst(c, _) = self.lookup_ty(t) else { unreachable!() };
@@ -2692,16 +2693,17 @@ impl<'a> Lower<'a> {
                 match self.db.find_member(c, name) {
                     Some((owner, m)) => Ok(self.member_value_ty(&inst, owner, m, true, origin)),
                     // `type`'s own attributes (`__name__`, `__mro__`, ...).
-                    None if self.db.has_any_base(c) || is_dunder(name) => Ok(Ty::Any),
-                    None => Err(format!("{} has no attribute `{name}`", self.show(obj_ty))),
+                    None if OBJECT_ATTRS.contains(&name) || TYPE_ATTRS.contains(&name) => Ok(Ty::Any),
+                    None => Err(format!("{} has no attribute `{name}`{}", self.show(obj_ty), self.untyped_hint(c))),
                 }
             }
-            // Builtin exceptions' attributes are not declared yet (`errno`,
-            // `filename`, ...): only `args` is typed.
-            (Ty::Exc(_), _) => Ok(if name == "args" { Ty::TupleVar(Box::new(Ty::Any)) } else { Ty::Any }),
+            (Ty::Exc(e), _) => match exc_attr(e, name) {
+                Some(t) => Ok(t),
+                None => Err(format!("{e} has no attribute `{name}`")),
+            },
             (Ty::Any, _) => Ok(Ty::Any),
             // `type`'s own attributes of any class (`__name__`, ...).
-            (Ty::Type(_), _) if is_dunder(name) => Ok(Ty::Any),
+            (Ty::Type(_), _) if OBJECT_ATTRS.contains(&name) || TYPE_ATTRS.contains(&name) => Ok(Ty::Any),
             (Ty::None, _) => Err(format!("cannot read attribute `{name}` of None")),
             (t, _) => Err(format!("attribute `{name}` of {} is not supported by Lizzard yet", self.show(t))),
         }
@@ -2734,6 +2736,16 @@ impl<'a> Lower<'a> {
         self.unbox_f32(v)
     }
 
+    /// For a message: why a class's members are unknown.
+    fn untyped_hint(&mut self, c: ClassId) -> String {
+        let bases = self.db.untyped_bases(c);
+        if bases.is_empty() {
+            return String::new();
+        }
+        let names: Vec<String> = bases.iter().map(|b| format!("`{b}`")).collect();
+        format!(" (its base class {} has no type definitions)", names.join(", "))
+    }
+
     /// `del obj.name`: a property needs a deleter.
     fn del_attr(&mut self, obj: &Val, a: &ast::ExprAttribute) {
         let off: u32 = a.attr.range().start().into();
@@ -2746,7 +2758,10 @@ impl<'a> Lower<'a> {
                     self.err(off, format!("property `{name}` has no deleter"));
                 }
                 Some((_, Member::Method(_))) => self.err(off, format!("cannot delete method `{name}`")),
-                None if !self.db.has_any_base(c) => self.err(off, format!("{cn} has no attribute `{name}`")),
+                None => {
+                    let hint = self.untyped_hint(c);
+                    self.err(off, format!("{cn} has no attribute `{name}`{hint}"));
+                }
                 _ => {}
             }
         } else if !matches!(obj.ty, Ty::Any) {
@@ -2804,12 +2819,12 @@ impl<'a> Lower<'a> {
                     }
                     val
                 }
-                None if self.db.has_any_base(*c) => val,
                 None => {
                     let t = self.show(&lt);
+                    let hint = self.untyped_hint(*c);
                     self.err(
                         off,
-                        format!("{t} has no attribute `{name}`; declare it in the class body (`{name}: T`) or in `__init__` (`self.{name}: T = ...`)"),
+                        format!("{t} has no attribute `{name}`{hint}; declare it in the class body (`{name}: T`) or in `__init__` (`self.{name}: T = ...`)"),
                     );
                     val
                 }
@@ -2908,7 +2923,7 @@ impl<'a> Lower<'a> {
             let lt = self.lookup_ty(&v.ty);
             let ok = match &lt {
                 Ty::Any => true,
-                Ty::Inst(cl, _) => self.db.find_member(*cl, "__len__").is_some() || self.db.has_any_base(*cl),
+                Ty::Inst(cl, _) => self.db.find_member(*cl, "__len__").is_some(),
                 _ => false,
             };
             if !ok {
@@ -3221,7 +3236,11 @@ impl<'a> Lower<'a> {
                 }
             },
             _ => {
-                if self.db.exc_base(c).is_none() && !self.db.has_any_base(c) && (!pos.is_empty() || !kws.is_empty()) {
+                let untyped = self.db.untyped_bases(c);
+                if !untyped.is_empty() {
+                    let hint = self.untyped_hint(c);
+                    self.err(off, format!("cannot check the arguments of {cname}(){hint}"));
+                } else if self.db.exc_base(c).is_none() && (!pos.is_empty() || !kws.is_empty()) {
                     self.err(off, format!("{cname}() takes no arguments"));
                 }
                 self.db.erase(&recv)
@@ -3402,7 +3421,6 @@ impl<'a> Lower<'a> {
         let Ty::Inst(c, _) = self.lookup_ty(recv) else { return None };
         match self.db.find_member(c, name) {
             Some((_, Member::Method(f))) => Some(self.resolve(f, Some(recv.clone()), args, &[], None)),
-            None if self.db.has_any_base(c) => Some(Ok((Ty::Any, self.file, 0))),
             _ => None,
         }
     }
@@ -4102,6 +4120,27 @@ impl<'a> Visitor<'a> for NameScope {
             self.bound.insert(n.to_string());
         }
         walk_except_handler(self, h);
+    }
+}
+
+/// The attributes of builtin exception `e` (the checker's own exception
+/// classes have no definition file).
+fn exc_attr(e: &str, name: &str) -> Option<Ty> {
+    let any = Some(Ty::Any);
+    match name {
+        "args" => Some(Ty::TupleVar(Box::new(Ty::Any))),
+        "__traceback__" | "__cause__" | "__context__" | "__notes__" | "with_traceback" | "add_note" => any,
+        "__suppress_context__" => Some(Ty::Bool),
+        n if OBJECT_ATTRS.contains(&n) => any,
+        "errno" | "strerror" | "filename" | "filename2" if exc_sub(e, "OSError") => any,
+        "value" if exc_sub(e, "StopIteration") => any,
+        "code" if exc_sub(e, "SystemExit") => any,
+        "name" | "path" if exc_sub(e, "ImportError") => any,
+        "name" if exc_sub(e, "NameError") || exc_sub(e, "AttributeError") => Some(Ty::Str),
+        "obj" if exc_sub(e, "AttributeError") => any,
+        "encoding" | "object" | "start" | "end" | "reason" if exc_sub(e, "UnicodeError") => any,
+        "msg" | "lineno" | "offset" | "text" | "filename" if exc_sub(e, "SyntaxError") => any,
+        _ => None,
     }
 }
 

@@ -237,6 +237,9 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Unfinished generators are closed when freed**, so their `finally` blocks run; an exception there is reported as unraisable, as CPython does.
 - **`for` loops resume Lizzard generators directly**, without a `StopIteration` at the end.
 
+**Strict attribute access.** Every attribute read, write, `del`, call and operator must be declared: in the class or a base class, in a definition file, or among `object`'s and `type`'s own attributes (`__class__`, `__dict__`, `__name__`, `__mro__`, ...). There is no fallback to `Any`. A class deriving from a class nothing defines (an opaque standard-library module's, say `queue.Queue`) can still be written, but using a member it does not declare itself, or constructing it, is an error that names the untyped base. Exception classes get the builtin exceptions' attributes (`args`, `__cause__`, `errno` for `OSError`, ...).
+- **Standard-library definitions** live next to the bundled overlays (`python/lizzard/stubs/<module>.pyi`). A standard-library module with such a file is read from it alone; the others stay opaque. `threading` is the first: `Thread` (and subclasses of it), `Timer`, `Lock`, `RLock`, `Condition`, `Semaphore`, `BoundedSemaphore`, `Event`, `Barrier` and the module functions.
+
 **Behaviour decisions:**
 - **A type error in top-level code is a static error.** The example's last line therefore stops the import with a diagnostic. The runtime check is what Python callers see.
 - **`a[i]` on `npt.NDArray` (unknown ndim) is `Any`**, by the typing spec's rule for overloads matched through `Any`. The unboxed float32 path needs a shape-typed array: `np.ndarray[tuple[int], np.dtype[np.float32]]`.
@@ -249,7 +252,7 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **A type variable is fixed by its first argument.** `same(1, "a")` for `def same[T](a: T, b: T)` is an error rather than `T = int | str` (widening could be unsound with invariant containers).
 - **A lambda needs an expected `Callable` type** for its parameters (an annotation, a parameter, `key=`); `f = lambda x: ...` alone is an error, like an unannotated `def`.
 - **A name is local to a function if it is assigned anywhere in it**, as in Python: reading it before the assignment is an error rather than a read of the global.
-- **Builtin exceptions' attributes other than `args` are `Any`** (`errno`, `filename`, ...).
+- **Builtin exceptions' attributes are known by name but mostly `Any`** (`errno`, `filename`, `__cause__`, ...); `args` is a tuple and `__suppress_context__` a bool.
 - **The value sent to a `yield` is checked against `S | None`.** `next()` sends None whatever the send type is, as typing allows.
 - **Temporaries may keep objects alive until the function returns.** Assignment moves a temporary's reference into the variable, so `del x` frees an object at once, but other temporaries (a call's arguments, say) are only released when overwritten. A liveness pass that clears dead registers (needed by the JIT anyway) would make finalization as prompt as CPython's.
 - **Compiled frames add no traceback entries** (they add a `lizzard:` note per frame instead), so tracebacks of errors in generators point at the caller.
@@ -261,7 +264,8 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
 **Deferred:**
 - checking that overlays only refine the base declarations;
-- bundled typeshed (stdlib modules are `Any`), `@runtime_checkable` protocols and `Literal` types;
+- bundled typeshed (stdlib modules without a definition file are `Any`), `@runtime_checkable` protocols and `Literal` types;
+- `threading.local`, whose instances take arbitrary attributes;
 - generator expressions, `async` (coroutines, async generators), `match`, `except*`, the walrus operator, `del` of globals;
 - `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;
 - decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
