@@ -1,4 +1,4 @@
-  File "err_main_return.lz", line 2
+  File "err_main_return.py", line 2
     def main() -> str:
     ^
 TypeError: `main` must return `()` or an exit status `int`

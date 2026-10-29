@@ -1,4 +1,4 @@
-  File "err_none_not_option.lz", line 2
+  File "err_none_not_option.py", line 2
         x: int = None
         ^
 TypeError: `x` is declared `int` but assigned a `None`

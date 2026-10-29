@@ -1,4 +1,4 @@
-  File "err_array_store_type.lz", line 3
+  File "err_array_store_type.py", line 3
         b[0] = 1.5
                ^
 TypeError: cannot store a `float` in an `array<u8>`

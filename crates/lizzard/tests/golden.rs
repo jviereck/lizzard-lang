@@ -1,4 +1,4 @@
-//! Golden tests: every `tests/programs/*.lz` is run and its combined
+//! Golden tests: every `tests/programs/*.py` is run and its combined
 //! stdout+stderr compared with the matching `.out` file.
 //! Run with `BLESS=1` to (re)generate the expected output.
 
@@ -30,7 +30,7 @@ fn golden_programs() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "lz"))
+        .filter(|p| p.extension().is_some_and(|x| x == "py"))
         .collect();
     entries.sort();
     let mut failures = Vec::new();

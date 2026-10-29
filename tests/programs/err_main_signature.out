@@ -1,4 +1,4 @@
-  File "err_main_signature.lz", line 2
+  File "err_main_signature.py", line 2
     def main(n: int) -> ():
     ^
 TypeError: `main` takes no parameters or the program's arguments: `def main(args: list<str>)`

@@ -1,4 +1,4 @@
-  File "err_struct_lit_missing.lz", line 7
+  File "err_struct_lit_missing.py", line 7
         a = A { x: 1 }
               ^
 TypeError: missing field `y` in `A { .. }`

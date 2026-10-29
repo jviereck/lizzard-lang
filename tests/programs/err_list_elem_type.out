@@ -1,4 +1,4 @@
-  File "err_list_elem_type.lz", line 3
+  File "err_list_elem_type.py", line 3
         l.append(3)
                 ^
 TypeError: cannot store `int` as element of `list<str>`

@@ -6,7 +6,7 @@ use std::process::Command;
 fn main_args_and_exit_status() {
     let dir = std::env::temp_dir().join(format!("lizzard-cli-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let prog = dir.join("args.lz");
+    let prog = dir.join("args.py");
     std::fs::write(&prog, "def main(args: list<str>) -> int:\n    print(args)\n    len(args)\n").unwrap();
     // Options come before the file; everything after it is the program's.
     let out = Command::new(env!("CARGO_BIN_EXE_lizzard")).arg("--rc-audit").arg(&prog).args(["a", "b c", "--rc-audit"]).output().unwrap();

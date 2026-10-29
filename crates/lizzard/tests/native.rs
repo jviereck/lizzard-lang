@@ -173,7 +173,7 @@ fn stack<T: FromLizzard + IntoLizzard + Clone + 'static>(c: &mut ClassBuilder<St
 fn run(src: &str) -> Result<Vec<String>, String> {
     let (rt, log) = runtime();
     let before = lizzard_vm::rc::live_objects();
-    let r = rt.run_source(src, "test.lz");
+    let r = rt.run_source(src, "test.py");
     let after = lizzard_vm::rc::live_objects();
     assert_eq!(before, after, "objects leaked by:\n{src}");
     r.map(|_| log.lock().unwrap().clone())

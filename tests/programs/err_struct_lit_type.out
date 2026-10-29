@@ -1,4 +1,4 @@
-  File "err_struct_lit_type.lz", line 6
+  File "err_struct_lit_type.py", line 6
         a = A { x: "one" }
                 ^
 TypeError: field `x` of `A` expects `int`, got `str`

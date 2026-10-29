@@ -1,4 +1,4 @@
-  File "err_impl_blanket.lz", line 4
+  File "err_impl_blanket.py", line 4
     impl<T> D for T:
                   ^
 TypeError: blanket impls (`impl<T> Trait for T`) are not supported; implement the trait for each type

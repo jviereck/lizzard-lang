@@ -1,4 +1,4 @@
-  File "err_untyped_method.lz", line 4
+  File "err_untyped_method.py", line 4
         def f(self, x) -> ():
                     ^
 SyntaxError: parameter `x` of method `f` needs a type annotation (all method parameters must be typed)

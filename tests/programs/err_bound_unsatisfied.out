@@ -1,4 +1,4 @@
-  File "err_bound_unsatisfied.lz", line 16
+  File "err_bound_unsatisfied.py", line 16
         bad = SortedBag::<list<int>>::new()
                                          ^
 TypeError: `list<int>` does not implement `Ord` (required by `T` of `SortedBag::new()`)

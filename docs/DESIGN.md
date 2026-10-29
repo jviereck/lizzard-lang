@@ -98,7 +98,7 @@ def main(args: list<str>) -> int:                # the entry point (or `main() -
   - Parameters follow the same rules as functions: borrowed by default, with `+ keep` allowed. Captures move move-type values in (`++` a value first to keep it) and copy copy-type values.
   - A lambda is itself a move-type object.
 - **Programs start at `main`, as in Rust.** The top level holds only items: functions, structs, traits, impls and imports (a docstring is allowed). Any other statement there is a compile error, and there are no module variables (nor `global`): state lives in `main`'s locals and is passed on. Items are defined before `main` runs, in any order.
-  - `main` takes nothing or the program's arguments, `def main(args: list<str>)` (`lizzard prog.lz a b` passes `["a", "b"]`), and returns `()` or an `int` exit status (its low 8 bits, as the OS keeps them). It cannot be generic or a generator.
+  - `main` takes nothing or the program's arguments, `def main(args: list<str>)` (`lizzard prog.py a b` passes `["a", "b"]`), and returns `()` or an `int` exit status (its low 8 bits, as the OS keeps them). It cannot be generic or a generator.
   - A program without `main` is a compile error. An exception escaping `main` prints the traceback and exits with status 1.
   - Embedders set the arguments with `Runtime::args`; `run_source` returns the exit status.
 - **Mandatory struct typing.**
@@ -222,8 +222,8 @@ A decrement never frees anything inline; it only does bookkeeping.
 | `lizzard-jit` | `backend/jit.rs` Cranelift backend; compile-queue thread; entry/exit generation; code installation |
 | `lizzard-abi` | The C ABI between the interpreter and native modules: `LizzardApi`, descriptors, `ABI_VERSION` |
 | `lizzard-ext` | The Rust binding API (`Module`, `ClassBuilder`, `FromLizzard`, ...) over `lizzard-abi`; `module!` declares an extension library |
-| `lizzard` (bin) | CLI: `lizzard run file.lz [--jit=off\|auto\|always] [--dis]` |
-| `tests/` | Golden `.lz` programs with `.out` files (including expected compile errors), run under every JIT mode |
+| `lizzard` (bin) | CLI: `lizzard run file.py [--jit=off\|auto\|always] [--dis]` |
+| `tests/` | Golden `.py` programs with `.out` files (including expected compile errors), run under every JIT mode |
 
 Dependencies:
 - `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`
@@ -374,7 +374,7 @@ pub trait Backend {
 ## Verification
 - `cargo test --workspace` runs:
   - unit tests for the lexer, parser, compiler and ownership checker
-  - golden tests: every `tests/programs/*.lz` is checked against its `.out`. In Phase B the same tests also run under `--jit=always` and `--jit=auto` (low threshold).
+  - golden tests: every `tests/programs/*.py` is checked against its `.out`. In Phase B the same tests also run under `--jit=always` and `--jit=auto` (low threshold).
   - RC tests:
     - with `rc_auto(False)`, objects stay alive until `rc_run()`
     - `rc_run(limit)` frees at most `limit` objects
@@ -383,7 +383,7 @@ pub trait Backend {
   - expression tests: implicit returns, `if`/`try` values, an `if` without `else` producing `()`, the discarded last value in a `-> ()` function, and `TypeError` on a wrongly typed implicit return
   - negative tests: use-after-move, `x = foo.bar` without `++`/`<-`, a borrow escaping (bound, stored, returned or yielded without `++`), moving a borrowed param, missing annotations, using an `Option` without narrowing, `None` assigned to a non-Option, lambda indentation errors, `TypeError`/`OverflowError`/`OwnershipError` messages
 - A debug-build refcount audit at exit: with the immortals excluded, every non-leaked object must reach rc 0.
-- `lizzard run --dis file.lz` lets you inspect bytecode, with every RC op visible.
+- `lizzard run --dis file.py` lets you inspect bytecode, with every RC op visible.
 - From M6, thread stress tests: N threads racing `<-` stores and borrowed reads on shared objects, and shared list/dict under Lock. `cargo +nightly test -Zsanitizer=thread` on the runtime.
 - In Phase B, `LIZZARD_JIT_DUMP=1` dumps the Cranelift IR, and benchmarks in `benches/` compare interpreter and JIT time. The JIT should be several times faster on integer and float code.
 

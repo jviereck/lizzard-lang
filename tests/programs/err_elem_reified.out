@@ -1,6 +1,6 @@
 [1, 2, 3]
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_elem_reified.lz", line 11, in main
+  File "err_elem_reified.py", line 11, in main
 TypeError: cannot store `str` in `list<int>`
 [exit 1]

@@ -1,4 +1,4 @@
-  File "err_impl_specialized_missing.lz", line 13
+  File "err_impl_specialized_missing.py", line 13
         Box { value: "s" }.d()
                             ^
 AttributeError: `Box<str>` has no method `d`

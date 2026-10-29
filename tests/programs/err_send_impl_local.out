@@ -1,4 +1,4 @@
-  File "err_send_impl_local.lz", line 5
+  File "err_send_impl_local.py", line 5
     impl Local for Counter
          ^
 TypeError: there is no `Local` trait: as in Rust, a struct is `Send` unless a field is not (e.g. an `any` field)

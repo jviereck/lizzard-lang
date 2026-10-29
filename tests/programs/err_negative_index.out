@@ -1,6 +1,6 @@
 3
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_negative_index.lz", line 4, in main
+  File "err_negative_index.py", line 4, in main
 IndexError: index -1 out of range for list of length 3
 [exit 1]

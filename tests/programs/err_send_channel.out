@@ -1,4 +1,4 @@
-  File "err_send_channel.lz", line 10
+  File "err_send_channel.py", line 10
         ch: Channel<Bag> = Channel()
             ^
 TypeError: `Channel<Bag>`: channel items must be `Send`, and `Bag` is not

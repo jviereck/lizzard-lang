@@ -162,7 +162,7 @@ How the compiler keeps them fast:
 ## 8. Milestones
 1. **Python front end and checker.**
    - The new parser, the typed-Python checker with generics, the `lizzard` package, and `lizzard check`.
-   - Port `tests/programs/*.lz` to `.py` programs; CPython itself is the oracle for their `.out` files.
+   - Port `tests/programs/*.py` to valid typed Python; CPython itself is the oracle for their `.out` files.
 2. **Definition files.** The loader, boundary-check semantics, bundled typeshed, `lizzard stubgen`, and initial NumPy definitions.
 3. **Import hook and JIT for the core.**
    - Trampolines (entry points), unboxed int/float code, control flow, calls, globals, generic type arguments.

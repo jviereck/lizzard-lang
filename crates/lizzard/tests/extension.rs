@@ -50,7 +50,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn extension_modules() {
     let lib_dir = build_extension();
-    let script = root().join("examples/geom_ext/geom.lz");
+    let script = root().join("examples/geom_ext/geom.py");
 
     // Found on LIZZARD_PATH; the same output as the statically embedded module.
     let expected = std::fs::read_to_string(root().join("examples/geom_ext/geom.out")).unwrap();
@@ -59,8 +59,8 @@ fn extension_modules() {
     // Found next to the program.
     let d = scratch("local");
     std::fs::copy(lib_dir.join(library("geom")), d.join(library("geom"))).unwrap();
-    std::fs::copy(&script, d.join("geom.lz")).unwrap();
-    assert_eq!(lizzard(&d.join("geom.lz"), None), expected);
+    std::fs::copy(&script, d.join("geom.py")).unwrap();
+    assert_eq!(lizzard(&d.join("geom.py"), None), expected);
 
     // Not found: the compiler's error.
     let out = lizzard(&script, None);
@@ -69,12 +69,12 @@ fn extension_modules() {
     // A library that is not an extension, and one for another module.
     let d = scratch("bad");
     std::fs::write(d.join(library("junk")), b"not a library").unwrap();
-    std::fs::write(d.join("junk.lz"), "import junk\n").unwrap();
-    let out = lizzard(&d.join("junk.lz"), None);
+    std::fs::write(d.join("junk.py"), "import junk\n").unwrap();
+    let out = lizzard(&d.join("junk.py"), None);
     assert!(out.contains("ImportError: cannot load module `junk`") && out.ends_with("[exit 1]\n"), "{out}");
     std::fs::copy(lib_dir.join(library("geom")), d.join(library("shapes"))).unwrap();
-    std::fs::write(d.join("shapes.lz"), "import shapes\n").unwrap();
-    let out = lizzard(&d.join("shapes.lz"), None);
+    std::fs::write(d.join("shapes.py"), "import shapes\n").unwrap();
+    let out = lizzard(&d.join("shapes.py"), None);
     assert!(out.contains("cannot load module `shapes`") && out.contains("it defines module `geom`"), "{out}");
 }
 

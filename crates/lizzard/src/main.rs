@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: lizzard [run] [--dis] [--rc-audit] <file.lz> [args...]
+const USAGE: &str = "usage: lizzard [run] [--dis] [--rc-audit] <file.py> [args...]
 
 Runs the program's `main`; `main(args: list<str>)` receives the arguments after
 the file, and `main() -> int` sets the exit status.

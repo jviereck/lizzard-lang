@@ -8,7 +8,7 @@
 //!     });
 //! });
 //! let src = "from geom import dot\n\ndef main() -> ():\n    print(dot([1.0, 2.0], [3.0, 4.0]))\n";
-//! rt.run_source(src, "main.lz").unwrap();
+//! rt.run_source(src, "main.py").unwrap();
 //! ```
 //!
 //! Native modules come from two places:

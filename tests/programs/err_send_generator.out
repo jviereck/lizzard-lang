@@ -1,4 +1,4 @@
-  File "err_send_generator.lz", line 12
+  File "err_send_generator.py", line 12
         yield 1
         ^
 TypeError: generator `ticks` is declared `Send` but holds `Bag` (`b`), which is not `Send`, across a `yield`; declare it `-> Iterator<int>`

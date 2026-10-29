@@ -8,7 +8,7 @@ use lizzard::Runtime;
 fn main() {
     let mut rt = Runtime::new();
     rt.module("geom", geom::build);
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../geom_ext/geom.lz");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../geom_ext/geom.py");
     match rt.run_file(script) {
         // `main`'s exit status (its low 8 bits, as the OS keeps them).
         Ok(status) => std::process::exit(status as u8 as i32),

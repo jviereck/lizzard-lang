@@ -1,4 +1,4 @@
-  File "err_trait_method_missing.lz", line 17
+  File "err_trait_method_missing.py", line 17
         print(Land::acres(p))
                          ^
 TypeError: `Plot` has no method `Land::acres`

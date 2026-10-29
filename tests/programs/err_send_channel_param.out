@@ -1,4 +1,4 @@
-  File "err_send_channel_param.lz", line 3
+  File "err_send_channel_param.py", line 3
         jobs: Channel<T>
         ^
 TypeError: `Channel<T>`: channel items must be `Send`, and `T` may not be; add a `T: Send` bound

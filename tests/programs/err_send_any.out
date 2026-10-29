@@ -1,4 +1,4 @@
-  File "err_send_any.lz", line 13
+  File "err_send_any.py", line 13
         print(keep_for_later(Bag::new(1)))
                                      ^
 TypeError: `Bag` is not `Send` and cannot be used as `any + Send`

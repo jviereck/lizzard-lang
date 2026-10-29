@@ -1,4 +1,4 @@
-  File "err_trait_signature.lz", line 8
+  File "err_trait_signature.py", line 8
         def scale(self, k: int) -> Self:
         ^
 TypeError: `impl Shape for Square`: `scale` is `(int) -> Square`, but `Shape` needs `(float) -> Square`

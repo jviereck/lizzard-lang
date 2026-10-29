@@ -1,4 +1,4 @@
-  File "err_impl_in_function.lz", line 4
+  File "err_impl_in_function.py", line 4
         impl A:
         ^
 SyntaxError: `impl` blocks must be at module level

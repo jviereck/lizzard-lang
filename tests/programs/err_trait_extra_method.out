@@ -1,4 +1,4 @@
-  File "err_trait_extra_method.lz", line 10
+  File "err_trait_extra_method.py", line 10
         def perimeter(self) -> float:
         ^
 TypeError: `impl Shape for Square`: `perimeter` is not a method of trait `Shape`

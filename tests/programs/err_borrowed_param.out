@@ -1,4 +1,4 @@
-  File "err_borrowed_param.lz", line 2
+  File "err_borrowed_param.py", line 2
         y = msg
             ^
 OwnershipError: cannot move parameter `msg` (a borrowed `str`) into a variable; use `msg++` to create a new reference

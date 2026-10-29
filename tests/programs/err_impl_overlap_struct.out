@@ -1,4 +1,4 @@
-  File "err_impl_overlap_struct.lz", line 11
+  File "err_impl_overlap_struct.py", line 11
     impl D for Box<int>:
     ^
 TypeError: conflicting implementations of `D`: `impl D for Box<int>` overlaps the implementation for every `Box`

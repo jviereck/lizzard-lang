@@ -1,4 +1,4 @@
-  File "err_empty_literal.lz", line 3
+  File "err_empty_literal.py", line 3
         names = []
                 ^
 TypeError: cannot infer the type of `[]`; annotate it (e.g. `xs: list<int> = []`)

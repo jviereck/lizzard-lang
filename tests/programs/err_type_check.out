@@ -1,7 +1,7 @@
 6
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_type_check.lz", line 9, in main
-  File "err_type_check.lz", line 1, in area
+  File "err_type_check.py", line 9, in main
+  File "err_type_check.py", line 1, in area
 TypeError: argument `h` of `area()` expected `int`, got `str`
 [exit 1]
