@@ -1,6 +1,6 @@
-"""lizzard: typed Python, checked and run by lizzard inside CPython.
+"""lizzard: typed Python, checked and run by Lizzard inside CPython.
 
-Importing this package installs the import hook for lizzard modules (``.py``
+Importing this package installs the import hook for Lizzard modules (``.py``
 files marked ``# lizzard: module``). ``python -m lizzard app.py`` runs a program.
 """
 

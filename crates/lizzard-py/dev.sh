@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build lizzard's Python extension into two venvs (free-threaded 3.14t and the
+# Build Lizzard's Python extension into two venvs (free-threaded 3.14t and the
 # GIL 3.14 build) and run the Python tests in each.
 #   crates/lizzard-py/dev.sh            build and test both
 #   crates/lizzard-py/dev.sh ft         only the free-threaded venv

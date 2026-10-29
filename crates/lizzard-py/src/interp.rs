@@ -1,4 +1,4 @@
-//! The IR interpreter and lizzard function objects.
+//! The IR interpreter and Lizzard function objects.
 
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ impl FuncRt {
     }
 }
 
-/// A checked lizzard function, callable from Python.
+/// A checked Lizzard function, callable from Python.
 #[pyclass(frozen, module = "lizzard._lizzard")]
 pub struct LizzardFunction {
     rt: Arc<FuncRt>,
@@ -81,7 +81,7 @@ impl LizzardFunction {
     }
 
     fn __repr__(&self) -> String {
-        format!("<lizzard function {} at {}:{}>", self.rt.ir.name, self.rt.ir.file, self.rt.ir.line)
+        format!("<Lizzard function {} at {}:{}>", self.rt.ir.name, self.rt.ir.file, self.rt.ir.line)
     }
 }
 

@@ -1,5 +1,5 @@
 //! `cargo run -p lizzard-py-front --example check -- FILE SITE_PACKAGES OVERLAY_ROOT`
-//! Type-checks a lizzard module and prints diagnostics and the lowered IR.
+//! Type-checks a Lizzard module and prints diagnostics and the lowered IR.
 use std::path::PathBuf;
 
 fn main() {

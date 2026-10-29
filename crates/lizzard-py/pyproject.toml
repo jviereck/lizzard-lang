@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "lizzard"
 version = "0.1.0"
-description = "Typed Python checked and run by lizzard inside CPython"
+description = "Typed Python checked and run by Lizzard inside CPython"
 requires-python = ">=3.14"
 
 [tool.maturin]

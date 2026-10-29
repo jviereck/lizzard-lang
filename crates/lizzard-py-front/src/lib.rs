@@ -1,6 +1,6 @@
-//! lizzard's front end for typed Python: definition files (`.pyi` overlays
+//! Lizzard's front end for typed Python: definition files (`.pyi` overlays
 //! over a package's own declarations), the type checker and lowering of
-//! lizzard functions to the IR in `ir`.
+//! Lizzard functions to the IR in `ir`.
 
 pub mod check;
 pub mod db;
@@ -15,7 +15,7 @@ pub struct Compiled {
     pub warnings: Vec<String>,
 }
 
-/// Check the lizzard module `name` at `path` and lower its functions.
+/// Check the Lizzard module `name` at `path` and lower its functions.
 pub fn compile_module(env: Env, name: &str, path: &str, source: &str) -> Compiled {
     let mut db = db::Db::new(env);
     let (m, body) = match db.add_user_module(name, path, source) {

@@ -1,4 +1,4 @@
-//! Type checking of a lizzard module and lowering of its functions to IR.
+//! Type checking of a Lizzard module and lowering of its functions to IR.
 //!
 //! One pass does both: every expression is typed and lowered together.
 //! Top-level statements (run by CPython) are checked the same way into a
@@ -52,7 +52,7 @@ struct Lower<'a> {
 const BUILTIN_FNS: &[&str] = &["print", "len", "range"];
 
 pub fn check_module(db: &mut Db, m: ModId, body: &[Stmt]) -> Vec<FuncIr> {
-    let file = db.modules[m].file.expect("lizzard module without file");
+    let file = db.modules[m].file.expect("Lizzard module without file");
     let mut funcs = Vec::new();
     let mut top = Lower::new(db, m, file, true, "<module>".into(), Ty::Any);
     for s in body {
@@ -246,7 +246,7 @@ impl<'a> Lower<'a> {
     fn function(&mut self, d: &ast::StmtFunctionDef) -> Option<FuncIr> {
         let off = self.at(d);
         if d.is_async || !d.decorator_list.is_empty() || d.type_params.is_some() {
-            self.err(off, "async, decorated and generic functions are not supported by lizzard yet");
+            self.err(off, "async, decorated and generic functions are not supported by Lizzard yet");
             return None;
         }
         let Some(Sym::Func(f)) = self.db.lookup_in(self.m, d.name.as_str()) else {
@@ -265,7 +265,7 @@ impl<'a> Lower<'a> {
         let mut params = Vec::new();
         for p in &sig.params {
             if !matches!(p.kind, PKind::PosOnly | PKind::PosOrKw) || p.default {
-                l.err(off, format!("parameter `{}`: only plain positional parameters are supported by lizzard yet", p.name));
+                l.err(off, format!("parameter `{}`: only plain positional parameters are supported by Lizzard yet", p.name));
             }
             let reg = l.reg(Repr::Obj);
             l.locals.insert(p.name.clone(), Local { reg, ty: p.ty.clone(), repr: Repr::Obj });
@@ -317,7 +317,7 @@ impl<'a> Lower<'a> {
             }
             Stmt::Assign(a) => {
                 let [target] = a.targets.as_slice() else {
-                    return self.err(off, "multiple assignment targets are not supported by lizzard yet");
+                    return self.err(off, "multiple assignment targets are not supported by Lizzard yet");
                 };
                 match target {
                     Expr::Name(n) => {
@@ -328,12 +328,12 @@ impl<'a> Lower<'a> {
                         let v = self.expr(&a.value);
                         self.store_item(sub, v);
                     }
-                    _ => self.err(off, "this assignment target is not supported by lizzard yet"),
+                    _ => self.err(off, "this assignment target is not supported by Lizzard yet"),
                 }
             }
             Stmt::AnnAssign(a) => {
                 let Expr::Name(n) = &*a.target else {
-                    return self.err(off, "this assignment target is not supported by lizzard yet");
+                    return self.err(off, "this assignment target is not supported by Lizzard yet");
                 };
                 let ty = self.db.eval_type(&a.annotation, &Scope { m: self.m, tparams: &[], self_ty: None });
                 match &a.value {
@@ -341,17 +341,17 @@ impl<'a> Lower<'a> {
                         let v = self.expr(v);
                         self.assign_local(n.id.as_str(), v, Some(ty), off);
                     }
-                    None => self.err(off, "a declaration without a value is not supported by lizzard yet"),
+                    None => self.err(off, "a declaration without a value is not supported by Lizzard yet"),
                 }
             }
             Stmt::If(i) => self.if_stmt(&i.test, &i.body, &i.elif_else_clauses),
             Stmt::For(f) => self.for_stmt(f),
             Stmt::Raise(r) => {
                 if r.cause.is_some() {
-                    self.err(off, "`raise ... from` is not supported by lizzard yet");
+                    self.err(off, "`raise ... from` is not supported by Lizzard yet");
                 }
                 let Some(exc) = &r.exc else {
-                    return self.err(off, "a bare `raise` is not supported by lizzard yet");
+                    return self.err(off, "a bare `raise` is not supported by Lizzard yet");
                 };
                 let v = self.expr(exc);
                 let ok = matches!(&v.ty, Ty::Any | Ty::Exc(_) | Ty::Inst(..)) || matches!(&v.ty, Ty::Type(t) if matches!(**t, Ty::Exc(_)));
@@ -379,9 +379,9 @@ impl<'a> Lower<'a> {
                     self.db.lookup_in(self.m, n.id.as_str());
                 }
             }
-            Stmt::ClassDef(_) => self.err(off, "classes are not supported by lizzard yet"),
-            Stmt::FunctionDef(_) => self.err(off, "nested functions are not supported by lizzard yet"),
-            _ => self.err(off, "this statement is not supported by lizzard yet"),
+            Stmt::ClassDef(_) => self.err(off, "classes are not supported by Lizzard yet"),
+            Stmt::FunctionDef(_) => self.err(off, "nested functions are not supported by Lizzard yet"),
+            _ => self.err(off, "this statement is not supported by Lizzard yet"),
         }
     }
 
@@ -397,7 +397,7 @@ impl<'a> Lower<'a> {
             }
             Stmt::ImportFrom(i) => {
                 let Some(module) = i.module.as_ref().filter(|_| i.level == 0) else {
-                    return self.err(off, "relative imports are not supported by lizzard yet");
+                    return self.err(off, "relative imports are not supported by Lizzard yet");
                 };
                 match self.db.load_module(module.as_str()) {
                     None => self.err(off, format!("cannot find module `{}`", module.as_str())),
@@ -483,14 +483,14 @@ impl<'a> Lower<'a> {
     fn for_stmt(&mut self, f: &ast::StmtFor) {
         let off = self.at(f);
         let Expr::Name(target) = &*f.target else {
-            return self.err(off, "only `for name in range(...)` is supported by lizzard yet");
+            return self.err(off, "only `for name in range(...)` is supported by Lizzard yet");
         };
         let range_args = match &*f.iter {
             Expr::Call(c) if is_builtin_call(c, "range") && c.arguments.keywords.is_empty() && !self.locals.contains_key("range") => &c.arguments.args,
-            _ => return self.err(off, "only `for name in range(...)` is supported by lizzard yet"),
+            _ => return self.err(off, "only `for name in range(...)` is supported by Lizzard yet"),
         };
         if f.is_async || !f.orelse.is_empty() || range_args.is_empty() || range_args.len() > 2 {
-            return self.err(off, "only `for name in range(stop)` and `range(start, stop)` are supported by lizzard yet");
+            return self.err(off, "only `for name in range(stop)` and `range(start, stop)` are supported by Lizzard yet");
         }
         let mut bounds = Vec::new();
         for a in range_args.iter() {
@@ -535,7 +535,7 @@ impl<'a> Lower<'a> {
                 },
                 ast::Number::Float(f) => self.konst(Const::Float(*f), Ty::Float),
                 ast::Number::Complex { .. } => {
-                    self.err(off, "complex numbers are not supported by lizzard yet");
+                    self.err(off, "complex numbers are not supported by Lizzard yet");
                     self.any()
                 }
             },
@@ -562,22 +562,22 @@ impl<'a> Lower<'a> {
                         ast::Number::Int(i) if i.as_i64().is_some() => self.konst(Const::Int(-i.as_i64().unwrap()), Ty::Int),
                         ast::Number::Float(f) => self.konst(Const::Float(-f), Ty::Float),
                         _ => {
-                            self.err(off, "this negation is not supported by lizzard yet");
+                            self.err(off, "this negation is not supported by Lizzard yet");
                             self.any()
                         }
                     },
                     _ => {
-                        self.err(off, "unary minus is only supported on literals by lizzard yet");
+                        self.err(off, "unary minus is only supported on literals by Lizzard yet");
                         self.any()
                     }
                 },
                 _ => {
-                    self.err(off, "this operator is not supported by lizzard yet");
+                    self.err(off, "this operator is not supported by Lizzard yet");
                     self.any()
                 }
             },
             _ => {
-                self.err(off, "this expression is not supported by lizzard yet");
+                self.err(off, "this expression is not supported by Lizzard yet");
                 self.any()
             }
         }
@@ -608,7 +608,7 @@ impl<'a> Lower<'a> {
                 Ty::Any
             }
             Some(Sym::UserVar) => {
-                self.err(off, format!("lizzard functions cannot use the module variable `{name}` yet"));
+                self.err(off, format!("Lizzard functions cannot use the module variable `{name}` yet"));
                 Ty::Any
             }
             Some(s) => self.sym_value_ty(s),
@@ -671,7 +671,7 @@ impl<'a> Lower<'a> {
             Ty::Any => Ty::Any,
             t => {
                 let t = self.show(t);
-                self.err(off, format!("attribute `{name}` of {t} is not supported by lizzard yet"));
+                self.err(off, format!("attribute `{name}` of {t} is not supported by Lizzard yet"));
                 Ty::Any
             }
         };
@@ -713,14 +713,14 @@ impl<'a> Lower<'a> {
         let mut pos = Vec::new();
         for a in c.arguments.args.iter() {
             if matches!(a, Expr::Starred(_)) {
-                self.err(off, "`*args` in calls is not supported by lizzard yet");
+                self.err(off, "`*args` in calls is not supported by Lizzard yet");
             }
             pos.push(self.expr(a));
         }
         let mut kws = Vec::new();
         for k in c.arguments.keywords.iter() {
             let Some(name) = &k.arg else {
-                self.err(off, "`**kwargs` in calls is not supported by lizzard yet");
+                self.err(off, "`**kwargs` in calls is not supported by Lizzard yet");
                 continue;
             };
             let v = self.expr(&k.value);
@@ -733,7 +733,7 @@ impl<'a> Lower<'a> {
         let ret = match fv.ty.clone() {
             Ty::Func(FuncRef::Builtin("print")) => Ty::None,
             Ty::Func(FuncRef::Builtin(n)) => {
-                self.err(off, format!("{n}() is not supported here by lizzard yet"));
+                self.err(off, format!("{n}() is not supported here by Lizzard yet"));
                 Ty::Any
             }
             Ty::Type(t) if matches!(*t, Ty::Exc(_) | Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => {
@@ -977,7 +977,7 @@ impl<'a> Lower<'a> {
             ast::Operator::Mult => (BinOp::Mul, "__mul__", "__rmul__"),
             ast::Operator::Div => (BinOp::Div, "__truediv__", "__rtruediv__"),
             _ => {
-                self.err(off, format!("operator `{}` is not supported by lizzard yet", b.op.as_str()));
+                self.err(off, format!("operator `{}` is not supported by Lizzard yet", b.op.as_str()));
                 return self.any();
             }
         };
@@ -1031,7 +1031,7 @@ impl<'a> Lower<'a> {
     fn compare(&mut self, c: &ast::ExprCompare, e: &Expr) -> Val {
         let off: u32 = c.range().start().into();
         if c.ops.len() != 1 {
-            self.err(off, "chained comparisons are not supported by lizzard yet");
+            self.err(off, "chained comparisons are not supported by Lizzard yet");
             return self.any();
         }
         let (op, dunder) = match c.ops[0] {
@@ -1044,7 +1044,7 @@ impl<'a> Lower<'a> {
             ast::CmpOp::Is => (CmpOp::Is, ""),
             ast::CmpOp::IsNot => (CmpOp::IsNot, ""),
             _ => {
-                self.err(off, "`in` is not supported by lizzard yet");
+                self.err(off, "`in` is not supported by Lizzard yet");
                 return self.any();
             }
         };

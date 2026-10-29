@@ -1,5 +1,5 @@
 //! Threads, locks and channels. There is no global interpreter lock: every
-//! lizzard thread runs on its own OS thread and shares the heap.
+//! Lizzard thread runs on its own OS thread and shares the heap.
 //!
 //! Blocking operations (join, lock acquire, channel receive) take the thread
 //! *offline* for the epoch system, so other threads can keep reclaiming

@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let prog_args: Vec<String> = it.collect();
-    // Run on a thread with a large stack: each lizzard call recurses on the
+    // Run on a thread with a large stack: each Lizzard call recurses on the
     // native stack.
     let h = std::thread::Builder::new()
         .stack_size(512 << 20)

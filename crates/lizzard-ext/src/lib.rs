@@ -28,7 +28,7 @@
 //! - [`Module::class`] (`T: Send + Sync`): `&self` methods run concurrently
 //!   from any thread; `&mut self` methods are exclusive.
 //! - [`Module::class_send`] (`T: Send`): every method call is exclusive.
-//! - [`Module::class_not_send`] (any `T`): the lizzard class is not `Send`
+//! - [`Module::class_not_send`] (any `T`): the Lizzard class is not `Send`
 //!   either, so instances stay on the thread that created them, which is
 //!   also checked on every call (`ThreadError`), and are dropped there.
 //!
@@ -43,7 +43,7 @@
 //! `int`, and other type arguments raise `TypeError`.
 //!
 //! A module may define traits ([`Module::trait_def`]) that its classes
-//! implement ([`ClassBuilder::implements`]), as may lizzard structs. A class
+//! implement ([`ClassBuilder::implements`]), as may Lizzard structs. A class
 //! may also implement the builtin `Ord`, `Num` and `Len` through its dunder
 //! methods.
 
@@ -67,11 +67,11 @@ static API: OnceLock<&'static LizzardApi> = OnceLock::new();
 /// [`module!`], and by a host program before it builds static modules.
 pub fn install(api: &'static LizzardApi) -> Result<(), String> {
     if api.version != ABI_VERSION || api.size < std::mem::size_of::<LizzardApi>() {
-        return Err(format!("the interpreter has lizzard ABI version {}, this module was built for version {ABI_VERSION}", api.version));
+        return Err(format!("the interpreter has Lizzard ABI version {}, this module was built for version {ABI_VERSION}", api.version));
     }
     let cur = API.get_or_init(|| api);
     if !std::ptr::eq(*cur, api) {
-        return Err("a different lizzard interpreter is already connected".into());
+        return Err("a different Lizzard interpreter is already connected".into());
     }
     Ok(())
 }
@@ -87,7 +87,7 @@ fn read(f: impl FnOnce(abi::StrOut)) -> String {
     s
 }
 
-/// A lizzard value, borrowed for the duration of a native call (see
+/// A Lizzard value, borrowed for the duration of a native call (see
 /// [`FromLizzard`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -242,7 +242,7 @@ impl Elem {
     }
 }
 
-/// A lizzard type, as the compiler sees a native's parameters and result.
+/// A Lizzard type, as the compiler sees a native's parameters and result.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NType {
     Int,
@@ -350,17 +350,17 @@ fn encode_sig(params: &[NType], ret: &NType) -> Vec<u8> {
     d
 }
 
-/// A Rust type with a lizzard counterpart.
+/// A Rust type with a Lizzard counterpart.
 pub trait LizzardType {
     fn ntype() -> NType;
 }
 
-/// Conversion of a (borrowed) lizzard argument.
+/// Conversion of a (borrowed) Lizzard argument.
 pub trait FromLizzard: LizzardType + Sized {
     fn from_lizzard(v: Value) -> Result<Self, LizzardError>;
 }
 
-/// Conversion of a native result into an owned lizzard value.
+/// Conversion of a native result into an owned Lizzard value.
 pub trait IntoLizzard {
     fn ntype() -> NType;
     fn into_lizzard(self) -> Result<Value, LizzardError>;
@@ -497,7 +497,7 @@ impl std::hash::Hasher for IdHasher {
     }
 }
 
-/// The runtime type of the lizzard type of Rust type `id` (`ntype` gives it),
+/// The runtime type of the Lizzard type of Rust type `id` (`ntype` gives it),
 /// cached per thread so that conversions neither rebuild nor hash the
 /// `NType`. Types with classes are not cached (a class may be registered
 /// again).
@@ -513,7 +513,7 @@ fn rt_of(id: TypeId, ntype: fn() -> NType) -> RawValue {
     t
 }
 
-/// The runtime type of `T`'s lizzard type.
+/// The runtime type of `T`'s Lizzard type.
 fn rt<T: LizzardType + 'static>() -> RawValue {
     rt_of(TypeId::of::<T>(), T::ntype)
 }
@@ -574,7 +574,7 @@ impl<T: IntoLizzard + 'static> IntoLizzard for Vec<T> {
 
 // ---------------------------------------------------------------- handles
 
-/// A counted reference to a lizzard value, valid on the thread that got it.
+/// A counted reference to a Lizzard value, valid on the thread that got it.
 struct Handle {
     v: Value,
     _not_send: PhantomData<*const ()>,
@@ -609,7 +609,7 @@ impl Drop for Handle {
     }
 }
 
-/// Any lizzard value except `None` (use `Option<Any>` to accept `None`).
+/// Any Lizzard value except `None` (use `Option<Any>` to accept `None`).
 #[derive(Clone)]
 pub struct Any(Handle);
 
@@ -656,7 +656,7 @@ impl IntoLizzard for Any {
     }
 }
 
-/// A lizzard function (or other callable), called with [`Ctx::call`].
+/// A Lizzard function (or other callable), called with [`Ctx::call`].
 #[derive(Clone)]
 pub struct Func(Handle);
 
@@ -688,7 +688,7 @@ impl IntoLizzard for Func {
 }
 
 /// A `list<T>` read and written in place. Elements are converted one at a
-/// time; stores are checked like lizzard stores (types and locality).
+/// time; stores are checked like Lizzard stores (types and locality).
 pub struct ListRef<T> {
     h: Handle,
     _t: PhantomData<T>,
@@ -936,15 +936,15 @@ impl<T: ArrayElem> IntoLizzard for ArrayRef<T> {
 
 // ---------------------------------------------------------------- errors
 
-/// An error raised in lizzard as an exception of class `kind`.
+/// An error raised in Lizzard as an exception of class `kind`.
 pub struct LizzardError {
     pub kind: String,
     pub msg: String,
-    /// A lizzard exception raised by a callback, re-raised unchanged.
+    /// A Lizzard exception raised by a callback, re-raised unchanged.
     pending: Option<Pending>,
 }
 
-/// The interpreter's error carrying a lizzard exception.
+/// The interpreter's error carrying a Lizzard exception.
 struct Pending(usize);
 
 impl Pending {
@@ -1046,7 +1046,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Calls a lizzard function. Arguments are passed as new references.
+    /// Calls a Lizzard function. Arguments are passed as new references.
     pub fn call<R: FromLizzard>(&mut self, f: &Func, args: impl IntoArgs) -> Result<R, LizzardError> {
         let vals = args.into_values()?;
         let mut out = 0;
@@ -1059,7 +1059,7 @@ impl Ctx {
         r
     }
 
-    /// Runs `f` without access to lizzard values (they cannot be captured: they
+    /// Runs `f` without access to Lizzard values (they cannot be captured: they
     /// are not `Send`), letting other threads reclaim memory meanwhile. Use
     /// it around long or blocking work.
     pub fn offline<R: Send>(&mut self, f: impl FnOnce() -> R + Send) -> R {
@@ -1564,14 +1564,14 @@ impl Module {
         self.add_class(name, abi::MODE_SEND, build)
     }
 
-    /// Adds a class over a Rust type that is not `Send` (any `T`): the lizzard
+    /// Adds a class over a Rust type that is not `Send` (any `T`): the Lizzard
     /// class is not `Send` either, so instances stay on their thread.
     pub fn class_not_send<T: 'static>(&mut self, name: &str, build: impl FnOnce(&mut ClassBuilder<T>)) -> &mut Self {
         self.add_class(name, abi::MODE_LOCAL, build)
     }
 
     /// Adds a trait whose methods are all required, for classes of this
-    /// module (defined after it) and lizzard structs to implement:
+    /// module (defined after it) and Lizzard structs to implement:
     ///
     /// ```ignore
     /// m.trait_def("Shape", |t| {
@@ -1608,7 +1608,7 @@ impl Module {
     /// });
     /// ```
     ///
-    /// Constructing another instantiation from lizzard is a compile error when
+    /// Constructing another instantiation from Lizzard is a compile error when
     /// the type arguments are known statically, and a `TypeError` otherwise.
     pub fn generic_class(&mut self, name: &str, tparams: &[&str], build: impl FnOnce(&mut GenericBuilder)) -> &mut Self {
         assert!(!tparams.is_empty(), "generic class `{name}` needs type parameters");
@@ -1926,7 +1926,7 @@ pub unsafe fn init(api: *const LizzardApi, name: &str, build: impl FnOnce(&mut M
     // SAFETY: guaranteed by the caller.
     let api = unsafe { &*api };
     if api.version != ABI_VERSION {
-        return fail(format!("module `{name}` was built for lizzard ABI version {ABI_VERSION}, the interpreter has version {}", api.version));
+        return fail(format!("module `{name}` was built for Lizzard ABI version {ABI_VERSION}, the interpreter has version {}", api.version));
     }
     if let Err(e) = install(api) {
         return fail(e);

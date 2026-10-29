@@ -1,4 +1,4 @@
-"""``python -m lizzard app.py [args]``: run a program, checking it if it is a lizzard module."""
+"""``python -m lizzard app.py [args]``: run a program, checking it if it is a Lizzard module."""
 
 import os
 import sys

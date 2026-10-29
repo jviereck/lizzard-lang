@@ -32,7 +32,7 @@ pub use lizzard_ext::{
 
 mod load;
 
-/// A lizzard interpreter with native modules.
+/// A Lizzard interpreter with native modules.
 pub struct Runtime {
     modules: Vec<lizzard_vm::native::Module>,
     /// Report objects still alive at exit (`--rc-audit`).

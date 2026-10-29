@@ -1,4 +1,4 @@
-//! The lizzard compiler: AST to register bytecode with ownership checking.
+//! The Lizzard compiler: AST to register bytecode with ownership checking.
 
 mod compiler;
 mod imports;

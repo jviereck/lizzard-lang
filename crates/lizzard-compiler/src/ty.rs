@@ -61,7 +61,7 @@ pub enum Ty {
     Local(Box<Ty>),
 }
 
-/// The lizzard type of an array element read.
+/// The Lizzard type of an array element read.
 pub fn elem_ty(e: Elem) -> Ty {
     match e {
         Elem::F32 | Elem::F64 => Ty::Float,

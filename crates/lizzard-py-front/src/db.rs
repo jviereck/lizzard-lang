@@ -1,10 +1,10 @@
 //! Modules, definition files and types.
 //!
-//! Every imported module is backed by up to two files: a lizzard overlay
+//! Every imported module is backed by up to two files: a Lizzard overlay
 //! (`<overlay root>/numpy/__init__.pyi`) and the module's own `.pyi`/`.py`
 //! (the base). Files are parsed when the module is first imported; names are
 //! resolved lazily, so only the declarations a program actually reaches are
-//! evaluated. Declarations lizzard cannot understand degrade to `Any`.
+//! evaluated. Declarations Lizzard cannot understand degrade to `Any`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub struct Env {
     pub version: (u32, u32),
     pub platform: String,
     /// Top-level standard library modules: imported as opaque (`Any`) until
-    /// lizzard bundles typeshed.
+    /// Lizzard bundles typeshed.
     pub stdlib: HashSet<String>,
     /// The installed version of a distribution, for overlay headers.
     pub pkg_version: PkgVersion,
@@ -126,7 +126,7 @@ pub enum Sym {
     Special(Special),
     /// A builtin type name (`int`, `tuple`, ...) as the type it denotes.
     Builtin(Ty),
-    /// A variable assigned at the top level of a lizzard module.
+    /// A variable assigned at the top level of a Lizzard module.
     UserVar,
 }
 
@@ -238,7 +238,7 @@ pub struct Module {
     pub file: Option<FileId>,
     is_package: bool,
     kind: ModKind,
-    /// A lizzard module: its declarations are checked strictly.
+    /// A Lizzard module: its declarations are checked strictly.
     pub user: bool,
     decls: HashMap<String, Decl>,
     syms: HashMap<String, Sym>,
@@ -267,7 +267,7 @@ pub struct Db {
     pub aliases: Vec<AliasInfo>,
     alias_keys: HashMap<(ModId, String), AliasId>,
     /// Non-generic aliases by target, with their qualified name and whether
-    /// they come from a lizzard module: `floating[_32Bit]` -> `numpy.float32`.
+    /// they come from a Lizzard module: `floating[_32Bit]` -> `numpy.float32`.
     reverse_alias: HashMap<Ty, (String, bool)>,
     aliases_resolved: HashSet<ModId>,
     pub diags: Vec<(FileId, u32, String)>,
@@ -375,7 +375,7 @@ impl Db {
         }
     }
 
-    /// Report an error in a lizzard module (declarations elsewhere degrade
+    /// Report an error in a Lizzard module (declarations elsewhere degrade
     /// silently).
     pub fn err(&mut self, m: ModId, off: u32, msg: impl Into<String>) {
         if self.modules[m].user {
@@ -387,7 +387,7 @@ impl Db {
 
     // ---- modules ----
 
-    /// Parse a lizzard module and register it under `name`.
+    /// Parse a Lizzard module and register it under `name`.
     pub fn add_user_module(&mut self, name: &str, path: &str, text: &str) -> Result<(ModId, Vec<Stmt>), String> {
         let parsed = ruff_python_parser::parse_module(text);
         let file = self.add_file(path.to_string(), text.to_string());
@@ -1156,7 +1156,7 @@ impl Db {
                     },
                     Some(Sym::Special(Special::Final | Special::ClassVar)) => args.first().map_or(Ty::Any, |a| self.eval_type(a, sc)),
                     Some(Sym::Special(Special::Union | Special::Optional)) => {
-                        self.err(sc.m, off, "union types are not supported by lizzard yet");
+                        self.err(sc.m, off, "union types are not supported by Lizzard yet");
                         Ty::Any
                     }
                     _ => {
@@ -1166,7 +1166,7 @@ impl Db {
                 }
             }
             Expr::BinOp(b) if b.op == ast::Operator::BitOr => {
-                self.err(sc.m, off, "union types are not supported by lizzard yet");
+                self.err(sc.m, off, "union types are not supported by Lizzard yet");
                 Ty::Any
             }
             _ => {

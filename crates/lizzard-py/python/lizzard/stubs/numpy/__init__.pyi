@@ -1,6 +1,6 @@
 # lizzard: overlay numpy>=2.2,<3
 # type: ignore  (an overlay is only meaningful merged onto NumPy's own stubs)
-# lizzard's overlay for NumPy. The members declared here replace NumPy's own
+# Lizzard's overlay for NumPy. The members declared here replace NumPy's own
 # declarations of the same name: a class re-declared here keeps NumPy's bases
 # and type parameters and only swaps the members listed. Everything else,
 # including `numpy.typing`, the scalar types and `dtype`, comes from NumPy's

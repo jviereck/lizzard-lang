@@ -1,7 +1,7 @@
-"""Import hook for lizzard modules.
+"""Import hook for Lizzard modules.
 
 A ``.py`` file whose first lines contain ``# lizzard: module`` is checked by
-lizzard before it runs: its functions are replaced by lizzard functions, and its
+Lizzard before it runs: its functions are replaced by Lizzard functions, and its
 top level runs on CPython as usual.
 """
 
@@ -18,7 +18,7 @@ MARKER = "# lizzard: module"
 
 
 class CheckError(Exception):
-    """A lizzard module failed to type-check; ``diagnostics`` lists the errors."""
+    """A Lizzard module failed to type-check; ``diagnostics`` lists the errors."""
 
     def __init__(self, diagnostics):
         self.diagnostics = list(diagnostics)

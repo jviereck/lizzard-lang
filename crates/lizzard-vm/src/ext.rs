@@ -222,7 +222,7 @@ unsafe extern "C" fn list_snapshot(v: RawValue, out: *mut RawValue, cap: usize) 
     unsafe { write_values(items.into_iter(), out, cap) }
 }
 
-/// `x` checked like a lizzard store into list `l` (consumed on error).
+/// `x` checked like a Lizzard store into list `l` (consumed on error).
 fn admit_elem(l: &crate::list::ListObj, x: Value) -> Result<Value, LizzardError> {
     let lt = rtype::as_type(l.ty).unwrap();
     let et = rtype::as_type(rtype::elem_of(lt)).unwrap();

@@ -1,4 +1,4 @@
-//! Rust bindings: native functions and classes called from lizzard.
+//! Rust bindings: native functions and classes called from Lizzard.
 //!
 //! One test function runs the scenarios in order, so the live-object count
 //! (process-wide) can be checked after each program.
@@ -80,7 +80,7 @@ fn runtime() -> (Runtime, Log) {
                 a.0
             });
             c.method_mut("add_via", |ctx: &mut Ctx, a: &mut Acc, f: Func| -> Result<i64, LizzardError> {
-                // Calling back into lizzard while holding `&mut Acc`.
+                // Calling back into Lizzard while holding `&mut Acc`.
                 let n: i64 = ctx.call(&f, ())?;
                 a.0 += n;
                 Ok(a.0)
@@ -113,7 +113,7 @@ fn runtime() -> (Runtime, Log) {
             g.class_not_send::<Native<Point>, _>(stack::<Native<Point>>);
         });
         // A Rust trait, implemented by a Rust class (with builtin `Len` and
-        // `Ord` through dunders) and by lizzard classes.
+        // `Ord` through dunders) and by Lizzard classes.
         m.trait_def("Shape", |t| {
             t.method::<(), f64>("area");
             t.method::<(f64,), ()>("scale");
@@ -377,7 +377,7 @@ def main() -> ():
 "#);
     assert_eq!(l, ["1200"]);
 
-    // Not Send: a binding over a non-`Send` Rust type is a non-`Send` lizzard
+    // Not Send: a binding over a non-`Send` Rust type is a non-`Send` Lizzard
     // class, so instances never leave their thread. `Any`/`Func` handles are
     // `any`/`function`, which may hold values that are not `Send`.
     let l = ok(r#"

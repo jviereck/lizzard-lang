@@ -1,11 +1,11 @@
-//! Native modules: Rust functions and classes callable from lizzard.
+//! Native modules: Rust functions and classes callable from Lizzard.
 //!
 //! This is the interpreter's side. Extensions build modules through the C
 //! ABI of `lizzard-abi` (see `ext.rs`), with the binding API of `lizzard-ext`
 //! (closures, conversions, class builders); statically embedded modules do
 //! the same. A [`Module`] is built before a program is compiled. The
-//! compiler sees each item's signature as lizzard types ([`NType`]), so calls
-//! of natives are checked like calls of lizzard functions.
+//! compiler sees each item's signature as Lizzard types ([`NType`]), so calls
+//! of natives are checked like calls of Lizzard functions.
 //!
 //! A native class wraps a Rust value the interpreter does not look into:
 //! an opaque pointer that the extension's drop function frees. Its mode
@@ -13,7 +13,7 @@
 //! - [`Mode::Sync`] (`T: Send + Sync`): shared calls run concurrently from
 //!   any thread; exclusive (`&mut self`) calls are exclusive.
 //! - [`Mode::Send`] (`T: Send`): every method call is exclusive.
-//! - [`Mode::Local`] (any `T`): the lizzard class is not `Send` either, so
+//! - [`Mode::Local`] (any `T`): the Lizzard class is not `Send` either, so
 //!   instances stay on the thread that created them, which is also checked
 //!   on every call (`ThreadError`), and are dropped there.
 //!
@@ -27,7 +27,7 @@
 //! dispatches to the class registered for `int`, and other type arguments
 //! raise `TypeError`.
 //!
-//! A module may define traits that its classes implement, as may lizzard
+//! A module may define traits that its classes implement, as may Lizzard
 //! structs. A class may also implement the builtin `Ord`, `Num` and `Len`
 //! through its dunder methods.
 
@@ -47,7 +47,7 @@ use crate::value::Value;
 
 // ---------------------------------------------------------------- types
 
-/// A lizzard type, as the compiler sees a native's parameters and result.
+/// A Lizzard type, as the compiler sees a native's parameters and result.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NType {
     Int,
@@ -150,11 +150,11 @@ pub(crate) fn decode_sig(mut b: &[u8]) -> Option<(Vec<NType>, NType)> {
 
 // ---------------------------------------------------------------- errors
 
-/// An error raised in lizzard as an exception of class `kind`.
+/// An error raised in Lizzard as an exception of class `kind`.
 pub(crate) struct LizzardError {
     pub kind: String,
     pub msg: String,
-    /// A lizzard exception raised by a callback, re-raised unchanged.
+    /// A Lizzard exception raised by a callback, re-raised unchanged.
     pending: Option<PendingExc>,
 }
 
@@ -675,7 +675,7 @@ impl Module {
     }
 
     /// Adds a trait whose methods are all required, for classes of this
-    /// module (defined after it) and lizzard structs to implement.
+    /// module (defined after it) and Lizzard structs to implement.
     pub(crate) fn add_trait(&mut self, name: &str, methods: Vec<FnSpec>) -> Result<(), String> {
         if self.traits.iter().any(|(t, _)| t.name == name) {
             return Err(format!("module `{}` defines trait `{name}` twice", self.name));

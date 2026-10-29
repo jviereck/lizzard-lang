@@ -155,7 +155,7 @@ pub struct ArgList {
     /// Some argument is a borrow of a field/element/global: the call pins the
     /// thread's epoch so the borrowed object outlives the call.
     pub pins: bool,
-    /// The callee is a known, non-generic lizzard function without `keep`
+    /// The callee is a known, non-generic Lizzard function without `keep`
     /// parameters, and the compiler proved the arguments' types: the call
     /// skips the generic argument handling and the parameter checks.
     pub fast: bool,

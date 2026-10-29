@@ -1,7 +1,7 @@
-"""End-to-end tests of lizzard's typed-Python slice: the NumPy example, the
+"""End-to-end tests of Lizzard's typed-Python slice: the NumPy example, the
 float32 fast path, runtime checks and diagnostics.
 
-Every program runs in a fresh subprocess, under lizzard and under plain CPython.
+Every program runs in a fresh subprocess, under Lizzard and under plain CPython.
 """
 
 import os
@@ -181,7 +181,7 @@ class Checker(unittest.TestCase):
             "name `undefined` is not defined",
             "`g` returns str, but this returns int",
             "parameter `a` needs a type annotation",
-            "this statement is not supported by lizzard yet",
+            "this statement is not supported by Lizzard yet",
             "argument `a` of f(): expected int, got str",
         ])
 

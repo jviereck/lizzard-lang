@@ -5,7 +5,7 @@ import numpy.typing as npt
 
 def add(a: npt.NDArray[np.float32], b: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     # A normal call into NumPy: the overlay resolves float32 + float32 to NDArray[float32],
-    # and lizzard checks the result's type and dtype when the call returns.
+    # and Lizzard checks the result's type and dtype when the call returns.
     return a + b
 
 

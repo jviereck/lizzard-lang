@@ -1149,7 +1149,7 @@ pub extern "C" fn f_call(th: &mut Thread, frame: &mut Frame, dst: u32, func: u32
 /// An `ArgList::fast` call of `f` (with `recv` as `self` for a method):
 /// the arguments' types are proven, so they are passed as they are and the
 /// callee starts after its parameter checks. `None` if `f` is not a plain
-/// lizzard function of that arity.
+/// Lizzard function of that arity.
 fn call_fast(th: &mut Thread, frame: &mut Frame, f: Value, recv: Option<Value>, al: &ArgList, dst: u32) -> Option<u32> {
     let Some(Body::Function(func)) = f.body() else { return None };
     let code = &func.code;

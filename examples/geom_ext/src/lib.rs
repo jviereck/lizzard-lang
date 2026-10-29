@@ -1,4 +1,4 @@
-//! The `geom` module: Rust functions, classes and a trait for lizzard.
+//! The `geom` module: Rust functions, classes and a trait for Lizzard.
 //!
 //! Built two ways from this one definition:
 //! - an extension library (`libgeom.so` / `libgeom.dylib`), which the
@@ -32,7 +32,7 @@ impl Polygon {
     }
 }
 
-/// A generic Rust type: lizzard sees `Stack<T>` for the registered `T`s.
+/// A generic Rust type: Lizzard sees `Stack<T>` for the registered `T`s.
 struct Stack<T> {
     items: Vec<T>,
 }
@@ -57,7 +57,7 @@ pub fn build(m: &mut Module) {
         c.method("inc", |c: &Counter| c.0.fetch_add(1, Ordering::Relaxed) + 1);
         c.method("get", |c: &Counter| c.0.load(Ordering::Relaxed));
     });
-    // A trait for Rust and lizzard classes alike.
+    // A trait for Rust and Lizzard classes alike.
     m.trait_def("Shape", |t| {
         t.method::<(), f64>("area");
     });

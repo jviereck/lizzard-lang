@@ -1,4 +1,4 @@
-//! The C ABI between the lizzard interpreter and native extension modules.
+//! The C ABI between the Lizzard interpreter and native extension modules.
 //!
 //! An extension is a dynamic library (a Rust `cdylib` built with `lizzard-ext`)
 //! that exports two functions:
@@ -14,7 +14,7 @@
 //! the functions of [`LizzardApi`] interpret, every object is freed by the side
 //! that allocated it (the interpreter calls an extension's [`FreeFn`]s), and
 //! strings cross as borrowed [`Str`]s that the receiver copies. So an
-//! extension built by another compiler, or against another build of lizzard,
+//! extension built by another compiler, or against another build of Lizzard,
 //! works as long as the ABI version matches.
 //!
 //! Panics must not cross the boundary: the extension catches them in its
@@ -28,7 +28,7 @@ use std::ffi::c_void;
 /// the descriptors.
 pub const ABI_VERSION: u32 = 2;
 
-/// A lizzard value: opaque bits. Each function says whether it borrows or
+/// A Lizzard value: opaque bits. Each function says whether it borrows or
 /// takes (consumes) a value it is given, and whether a value it returns is
 /// owned (the caller must `decref` it) or borrowed.
 pub type RawValue = u64;
@@ -301,7 +301,7 @@ pub struct LizzardApi {
 
     // ---- errors and calls
     /// Copies an error's exception class and message; true if it carries a
-    /// lizzard exception (raised by a callback), which `err_raise` re-raises.
+    /// Lizzard exception (raised by a callback), which `err_raise` re-raises.
     pub err_read: unsafe extern "C" fn(e: HostErr, kind: StrOut, msg: StrOut) -> bool,
     pub err_free: unsafe extern "C" fn(e: HostErr),
     /// Raises (and consumes) `e`.

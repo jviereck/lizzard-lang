@@ -1,5 +1,5 @@
 //! Embedding lizzard: the native `geom` module (`examples/geom_ext`), linked
-//! into this program and registered statically, used from a lizzard script.
+//! into this program and registered statically, used from a Lizzard script.
 //! The same script runs with the `lizzard` interpreter, which loads the module
 //! as an extension library instead.
 

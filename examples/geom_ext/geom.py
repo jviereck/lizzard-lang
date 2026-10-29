@@ -4,7 +4,7 @@ def count(c: Counter, n: int) -> ():
     for i in range(n):
         c.inc()
 
-# `Shape` is defined in Rust; lizzard structs implement it too.
+# `Shape` is defined in Rust; Lizzard structs implement it too.
 struct Circle:
     r: float
 
@@ -50,7 +50,7 @@ def main() -> ():
     square.add(0.0, 2.0)
     print(square, "area:", square.area(), "points:", len(square))
 
-    # Any `Shape`, Rust or lizzard.
+    # Any `Shape`, Rust or Lizzard.
     shapes: list<Shape> = [square++, Circle { r: 1.0 }]
     for s in shapes:
         print("shape area:", s.area())

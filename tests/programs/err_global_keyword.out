@@ -1,5 +1,5 @@
   File "err_global_keyword.py", line 3
         global count
         ^
-SyntaxError: lizzard has no module variables, so no `global`: pass values as arguments, or keep them in a struct
+SyntaxError: Lizzard has no module variables, so no `global`: pass values as arguments, or keep them in a struct
 [exit 1]

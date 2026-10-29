@@ -1,5 +1,5 @@
 //! Front-end tests against small fixture stubs (`fixtures/site` is the
-//! package's own layer, `fixtures/overlay` lizzard's overlay).
+//! package's own layer, `fixtures/overlay` Lizzard's overlay).
 
 use std::path::PathBuf;
 
@@ -84,5 +84,5 @@ fn overlay_with_wrong_version_is_ignored() {
 #[test]
 fn unsupported_constructs_are_reported() {
     let d = check("class C:\n    pass\n\ndef f(x: int | None) -> None:\n    pass\n");
-    assert_eq!(d, ["classes are not supported by lizzard yet", "union types are not supported by lizzard yet"]);
+    assert_eq!(d, ["classes are not supported by Lizzard yet", "union types are not supported by Lizzard yet"]);
 }

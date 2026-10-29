@@ -212,7 +212,7 @@ impl Parser {
                 }
                 Ok((mk(StmtKind::FromImport { module, names }), false))
             }
-            Tok::Global => Err(Error::syntax("lizzard has no module variables, so no `global`: pass values as arguments, or keep them in a struct", self.span())),
+            Tok::Global => Err(Error::syntax("Lizzard has no module variables, so no `global`: pass values as arguments, or keep them in a struct", self.span())),
             Tok::Del => {
                 self.advance();
                 let mut targets = vec![self.expr()?];

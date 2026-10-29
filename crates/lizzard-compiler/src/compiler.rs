@@ -237,7 +237,7 @@ pub struct TraitInfo {
     pub tparams: Vec<TParamSig>,
     pub methods: HashMap<String, Sig>,
     /// Defined by a native module: every method is required, and only Rust
-    /// classes (`c.implements`) or lizzard structs (`impl T for S`) implement it.
+    /// classes (`c.implements`) or Lizzard structs (`impl T for S`) implement it.
     pub native: bool,
 }
 
@@ -682,7 +682,7 @@ fn ntype_ty(t: &NType, classes: &NativeNames) -> Ty {
     }
 }
 
-/// The lizzard name and type arguments of the native class over each Rust
+/// The Lizzard name and type arguments of the native class over each Rust
 /// type, by class key (`geom.Stack`, `[int]` for an instantiation of a
 /// generic class).
 type NativeNames = HashMap<u64, (String, Vec<NType>)>;
@@ -4789,7 +4789,7 @@ impl<'m> FnCtx<'m> {
             self.option_check(&r, &format!("calling `.{mname}()`"), span)?;
         }
         let mut sig: Option<Sig> = None;
-        // An inherent method of a non-generic lizzard struct: `ArgList::fast` may apply.
+        // An inherent method of a non-generic Lizzard struct: `ArgList::fast` may apply.
         let mut plain = false;
         // The trait whose method this is: the call is qualified with it.
         let mut qual: Option<String> = force.map(String::from);

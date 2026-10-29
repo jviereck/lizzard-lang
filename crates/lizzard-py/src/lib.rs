@@ -1,4 +1,4 @@
-//! `lizzard._lizzard`: compiles lizzard modules (typed Python) and runs their
+//! `lizzard._lizzard`: compiles Lizzard modules (typed Python) and runs their
 //! functions inside CPython.
 
 mod array;
@@ -14,7 +14,7 @@ use pyo3::types::{PyDict, PyList};
 
 use interp::{FuncRt, LizzardFunction};
 
-/// The checked and lowered functions of one lizzard module.
+/// The checked and lowered functions of one Lizzard module.
 #[pyclass(frozen, module = "lizzard._lizzard")]
 struct CompiledModule {
     funcs: Vec<Arc<FuncRt>>,
@@ -42,7 +42,7 @@ fn paths(env: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<PathBuf>> {
     Ok(v.into_iter().map(PathBuf::from).collect())
 }
 
-/// Check and lower a lizzard module. Returns `(module or None, diagnostics,
+/// Check and lower a Lizzard module. Returns `(module or None, diagnostics,
 /// warnings)`; the module is `None` when there are diagnostics.
 #[pyfunction]
 fn compile_module<'py>(py: Python<'py>, source: &str, path: &str, name: &str, env: &Bound<'py, PyDict>) -> PyResult<(Option<CompiledModule>, Bound<'py, PyList>, Bound<'py, PyList>)> {

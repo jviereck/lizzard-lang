@@ -97,7 +97,7 @@ thread_local! {
 /// A spawned thread's last step: hands its queues to the orphan queue
 /// before it reports that it finished. (The thread-local state is only
 /// dropped later, when the OS thread exits, which shutdown cannot wait for.)
-/// The thread must not touch lizzard values afterwards.
+/// The thread must not touch Lizzard values afterwards.
 pub(crate) fn thread_exit() {
     RC.with(|rc| rc.borrow_mut().hand_off());
     flush_live();

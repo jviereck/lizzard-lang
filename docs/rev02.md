@@ -1,7 +1,7 @@
-# lizzard as typed Python: design outline
+# Lizzard as typed Python: design outline
 
 ## Context
-lizzard pivots from its own Rust-flavoured language to **typed Python**. A lizzard module is a normal `.py` file that runs unchanged under CPython. lizzard adds three things:
+Lizzard pivots from its own Rust-flavoured language to **typed Python**. A Lizzard module is a normal `.py` file that runs unchanged under CPython. Lizzard adds three things:
 1. a **static type checker** that requires annotations where compilation needs them;
 2. **type definition files** for the Python modules it imports, so code using NumPy, the stdlib or any Python library stays well typed;
 3. a **Cranelift JIT** that compiles the module's functions into native code running inside CPython 3.14t (free-threaded). Values are real `PyObject*`s, and memory is CPython's normal reference counting.
@@ -15,8 +15,8 @@ Everything Rust-inspired is dropped:
 Classes, inheritance, module globals and the top level all behave exactly as in Python. Reference-count elision and deferred cleanup are possible later optimizations, with no new syntax.
 
 ## 1. Principles
-1. **Valid, runnable Python.** A lizzard module has the same behaviour under plain CPython; lizzard only checks and compiles it.
-2. **Annotations are checked assertions.** A value entering an annotated position from untyped or Python code is checked. A mismatch raises `TypeError`. This is lizzard's existing rule. Plain CPython runs no checks, so a program that passes them behaves identically in both modes.
+1. **Valid, runnable Python.** A Lizzard module has the same behaviour under plain CPython; Lizzard only checks and compiles it.
+2. **Annotations are checked assertions.** A value entering an annotated position from untyped or Python code is checked. A mismatch raises `TypeError`. This is Lizzard's existing rule. Plain CPython runs no checks, so a program that passes them behaves identically in both modes.
 3. **Checks where compiled code relies on a type.** Compiled code relies on a type, by unboxing or reading an attribute at a fixed offset, only after a check that guarantees it: an exact-type pointer comparison, `isinstance`, or a guard on the type's version tag. Everything else is a normal CPython operation, so a wrong type is a Python exception, never a memory error.
 4. **Python semantics throughout:** aliasing on assignment, CPython reference counting and cycle GC, inheritance, mutable classes and globals.
 
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     print(energy(np.ones(10)), sys.argv[1:])
 ```
 - **Opt-in:** the pragma comment `# lizzard: module` in the first lines marks a module. Other modules stay plain Python.
-- **Top level** is unrestricted Python. CPython's own interpreter runs it once at import, after lizzard has checked it statically. lizzard compiles every function, method and lambda the module defines.
+- **Top level** is unrestricted Python. CPython's own interpreter runs it once at import, after Lizzard has checked it statically. Lizzard compiles every function, method and lambda the module defines.
 - **Entry point:** the usual `if __name__ == "__main__":` block. Run with `python app.py`, or with `python -m lizzard app.py` to compile the entry module itself, since modules are otherwise compiled only when imported.
 
 ## 3. Typing rules
@@ -69,7 +69,7 @@ if __name__ == "__main__":
 - **Generics are kept for precise checking, not erased.**
   - **Statically,** the checker tracks full generic types (PEP 695 classes and functions, `list[T]`, `dict[K, V]`, ...).
   - **Generic class instances** built by compiled code record their type arguments in `__orig_class__`, the same attribute `Box[int](...)` sets under CPython. A `Box[int]` passed where `Box[str]` is expected then fails at the boundary, even when it comes through untyped Python code.
-  - **Generic functions** receive their type arguments as hidden parameters (as lizzard does today), so checks inside them know the concrete `T`.
+  - **Generic functions** receive their type arguments as hidden parameters (as Lizzard does today), so checks inside them know the concrete `T`.
   - **Builtin containers** can't carry type arguments. A `list[float]` coming from Python therefore has its elements checked when they are read, an exact-type comparison.
 - **No extra scalar types.** Standard Python types only:
   - `float` is a C double, unboxed in compiled code.
@@ -78,7 +78,7 @@ if __name__ == "__main__":
   - `npt.NDArray[np.float64]`, or the shape-typed `np.ndarray[tuple[int, int], np.dtype[np.float64]]` when the number of dimensions is known.
   - The dtype (and number of dimensions, if declared) is checked once at a boundary.
   - Element access compiles to bounds-checked loads through the array's strides, unboxed to NumPy's scalar types (`np.float64`, `np.int32`, ...).
-- **Rejected in lizzard modules** with a clear error, unless written behind `Any`:
+- **Rejected in Lizzard modules** with a clear error, unless written behind `Any`:
   - dynamic constructs the checker can't type, such as `exec`, `eval`, `globals()[...]` writes and `setattr` with a computed name;
   - unannotated `def`s.
 
@@ -93,8 +93,8 @@ How the compiler keeps them fast:
 ## 5. Type definition files for Python imports
 **Format.** Plain `.pyi` syntax with standard typing, including `@final` and NumPy's array types. Nothing lizzard-specific.
 
-**Lookup order when a lizzard module imports `m`:**
-1. **lizzard definition files** on `LIZZARD_STUBS_PATH`, or in a `lizzard-stubs/m/` package. These are authoritative.
+**Lookup order when a Lizzard module imports `m`:**
+1. **Lizzard definition files** on `LIZZARD_STUBS_PATH`, or in a `lizzard-stubs/m/` package. These are authoritative.
 2. **The package's own `.pyi` files** (`py.typed`).
 3. **Bundled typeshed stubs** for the stdlib.
 4. **No definitions:** the module is `Any`. Its results become typed only when annotated, e.g. `x: float = m.f()`, which checks the value on assignment.
@@ -114,10 +114,10 @@ How the compiler keeps them fast:
 
 **Tooling:**
 - `lizzard stubgen m` bootstraps a definition file from runtime introspection plus any existing `.pyi`.
-- lizzard modules need no definition files: they are fully annotated Python that pyright and mypy read directly.
+- Lizzard modules need no definition files: they are fully annotated Python that pyright and mypy read directly.
 
-## 6. Mapping from current lizzard
-| current lizzard | becomes |
+## 6. Mapping from current Lizzard
+| current Lizzard | becomes |
 |---|---|
 | `struct` + `impl`, `class C(impl T)` | a normal `class` (use `__slots__`/`@final` for speed) |
 | `trait`, bounds, `impl Trait for X` | `Protocol` / ABC, PEP 695 bounds (`def f[T: Sized](x: T)`) |
@@ -152,9 +152,9 @@ How the compiler keeps them fast:
   - functions as vectorcall objects: a checked entry for Python callers, and a direct native entry for compiled-to-compiled calls;
   - traceback entries for compiled frames;
   - an on-disk cache of compiled code, keyed by source hash and CPython version.
-- **New `python/lizzard/`:** a tiny pure-Python package for `python -m lizzard` and the `lizzard check` / `lizzard stubgen` commands. lizzard modules don't need to import it.
+- **New `python/lizzard/`:** a tiny pure-Python package for `python -m lizzard` and the `lizzard check` / `lizzard stubgen` commands. Lizzard modules don't need to import it.
 - **Retired:**
-  - **`crates/lizzard-vm`:** the interpreter, `rc.rs`, lizzard's own dict/list/str, traits and generics registry.
+  - **`crates/lizzard-vm`:** the interpreter, `rc.rs`, Lizzard's own dict/list/str, traits and generics registry.
   - **`lizzard-abi`/`lizzard-ext`:** Rust extensions become ordinary Python extension modules.
 
   Ideas to carry over: the inline-cache layout, unboxed float arithmetic, compare-and-jump fusion, and the benchmark suite.
@@ -174,7 +174,7 @@ How the compiler keeps them fast:
 7. **Later, optional:** an analysis that removes redundant reference-count operations, and deferred decrefs for realtime use.
 
 ## Verification
-- **Dual-run goldens:** every `tests/programs/*.py` runs (a) under plain `python3.14t` and (b) compiled by lizzard. Both must match the `.out` file.
+- **Dual-run goldens:** every `tests/programs/*.py` runs (a) under plain `python3.14t` and (b) compiled by Lizzard. Both must match the `.out` file.
 - **Checker errors:** error goldens for checker diagnostics (missing annotations, type errors, narrowing, definition mismatches), run through `lizzard check`.
 - **Boundary tests:** deliberately wrong definition files and monkey-patched classes must raise or take the generic path, never crash. Run under a debug CPython build and with `PYTHONMALLOC=debug`.
 - **Reference-count audit:** `sys.gettotalrefcount` on a debug build before and after each golden, to catch leaks and over-decrefs in generated code.
