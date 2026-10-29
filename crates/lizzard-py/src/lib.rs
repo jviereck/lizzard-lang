@@ -2,8 +2,10 @@
 //! functions inside CPython.
 
 mod array;
+mod frame;
 mod generator;
 mod interp;
+mod jit;
 mod rt;
 
 use std::path::PathBuf;

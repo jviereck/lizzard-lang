@@ -173,11 +173,13 @@ class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
         for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS):
             with self.subTest(prog.name):
-                lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))
-                self.assertEqual(lizzard[0], 0, lizzard[2])
                 self.assertEqual(plain[0], 0, plain[2])
-                self.assertEqual(lizzard[1], plain[1])
+                # Compiled (the default) and interpreted.
+                for jit in ("1", "0"):
+                    lizzard = run("-m", "lizzard", str(prog), env={"LIZZARD_JIT": jit})
+                    self.assertEqual(lizzard[0], 0, lizzard[2])
+                    self.assertEqual(lizzard[1], plain[1], f"LIZZARD_JIT={jit}")
 
     def test_methods_are_compiled(self):
         code, out, err = run("-c", textwrap.dedent("""\

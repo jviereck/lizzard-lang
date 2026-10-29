@@ -252,6 +252,14 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 **Strict attribute access.** Every attribute read, write, `del`, call and operator must be declared: in the class or a base class, in a definition file, or among `object`'s and `type`'s own attributes (`__class__`, `__dict__`, `__name__`, `__mro__`, ...). There is no fallback to `Any`. A class deriving from a class nothing defines (an opaque standard-library module's, say `queue.Queue`) can still be written, but using a member it does not declare itself, or constructing it, is an error that names the untyped base. Exception classes get the builtin exceptions' attributes (`args`, `__cause__`, `errno` for `OSError`, ...).
 - **Standard-library definitions** live next to the bundled overlays (`python/lizzard/stubs/<module>.pyi`). A standard-library module with such a file is read from it alone; the others stay opaque. `threading` is the first: `Thread` (and subclasses of it), `Timer`, `Lock`, `RLock`, `Condition`, `Semaphore`, `BoundedSemaphore`, `Event`, `Barrier` and the module functions.
 
+**JIT (`crates/lizzard-jit`, Cranelift).** Functions are compiled to native code the first time they run (`LIZZARD_JIT=0` keeps everything in the interpreter; `LIZZARD_JIT_DUMP=1` prints the Cranelift IR).
+- **One frame for both engines.** Registers are 8-byte slots (`frame.rs`): an owned `PyObject*` (null while unbound), an `i64`, an `f32` or a bool. The interpreter, generators and compiled code all work on it, so a generator's frame can be resumed by either engine.
+- **Compiled code** is `fn(ctx, regs, *pc, pending) -> status`. It does the control flow natively: jumps and branches, the unboxed `i64`/`f32`/bool instructions, exception handler dispatch (each instruction's innermost handler is known statically), the entries a generator resumes at (after a `yield`, or at it with an exception pending for `throw`), and the exits (return, yield, error, leaving `*pc` where the interpreter would).
+- **Every other instruction calls the `step` helper**, which runs that one instruction with the interpreter's code: the two engines cannot disagree, and instructions move inline one by one (next: unboxed ints with overflow to `PyLong`, floats, attribute caches).
+- **Safepoints:** every 1024 loop back-edges, compiled code runs signal handlers and detaches briefly, so Ctrl-C and the free-threaded stop-the-world GC work in tight loops.
+- Cranelift is built optimized even in debug builds (workspace `Cargo.toml`); compiling then costs about a millisecond per function.
+- Every test program runs compiled and interpreted, and both must match CPython.
+
 **Behaviour decisions:**
 - **A type error in top-level code is a static error.** The example's last line therefore stops the import with a diagnostic. The runtime check is what Python callers see.
 - **`a[i]` on `npt.NDArray` (unknown ndim) is `Any`**, by the typing spec's rule for overloads matched through `Any`. The unboxed float32 path needs a shape-typed array: `np.ndarray[tuple[int], np.dtype[np.float32]]`.
@@ -281,5 +289,5 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;
 - decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
 - `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);
-- vectorcall entry points, the JIT, and safepoints;
+- vectorcall entry points; inline fast paths in compiled code (unboxed `int`/`float`, attribute caches); entering compiled code mid-loop (OSR);
 - direct access for other dtypes and dimensions.

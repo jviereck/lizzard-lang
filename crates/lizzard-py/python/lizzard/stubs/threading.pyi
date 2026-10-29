@@ -1,8 +1,9 @@
 # Lizzard's definitions for the standard `threading` module. A standard-library
 # module without such a file is opaque: Lizzard code can call into it, but a
 # class deriving from one of its classes cannot be constructed or use members
-# it does not declare itself (the checker is strict and has nothing to go on). `threading.local` is left out on purpose: its instances
-# take arbitrary attributes, which a strict checker cannot follow.
+# it does not declare itself (the checker is strict and has nothing to go on).
+# `threading.local` is left out on purpose: its instances take arbitrary
+# attributes, which a strict checker cannot follow.
 from typing import Any, Callable, Protocol
 
 TIMEOUT_MAX: float

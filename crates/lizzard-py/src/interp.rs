@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyNameError, PyTypeError, PyUnboundLocalError, PyValueError};
+use pyo3::exceptions::{PyNameError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -13,6 +13,8 @@ use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PySet, PyString, PyTuple, 
 use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, ParamKind, Repr};
 
 use crate::array;
+use crate::frame::{unbound, Regs};
+use crate::jit;
 use crate::generator::{self, LizzardGenerator, Sent};
 use crate::rt;
 
@@ -21,6 +23,10 @@ pub type Table = Arc<OnceLock<HashMap<String, Arc<FuncRt>>>>;
 
 pub struct FuncRt {
     pub ir: FuncIr,
+    /// Which registers hold objects.
+    pub objs: Arc<[bool]>,
+    /// Its compiled code, once it has run (None if it cannot be compiled).
+    pub jit: OnceLock<Option<lizzard_jit::Entry>>,
     pub(crate) consts: Vec<Py<PyAny>>,
     names: Vec<Py<PyString>>,
     table: Table,
@@ -41,7 +47,8 @@ impl FuncRt {
             consts.push(o.unbind());
         }
         let names = ir.names.iter().map(|n| PyString::intern(py, n).unbind()).collect();
-        Ok(FuncRt { ir, consts, names, table })
+        let objs = ir.reprs.iter().map(|r| *r == Repr::Obj).collect();
+        Ok(FuncRt { ir, objs, jit: OnceLock::new(), consts, names, table })
     }
 }
 
@@ -246,15 +253,6 @@ fn check_args(py: Python<'_>, ir: &FuncIr, bound: &[Bound<'_, PyAny>]) -> PyResu
     Ok(())
 }
 
-/// A register.
-pub(crate) enum V<'py> {
-    Empty,
-    O(Bound<'py, PyAny>),
-    I(i64),
-    F(f32),
-    B(bool),
-}
-
 /// How execution leaves a function's frame. The frame (registers and pc) is
 /// left as it was, so a generator can resume it: these exits and the entry
 /// of `exec` (a pc, with an exception raised there or not) are the
@@ -268,14 +266,10 @@ pub(crate) enum Exit<'py> {
     YieldFrom { value: Bound<'py, PyAny>, dst: u32, iter: Bound<'py, PyAny> },
 }
 
-fn unbound() -> PyErr {
-    PyUnboundLocalError::new_err("local variable referenced before assignment")
-}
-
 fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>, closure: &[Py<PyAny>]) -> PyResult<Py<PyAny>> {
-    let mut regs: Vec<V<'py>> = (0..f.ir.reprs.len()).map(|_| V::Empty).collect();
+    let mut regs = Regs::new(f.objs.clone());
     for (i, a) in args.into_iter().enumerate() {
-        regs[i] = V::O(a);
+        regs.set_obj(i as u32, a);
     }
     let mut pc = 0usize;
     match exec(py, f, globals, closure, &mut regs, &mut pc, None)? {
@@ -291,10 +285,15 @@ pub(crate) fn exec<'py>(
     f: &FuncRt,
     globals: &Bound<'py, PyDict>,
     closure: &[Py<PyAny>],
-    regs: &mut [V<'py>],
+    regs: &mut Regs,
     pc: &mut usize,
     mut pending: Option<PyErr>,
 ) -> PyResult<Exit<'py>> {
+    if jit::enabled() {
+        if let Some(entry) = jit::code(f) {
+            return jit::exec(py, entry, f, globals, closure, regs, pc, pending);
+        }
+    }
     let ir = &f.ir;
     loop {
         let r = match pending.take() {
@@ -311,7 +310,7 @@ pub(crate) fn exec<'py>(
                 let at = *pc as u32;
                 let handler = ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e));
                 if let Some(h) = handler {
-                    regs[h.exc as usize] = V::O(e.into_value(py).into_bound(py).into_any());
+                    regs.set_obj(h.exc, e.into_value(py).into_bound(py).into_any());
                     *pc = h.target as usize;
                     continue;
                 }
@@ -324,22 +323,8 @@ pub(crate) fn exec<'py>(
 }
 
 macro_rules! obj {
-    ($regs:expr, $r:expr) => {
-        match &$regs[$r as usize] {
-            V::O(o) => o,
-            V::Empty => return Err(unbound()),
-            _ => unreachable!("register {} is not an object", $r),
-        }
-    };
-}
-
-macro_rules! scalar {
-    ($regs:expr, $r:expr, $variant:ident) => {
-        match &$regs[$r as usize] {
-            V::$variant(x) => *x,
-            V::Empty => return Err(unbound()),
-            _ => unreachable!("register {} has the wrong representation", $r),
-        }
+    ($py:expr, $regs:expr, $r:expr) => {
+        $regs.obj($py, $r)?
     };
 }
 
@@ -381,40 +366,40 @@ fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>
 }
 
 /// Execute one instruction; `Some` when the function returns.
-fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut [V<'py>], pc: &mut usize) -> PyResult<Option<Exit<'py>>> {
+pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize) -> PyResult<Option<Exit<'py>>> {
     let ir = &f.ir;
     let instr = &ir.code[*pc];
     let mut next = *pc + 1;
     match instr {
-        Instr::Const { dst, idx } => regs[*dst as usize] = V::O(f.consts[*idx as usize].bind(py).clone()),
+        Instr::Const { dst, idx } => regs.set_obj(*dst, f.consts[*idx as usize].bind(py).clone()),
         Instr::LoadGlobal { dst, name } => {
             let n = f.names[*name as usize].bind(py);
             let v = match globals.get_item(n)? {
                 Some(v) => v,
                 None => builtins(py)?.getattr(n).map_err(|_| PyNameError::new_err(format!("name '{n}' is not defined")))?,
             };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
-        Instr::StoreGlobal { name, val } => globals.set_item(f.names[*name as usize].bind(py), obj!(regs, *val))?,
+        Instr::StoreGlobal { name, val } => globals.set_item(f.names[*name as usize].bind(py), obj!(py, regs, *val))?,
         Instr::MakeCell { dst } => {
             // SAFETY: NULL makes an empty cell; returns a new reference.
             let c = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyCell_New(std::ptr::null_mut()))? };
-            regs[*dst as usize] = V::O(c);
+            regs.set_obj(*dst, c);
         }
-        Instr::LoadCell { dst, cell } => match cell_get(py, obj!(regs, *cell))? {
-            Some(v) => regs[*dst as usize] = V::O(v),
+        Instr::LoadCell { dst, cell } => match cell_get(py, obj!(py, regs, *cell))? {
+            Some(v) => regs.set_obj(*dst, v),
             None => return Err(unbound()),
         },
-        Instr::StoreCell { cell, val } => cell_set(obj!(regs, *cell), obj!(regs, *val))?,
+        Instr::StoreCell { cell, val } => cell_set(obj!(py, regs, *cell), obj!(py, regs, *val))?,
         Instr::LoadFree { dst, idx } => match cell_get(py, closure[*idx as usize].bind(py))? {
-            Some(v) => regs[*dst as usize] = V::O(v),
+            Some(v) => regs.set_obj(*dst, v),
             None => {
                 let n = &f.ir.free[*idx as usize];
                 return Err(PyNameError::new_err(format!("cannot access free variable '{n}' where it is not associated with a value in enclosing scope")));
             }
         },
-        Instr::StoreFree { idx, val } => cell_set(closure[*idx as usize].bind(py), obj!(regs, *val))?,
-        Instr::LoadFreeCell { dst, idx } => regs[*dst as usize] = V::O(closure[*idx as usize].bind(py).clone()),
+        Instr::StoreFree { idx, val } => cell_set(closure[*idx as usize].bind(py), obj!(py, regs, *val))?,
+        Instr::LoadFreeCell { dst, idx } => regs.set_obj(*dst, closure[*idx as usize].bind(py).clone()),
         Instr::MakeFunction { dst, key, closure: cells, defaults } => {
             let key = f.names[*key as usize].bind(py).to_cow()?;
             let rt = f.table.get().and_then(|t| t.get(key.as_ref())).cloned().expect("inner function compiled with its module");
@@ -424,83 +409,79 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             };
             let mut cl = Vec::with_capacity(cells.len());
             for r in cells {
-                cl.push(obj!(regs, *r).clone().unbind());
+                cl.push(obj!(py, regs, *r).clone().unbind());
             }
             let mut dv = Vec::with_capacity(defaults.len());
             for r in defaults {
-                dv.push(obj!(regs, *r).clone().unbind());
+                dv.push(obj!(py, regs, *r).clone().unbind());
             }
             let func = Py::new(py, LizzardFunction::new(rt, globals.clone().unbind(), module, cl, dv))?;
-            regs[*dst as usize] = V::O(func.into_bound(py).into_any());
+            regs.set_obj(*dst, func.into_bound(py).into_any());
         }
         Instr::Move { dst, src } => {
-            let v = match &regs[*src as usize] {
-                V::Empty => return Err(unbound()),
-                V::O(o) => V::O(o.clone()),
-                V::I(i) => V::I(*i),
-                V::F(x) => V::F(*x),
-                V::B(b) => V::B(*b),
-            };
-            regs[*dst as usize] = v;
+            if !regs.is_bound(*src) {
+                return Err(unbound());
+            }
+            regs.copy(py, *dst, *src)?;
         }
         Instr::LoadAttr { dst, obj, name } => {
-            let v = obj!(regs, *obj).getattr(f.names[*name as usize].bind(py))?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *obj).getattr(f.names[*name as usize].bind(py))?;
+            regs.set_obj(*dst, v);
         }
         Instr::Call { dst, func, args, kwnames } => {
             let npos = args.len() - kwnames.len();
             let mut pos = Vec::with_capacity(npos);
             for r in &args[..npos] {
-                pos.push(obj!(regs, *r).clone());
+                pos.push(obj!(py, regs, *r).clone());
             }
             let kwargs = if kwnames.is_empty() {
                 None
             } else {
                 let d = PyDict::new(py);
                 for (r, n) in args[npos..].iter().zip(kwnames) {
-                    d.set_item(f.names[*n as usize].bind(py), obj!(regs, *r))?;
+                    d.set_item(f.names[*n as usize].bind(py), obj!(py, regs, *r))?;
                 }
                 Some(d)
             };
-            let v = obj!(regs, *func).call(PyTuple::new(py, pos)?, kwargs.as_ref())?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *func).call(PyTuple::new(py, pos)?, kwargs.as_ref())?;
+            regs.set_obj(*dst, v);
         }
         Instr::CallEx { dst, func, args, kwargs } => {
-            let a = obj!(regs, *args).cast::<PyTuple>().map_err(PyErr::from)?.clone();
+            let a = obj!(py, regs, *args).cast::<PyTuple>().map_err(PyErr::from)?.clone();
             let kw = match kwargs {
-                Some(k) => Some(obj!(regs, *k).cast::<PyDict>().map_err(PyErr::from)?.clone()),
+                Some(k) => Some(obj!(py, regs, *k).cast::<PyDict>().map_err(PyErr::from)?.clone()),
                 None => None,
             };
-            let v = obj!(regs, *func).call(a, kw.as_ref())?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *func).call(a, kw.as_ref())?;
+            regs.set_obj(*dst, v);
         }
         Instr::ListExtend { list, iter } => {
-            let l = obj!(regs, *list).cast::<PyList>().map_err(PyErr::from)?.clone();
-            for item in obj!(regs, *iter).try_iter()? {
+            let l = obj!(py, regs, *list).cast::<PyList>().map_err(PyErr::from)?.clone();
+            for item in obj!(py, regs, *iter).try_iter()? {
                 l.append(item?)?;
             }
         }
         Instr::ListToTuple { dst, src } => {
-            let t = obj!(regs, *src).cast::<PyList>().map_err(PyErr::from)?.to_tuple();
-            regs[*dst as usize] = V::O(t.into_any());
+            let t = obj!(py, regs, *src).cast::<PyList>().map_err(PyErr::from)?.to_tuple();
+            regs.set_obj(*dst, t.into_any());
         }
         Instr::DictMerge { dict, src, func } => {
-            let d = obj!(regs, *dict).cast::<PyDict>().map_err(PyErr::from)?.clone();
-            let src = obj!(regs, *src);
+            let d = obj!(py, regs, *dict).cast::<PyDict>().map_err(PyErr::from)?.clone();
+            let src = obj!(py, regs, *src);
             let keys = src.call_method0("keys").map_err(|_| {
                 PyTypeError::new_err(format!("argument after ** must be a mapping, not {}", src.get_type().name().map(|n| n.to_string()).unwrap_or_default()))
             })?;
             for k in keys.try_iter()? {
                 let k = k?;
                 if d.contains(&k)? {
-                    let fname = obj!(regs, *func).getattr("__qualname__").and_then(|n| n.extract::<String>()).unwrap_or_else(|_| "function".into());
+                    let fname = obj!(py, regs, *func).getattr("__qualname__").and_then(|n| n.extract::<String>()).unwrap_or_else(|_| "function".into());
                     return Err(PyTypeError::new_err(format!("{fname}() got multiple values for keyword argument '{}'", k.str()?)));
                 }
                 d.set_item(&k, src.get_item(&k)?)?;
             }
         }
         Instr::BinOp { dst, op, a, b, inplace } => {
-            let (x, y) = (obj!(regs, *a), obj!(regs, *b));
+            let (x, y) = (obj!(py, regs, *a), obj!(py, regs, *b));
             let v = if *inplace && *op == BinOp::Pow {
                 // SAFETY: valid objects in, a new reference or NULL out.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyNumber_InPlacePower(x.as_ptr(), y.as_ptr(), ffi::Py_None()))? }
@@ -540,87 +521,87 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
                     BinOp::RShift => x.rshift(y)?,
                 }
             };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
         Instr::Neg { dst, src } => {
-            let v = obj!(regs, *src).neg()?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *src).neg()?;
+            regs.set_obj(*dst, v);
         }
         Instr::Invert { dst, src } => {
-            let v = obj!(regs, *src).bitnot()?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *src).bitnot()?;
+            regs.set_obj(*dst, v);
         }
         Instr::Pos { dst, src } => {
-            let v = obj!(regs, *src).pos()?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *src).pos()?;
+            regs.set_obj(*dst, v);
         }
         Instr::BuildSet { dst, items } => {
             let set = PySet::empty(py)?;
             for r in items {
-                set.add(obj!(regs, *r))?;
+                set.add(obj!(py, regs, *r))?;
             }
-            regs[*dst as usize] = V::O(set.into_any());
+            regs.set_obj(*dst, set.into_any());
         }
         Instr::SetAdd { set, val } => {
-            obj!(regs, *set).cast::<PySet>().map_err(PyErr::from)?.add(obj!(regs, *val))?;
+            obj!(py, regs, *set).cast::<PySet>().map_err(PyErr::from)?.add(obj!(py, regs, *val))?;
         }
-        Instr::StoreAttr { obj, name, val } => obj!(regs, *obj).setattr(f.names[*name as usize].bind(py), obj!(regs, *val))?,
-        Instr::DelItem { obj, key } => obj!(regs, *obj).del_item(obj!(regs, *key))?,
-        Instr::DelAttr { obj, name } => obj!(regs, *obj).delattr(f.names[*name as usize].bind(py))?,
+        Instr::StoreAttr { obj, name, val } => obj!(py, regs, *obj).setattr(f.names[*name as usize].bind(py), obj!(py, regs, *val))?,
+        Instr::DelItem { obj, key } => obj!(py, regs, *obj).del_item(obj!(py, regs, *key))?,
+        Instr::DelAttr { obj, name } => obj!(py, regs, *obj).delattr(f.names[*name as usize].bind(py))?,
         Instr::BuildList { dst, items } => {
             let mut v = Vec::with_capacity(items.len());
             for r in items {
-                v.push(obj!(regs, *r).clone());
+                v.push(obj!(py, regs, *r).clone());
             }
-            regs[*dst as usize] = V::O(PyList::new(py, v)?.into_any());
+            regs.set_obj(*dst, PyList::new(py, v)?.into_any());
         }
         Instr::BuildTuple { dst, items } => {
             let mut v = Vec::with_capacity(items.len());
             for r in items {
-                v.push(obj!(regs, *r).clone());
+                v.push(obj!(py, regs, *r).clone());
             }
-            regs[*dst as usize] = V::O(PyTuple::new(py, v)?.into_any());
+            regs.set_obj(*dst, PyTuple::new(py, v)?.into_any());
         }
         Instr::BuildDict { dst, keys, vals } => {
             let d = PyDict::new(py);
             for (k, v) in keys.iter().zip(vals) {
-                d.set_item(obj!(regs, *k), obj!(regs, *v))?;
+                d.set_item(obj!(py, regs, *k), obj!(py, regs, *v))?;
             }
-            regs[*dst as usize] = V::O(d.into_any());
+            regs.set_obj(*dst, d.into_any());
         }
         Instr::BuildSlice { dst, lower, upper, step } => {
-            let (a, b, c) = (obj!(regs, *lower), obj!(regs, *upper), obj!(regs, *step));
+            let (a, b, c) = (obj!(py, regs, *lower), obj!(py, regs, *upper), obj!(py, regs, *step));
             // SAFETY: valid objects in, a new reference or NULL out.
             let v = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PySlice_New(a.as_ptr(), b.as_ptr(), c.as_ptr()))? };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
         Instr::ListAppend { list, val } => {
-            let l = obj!(regs, *list).cast::<PyList>().map_err(PyErr::from)?;
-            l.append(obj!(regs, *val))?;
+            let l = obj!(py, regs, *list).cast::<PyList>().map_err(PyErr::from)?;
+            l.append(obj!(py, regs, *val))?;
         }
         Instr::GetIter { dst, obj } => {
-            let it = obj!(regs, *obj).try_iter()?;
-            regs[*dst as usize] = V::O(it.into_any());
+            let it = obj!(py, regs, *obj).try_iter()?;
+            regs.set_obj(*dst, it.into_any());
         }
         Instr::ForIter { dst, iter, target } => {
-            let it = obj!(regs, *iter);
+            let it = obj!(py, regs, *iter);
             // A Lizzard generator is resumed directly, without an exception
             // at the end.
             if let Ok(g) = it.cast::<LizzardGenerator>() {
                 match g.get().resume(py, generator::Op::Send(py.None().into_bound(py)))? {
-                    Sent::Next(v) => regs[*dst as usize] = V::O(v),
+                    Sent::Next(v) => regs.set_obj(*dst, v),
                     Sent::Return(_) => next = *target as usize,
                 }
             } else {
                 let mut it = it.cast::<PyIterator>().map_err(PyErr::from)?.clone();
                 match it.next() {
-                    Some(v) => regs[*dst as usize] = V::O(v?),
+                    Some(v) => regs.set_obj(*dst, v?),
                     None => next = *target as usize,
                 }
             }
         }
         Instr::Unpack { src, dsts } => {
-            let o = obj!(regs, *src).clone();
+            let o = obj!(py, regs, *src).clone();
             let n = dsts.len();
             let known = if o.is_exact_instance_of::<PyTuple>() || o.is_exact_instance_of::<PyList>() || o.is_exact_instance_of::<PyDict>() { Some(o.len()?) } else { None };
             if let Some(k) = known {
@@ -634,7 +615,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             let mut it = o.try_iter()?;
             for (i, d) in dsts.iter().enumerate() {
                 match it.next() {
-                    Some(v) => regs[*d as usize] = V::O(v?),
+                    Some(v) => regs.set_obj(*d, v?),
                     None => return Err(PyValueError::new_err(format!("not enough values to unpack (expected {n}, got {i})"))),
                 }
             }
@@ -644,7 +625,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             }
         }
         Instr::Format { dst, val, conv, spec } => {
-            let v = obj!(regs, *val);
+            let v = obj!(py, regs, *val);
             let v = match conv {
                 b's' => v.str()?.into_any(),
                 b'r' => v.repr()?.into_any(),
@@ -653,22 +634,22 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
                 _ => v.clone(),
             };
             let spec = match spec {
-                Some(r) => obj!(regs, *r).clone(),
+                Some(r) => obj!(py, regs, *r).clone(),
                 None => PyString::new(py, "").into_any(),
             };
             // SAFETY: as above.
             let s = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyObject_Format(v.as_ptr(), spec.as_ptr()))? };
-            regs[*dst as usize] = V::O(s);
+            regs.set_obj(*dst, s);
         }
         Instr::BuildString { dst, parts } => {
             let mut s = String::new();
             for r in parts {
-                s.push_str(&obj!(regs, *r).cast::<PyString>().map_err(PyErr::from)?.to_cow()?);
+                s.push_str(&obj!(py, regs, *r).cast::<PyString>().map_err(PyErr::from)?.to_cow()?);
             }
-            regs[*dst as usize] = V::O(PyString::new(py, &s).into_any());
+            regs.set_obj(*dst, PyString::new(py, &s).into_any());
         }
         Instr::Compare { dst, op, a, b } => {
-            let (x, y) = (obj!(regs, *a), obj!(regs, *b));
+            let (x, y) = (obj!(py, regs, *a), obj!(py, regs, *b));
             let v = match op {
                 CmpOp::Is => PyBool::new(py, x.is(y)).to_owned().into_any(),
                 CmpOp::IsNot => PyBool::new(py, !x.is(y)).to_owned().into_any(),
@@ -686,33 +667,33 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
                     x.rich_compare(y, o)?
                 }
             };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
         Instr::GetItem { dst, obj, key } => {
-            let v = obj!(regs, *obj).get_item(obj!(regs, *key))?;
-            regs[*dst as usize] = V::O(v);
+            let v = obj!(py, regs, *obj).get_item(obj!(py, regs, *key))?;
+            regs.set_obj(*dst, v);
         }
-        Instr::SetItem { obj, key, val } => obj!(regs, *obj).set_item(obj!(regs, *key), obj!(regs, *val))?,
+        Instr::SetItem { obj, key, val } => obj!(py, regs, *obj).set_item(obj!(py, regs, *key), obj!(py, regs, *val))?,
         Instr::Truthy { dst, src } => {
-            let b = obj!(regs, *src).is_truthy()?;
-            regs[*dst as usize] = V::B(b);
+            let b = obj!(py, regs, *src).is_truthy()?;
+            regs.set_bool(*dst, b);
         }
-        Instr::Not { dst, src } => regs[*dst as usize] = V::B(!scalar!(regs, *src, B)),
+        Instr::Not { dst, src } => regs.set_bool(*dst, !regs.bool(*src)),
         Instr::Jump { target } => next = *target as usize,
         Instr::JumpIfFalse { cond, target } => {
-            if !scalar!(regs, *cond, B) {
+            if !regs.bool(*cond) {
                 next = *target as usize;
             }
         }
         Instr::JumpIfTrue { cond, target } => {
-            if scalar!(regs, *cond, B) {
+            if regs.bool(*cond) {
                 next = *target as usize;
             }
         }
         Instr::Raise { exc, cause } => {
-            let e = exception_instance(obj!(regs, *exc))?;
+            let e = exception_instance(obj!(py, regs, *exc))?;
             if let Some(c) = cause {
-                let c = obj!(regs, *c);
+                let c = obj!(py, regs, *c);
                 let c = if c.is_none() { c.clone() } else { exception_instance(c)? };
                 // Also sets `__suppress_context__`.
                 e.setattr("__cause__", c)?;
@@ -722,28 +703,28 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
             unsafe { ffi::PyErr_SetObject(e.get_type().as_ptr(), e.as_ptr()) };
             return Err(PyErr::fetch(py));
         }
-        Instr::Reraise { exc } => return Err(PyErr::from_value(obj!(regs, *exc).clone())),
+        Instr::Reraise { exc } => return Err(PyErr::from_value(obj!(py, regs, *exc).clone())),
         Instr::ExcMatch { dst, exc, cls } => {
-            let m = obj!(regs, *exc).is_instance(obj!(regs, *cls))?;
-            regs[*dst as usize] = V::B(m);
+            let m = obj!(py, regs, *exc).is_instance(obj!(py, regs, *cls))?;
+            regs.set_bool(*dst, m);
         }
         Instr::GetHandled { dst } => {
             // SAFETY: returns a new reference or NULL.
             let p = unsafe { ffi::PyErr_GetHandledException() };
             let v = if p.is_null() { py.None().into_bound(py) } else { unsafe { Bound::from_owned_ptr(py, p) } };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
         Instr::SetHandled { src } => {
             // SAFETY: a valid object (None clears it); the reference is not stolen.
-            unsafe { ffi::PyErr_SetHandledException(obj!(regs, *src).as_ptr()) };
+            unsafe { ffi::PyErr_SetHandledException(obj!(py, regs, *src).as_ptr()) };
         }
-        Instr::Unbind { reg } => regs[*reg as usize] = V::Empty,
+        Instr::Unbind { reg } => regs.clear(*reg),
         Instr::TypeOf { dst, src } => {
-            let t = obj!(regs, *src).get_type().into_any();
-            regs[*dst as usize] = V::O(t);
+            let t = obj!(py, regs, *src).get_type().into_any();
+            regs.set_obj(*dst, t);
         }
         Instr::LoadSpecial { dst, obj, name } => {
-            let o = obj!(regs, *obj);
+            let o = obj!(py, regs, *obj);
             let t = o.get_type();
             let n = f.names[*name as usize].bind(py);
             let a = t.getattr(n).map_err(|_| PyTypeError::new_err(format!("'{}' object does not support the context manager protocol", t.name().map(|s| s.to_string()).unwrap_or_default())))?;
@@ -752,63 +733,75 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure:
                 Ok(get) => get.call1((&a, o, &t))?,
                 Err(_) => a,
             };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
-        Instr::Return { src } => return Ok(Some(Exit::Return(obj!(regs, *src).clone()))),
+        Instr::Return { src } => return Ok(Some(Exit::Return(obj!(py, regs, *src).clone()))),
         // Both leave `pc` at the instruction: the generator resumes after it,
         // or raises there.
-        Instr::Yield { dst, src } => return Ok(Some(Exit::Yield { value: obj!(regs, *src).clone(), dst: *dst })),
+        Instr::Yield { dst, src } => return Ok(Some(Exit::Yield { value: obj!(py, regs, *src).clone(), dst: *dst })),
         Instr::YieldFrom { dst, iter } => {
-            let it = obj!(regs, *iter).clone();
+            let it = obj!(py, regs, *iter).clone();
             match generator::send_to(&it, &py.None().into_bound(py))? {
                 Sent::Next(value) => return Ok(Some(Exit::YieldFrom { value, dst: *dst, iter: it })),
-                Sent::Return(v) => regs[*dst as usize] = V::O(v),
+                Sent::Return(v) => regs.set_obj(*dst, v),
             }
         }
-        Instr::I64Const { dst, value } => regs[*dst as usize] = V::I(*value),
-        Instr::I64Lt { dst, a, b } => regs[*dst as usize] = V::B(scalar!(regs, *a, I) < scalar!(regs, *b, I)),
-        Instr::I64Add { dst, a, b } => regs[*dst as usize] = V::I(scalar!(regs, *a, I) + scalar!(regs, *b, I)),
+        Instr::I64Const { dst, value } => regs.set_i64(*dst, *value),
+        Instr::I64Lt { dst, a, b } => regs.set_bool(*dst, regs.i64(*a) < regs.i64(*b)),
+        Instr::I64Add { dst, a, b } => regs.set_i64(*dst, regs.i64(*a) + regs.i64(*b)),
         Instr::Len { dst, obj } => {
-            let n = obj!(regs, *obj).len()?;
-            regs[*dst as usize] = V::I(n as i64);
+            let n = obj!(py, regs, *obj).len()?;
+            regs.set_i64(*dst, n as i64);
         }
         Instr::Box { dst, src } => {
-            let v = match &regs[*src as usize] {
-                V::Empty => return Err(unbound()),
-                V::O(o) => o.clone(),
-                V::I(i) => i.into_pyobject(py)?.into_any(),
-                V::F(x) => array::box_f32(py, *x)?,
-                V::B(b) => PyBool::new(py, *b).to_owned().into_any(),
+            let v = match ir.reprs[*src as usize] {
+                Repr::Obj => obj!(py, regs, *src).clone(),
+                Repr::I64 => regs.i64(*src).into_pyobject(py)?.into_any(),
+                Repr::F32 => array::box_f32(py, regs.f32(*src))?,
+                Repr::Bool => PyBool::new(py, regs.bool(*src)).to_owned().into_any(),
             };
-            regs[*dst as usize] = V::O(v);
+            regs.set_obj(*dst, v);
         }
         Instr::Unbox { dst, src } => {
-            let o = obj!(regs, *src);
-            regs[*dst as usize] = match ir.reprs[*dst as usize] {
-                Repr::I64 => V::I(o.extract::<i64>()?),
-                Repr::F32 => V::F(o.extract::<f64>()? as f32),
-                Repr::Bool => V::B(o.is_truthy()?),
-                Repr::Obj => V::O(o.clone()),
-            };
+            let o = obj!(py, regs, *src);
+            match ir.reprs[*dst as usize] {
+                Repr::I64 => {
+                    let v = o.extract::<i64>()?;
+                    regs.set_i64(*dst, v);
+                }
+                Repr::F32 => {
+                    let v = o.extract::<f64>()? as f32;
+                    regs.set_f32(*dst, v);
+                }
+                Repr::Bool => {
+                    let v = o.is_truthy()?;
+                    regs.set_bool(*dst, v);
+                }
+                Repr::Obj => {
+                    let v = o.clone();
+                    regs.set_obj(*dst, v);
+                }
+            }
         }
         Instr::ArrLoadF32 { dst, arr, idx } => {
-            let v = array::load_f32(py, obj!(regs, *arr), scalar!(regs, *idx, I))?;
-            regs[*dst as usize] = V::F(v);
+            let v = array::load_f32(py, obj!(py, regs, *arr), regs.i64(*idx))?;
+            regs.set_f32(*dst, v);
         }
-        Instr::ArrStoreF32 { arr, idx, val } => array::store_f32(py, obj!(regs, *arr), scalar!(regs, *idx, I), scalar!(regs, *val, F))?,
+        Instr::ArrStoreF32 { arr, idx, val } => array::store_f32(py, obj!(py, regs, *arr), regs.i64(*idx), regs.f32(*val))?,
         Instr::F32Bin { dst, op, a, b } => {
-            let (x, y) = (scalar!(regs, *a, F), scalar!(regs, *b, F));
-            regs[*dst as usize] = V::F(match op {
+            let (x, y) = (regs.f32(*a), regs.f32(*b));
+            let v = match op {
                 BinOp::Add => x + y,
                 BinOp::Sub => x - y,
                 BinOp::Mul => x * y,
                 BinOp::Div => x / y,
                 _ => unreachable!("float32 arithmetic is + - * / only"),
-            });
+            };
+            regs.set_f32(*dst, v);
         }
         Instr::Check { reg, check } => {
             let c = &ir.checks[*check as usize];
-            if let Err(got) = rt::check(py, obj!(regs, *reg), &c.check)? {
+            if let Err(got) = rt::check(py, obj!(py, regs, *reg), &c.check)? {
                 let line = ir.lines[*pc];
                 let origin = c.origin.as_ref().map(|o| format!(" (declared at {o})")).unwrap_or_default();
                 return Err(PyTypeError::new_err(format!("{}:{line}: {} should be {}{origin}, got {got}", ir.file, c.what, c.expected)));

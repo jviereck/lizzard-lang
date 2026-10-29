@@ -22,38 +22,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-use crate::interp::{exec, Exit, FuncRt, V};
-
-/// A register of a suspended frame.
-enum Slot {
-    Empty,
-    O(Py<PyAny>),
-    I(i64),
-    F(f32),
-    B(bool),
-}
-
-impl Slot {
-    fn bind(self, py: Python<'_>) -> V<'_> {
-        match self {
-            Slot::Empty => V::Empty,
-            Slot::O(o) => V::O(o.into_bound(py)),
-            Slot::I(i) => V::I(i),
-            Slot::F(f) => V::F(f),
-            Slot::B(b) => V::B(b),
-        }
-    }
-
-    fn unbind(v: V<'_>) -> Slot {
-        match v {
-            V::Empty => Slot::Empty,
-            V::O(o) => Slot::O(o.unbind()),
-            V::I(i) => Slot::I(i),
-            V::F(f) => Slot::F(f),
-            V::B(b) => Slot::B(b),
-        }
-    }
-}
+use crate::frame::Regs;
+use crate::interp::{exec, Exit, FuncRt};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
@@ -63,7 +33,7 @@ enum Status {
 }
 
 struct Frame {
-    regs: Vec<Slot>,
+    regs: Regs,
     /// The `yield` / `yield from` it is suspended at (0 before it starts).
     pc: usize,
     /// Where the value sent to that `yield` goes.
@@ -106,9 +76,9 @@ pub struct LizzardGenerator {
 impl LizzardGenerator {
     /// A generator over a new frame with the (checked) arguments.
     pub fn new(rt: Arc<FuncRt>, globals: Py<PyDict>, closure: Vec<Py<PyAny>>, args: Vec<Bound<'_, PyAny>>) -> LizzardGenerator {
-        let mut regs: Vec<Slot> = (0..rt.ir.reprs.len()).map(|_| Slot::Empty).collect();
+        let mut regs = Regs::new(rt.objs.clone());
         for (i, a) in args.into_iter().enumerate() {
-            regs[i] = Slot::O(a.unbind());
+            regs.set_obj(i as u32, a);
         }
         let frame = Frame { regs, pc: 0, dst: 0, delegate: None, handled: None };
         LizzardGenerator { rt, globals, closure, state: Mutex::new(GenState { status: Status::Created, frame: Some(frame) }), running: AtomicBool::new(false) }
@@ -179,7 +149,7 @@ impl LizzardGenerator {
                             return Ok(Sent::Next(v));
                         }
                         Ok(Sent::Return(v)) => {
-                            frame.regs[frame.dst as usize] = Slot::O(v.unbind());
+                            frame.regs.set_obj(frame.dst, v);
                             frame.pc += 1;
                         }
                         Err(e) => pending = Some(e),
@@ -187,14 +157,13 @@ impl LizzardGenerator {
                 }
                 None => match op {
                     Op::Send(v) => {
-                        frame.regs[frame.dst as usize] = Slot::O(v.unbind());
+                        frame.regs.set_obj(frame.dst, v);
                         frame.pc += 1;
                     }
                     Op::Throw(e) => pending = Some(e),
                 },
             }
         }
-        let mut regs: Vec<V<'py>> = std::mem::take(&mut frame.regs).into_iter().map(|s| s.bind(py)).collect();
         let mut pc = frame.pc;
         // The generator's own handled exception while it runs, the caller's
         // otherwise.
@@ -202,11 +171,10 @@ impl LizzardGenerator {
         if let Some(h) = frame.handled.take() {
             set_handled(&h.into_bound(py));
         }
-        let r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut regs, &mut pc, pending);
+        let r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, pending);
         let inner = handled(py);
         set_handled(&outer);
         let mut suspend = |value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
-            frame.regs = regs.drain(..).map(Slot::unbind).collect();
             frame.pc = pc;
             frame.dst = dst;
             frame.delegate = delegate.map(Bound::unbind);

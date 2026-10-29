@@ -1,0 +1,12 @@
+[package]
+name = "lizzard-jit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lizzard-py-front = { path = "../lizzard-py-front" }
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-native = "0.137"
