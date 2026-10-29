@@ -1333,7 +1333,7 @@ impl<'a> Lower<'a> {
                     None => Vec::new(),
                 };
                 let exc = self.reg(Repr::Obj);
-                self.emit(Instr::Call { dst: exc, func: func.reg, args, kwnames: Vec::new() });
+                self.emit(Instr::Call { dst: exc, func: func.reg, args, kwnames: Vec::new(), direct: None });
                 self.emit(Instr::Raise { exc, cause: None });
                 let h = self.here();
                 self.patch(ok, h);
@@ -1460,7 +1460,7 @@ impl<'a> Lower<'a> {
     fn call_exit_none(&mut self, exit: Reg) {
         let none = self.konst(Const::None, Ty::None);
         let dst = self.reg(Repr::Obj);
-        self.emit(Instr::Call { dst, func: exit, args: vec![none.reg; 3], kwnames: Vec::new() });
+        self.emit(Instr::Call { dst, func: exit, args: vec![none.reg; 3], kwnames: Vec::new(), direct: None });
     }
 
     /// The type an `except` clause catches.
@@ -1646,7 +1646,7 @@ impl<'a> Lower<'a> {
         let n = self.name("__enter__");
         self.emit(Instr::LoadSpecial { dst: enter, obj: m, name: n });
         let val = self.reg(Repr::Obj);
-        self.emit(Instr::Call { dst: val, func: enter, args: Vec::new(), kwnames: Vec::new() });
+        self.emit(Instr::Call { dst: val, func: enter, args: Vec::new(), kwnames: Vec::new(), direct: None });
         let v = Val { reg: val, ty: entered, repr: Repr::Obj };
         self.check(&v, format!("{}.__enter__()", self.src(&item.context_expr)), None);
         if let Some(t) = &item.optional_vars {
@@ -1674,7 +1674,7 @@ impl<'a> Lower<'a> {
         let n = self.name("__traceback__");
         self.emit(Instr::LoadAttr { dst: tb, obj: exc, name: n });
         let r = self.reg(Repr::Obj);
-        self.emit(Instr::Call { dst: r, func: exit, args: vec![ty, exc, tb], kwnames: Vec::new() });
+        self.emit(Instr::Call { dst: r, func: exit, args: vec![ty, exc, tb], kwnames: Vec::new(), direct: None });
         let b = self.reg(Repr::Bool);
         self.emit(Instr::Truthy { dst: b, src: r });
         self.close_region();
@@ -2748,7 +2748,7 @@ impl<'a> Lower<'a> {
         let cls = self.load_global(&cname, Ty::Any);
         let sup = self.load_global("super", Ty::Any);
         let sobj = self.reg(Repr::Obj);
-        self.emit(Instr::Call { dst: sobj, func: sup.reg, args: vec![cls.reg, this.reg], kwnames: Vec::new() });
+        self.emit(Instr::Call { dst: sobj, func: sup.reg, args: vec![cls.reg, this.reg], kwnames: Vec::new(), direct: None });
         let name = a.attr.as_str();
         let (inst_ty, on_class) = match &this.ty {
             Ty::Type(t) => ((**t).clone(), true),
@@ -3162,11 +3162,13 @@ impl<'a> Lower<'a> {
         let dst = self.reg(Repr::Obj);
         match method {
             Some((obj, name)) => {
-                self.emit(Instr::CallMethod { dst, obj, name, args, kwnames });
+                let direct = if kwnames.is_empty() { self.direct_call(&fv.ty, &pos_tys) } else { None };
+                self.emit(Instr::CallMethod { dst, obj, name, args, kwnames, direct });
             }
             None => {
+                let direct = if kwnames.is_empty() { self.direct_call(&fv.ty, &pos_tys) } else { None };
                 let func = self.obj(&fv);
-                self.emit(Instr::Call { dst, func, args, kwnames });
+                self.emit(Instr::Call { dst, func, args, kwnames, direct });
             }
         }
         let v = Val { reg: dst, ty: ret, repr: Repr::Obj };
@@ -3181,6 +3183,42 @@ impl<'a> Lower<'a> {
         let (line, col) = self.db.files[self.file].line_col(off);
         let note = format!("{}:{line}:{col}: note: revealed type is `{}`", self.db.files[self.file].path, self.show(t));
         self.db.warnings.push(note);
+    }
+
+    /// A call of a function of this module with plain positional parameters
+    /// (a module function, or a method through an instance): which
+    /// parameter checks the arguments' static types make unnecessary.
+    fn direct_call(&mut self, callee: &Ty, args: &[Ty]) -> Option<Direct> {
+        let (f, recv) = match callee {
+            Ty::Func(FuncRef::Def(f)) => (*f, None),
+            Ty::Func(FuncRef::Bound(f, r)) => (*f, Some((**r).clone())),
+            _ => return None,
+        };
+        let (m, owner, name) = (self.db.funcs[f].m, self.db.funcs[f].owner, self.db.funcs[f].name.clone());
+        if m != self.m || self.db.def_count(f) != 1 || recv.is_some() != owner.is_some() {
+            return None;
+        }
+        if owner.is_some() && self.db.method_kind(f) != MethodKind::Normal {
+            return None;
+        }
+        let sigs = self.db.sigs(f);
+        let [sig] = sigs.as_slice() else { return None };
+        let given: Vec<Ty> = recv.into_iter().chain(args.iter().map(decay)).collect();
+        if sig.params.len() != given.len() || sig.params.iter().any(|p| !matches!(p.kind, PKind::PosOnly | PKind::PosOrKw)) || given.len() > 64 {
+            return None;
+        }
+        let mut skip = 0u64;
+        for (i, (p, a)) in sig.params.iter().zip(&given).enumerate() {
+            let mut any = false;
+            if !matches!(a, Ty::Any) && self.db.assign(a, &p.ty, &mut Subst::new(), &mut any) && !any {
+                skip |= 1 << i;
+            }
+        }
+        let key = match owner {
+            Some(c) => format!("{}.{name}", self.db.classes[c].name),
+            None => name,
+        };
+        Some(Direct { key, skip })
     }
 
     /// The parameter types the arguments of a call bind to, with the

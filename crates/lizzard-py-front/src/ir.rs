@@ -116,12 +116,12 @@ pub enum Instr {
     StoreAttr { obj: Reg, name: u32, val: Reg },
     DelAttr { obj: Reg, name: u32 },
     /// `func(*args[..n - kwnames.len()], **{kwnames: args[rest]})`
-    Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32> },
+    Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32>, direct: Option<Direct> },
     /// `obj.name(*args[..n - kwnames.len()], **{kwnames: args[rest]})`,
     /// without creating a bound method (CPython's `PyObject_VectorcallMethod`).
     /// The method is looked up after the arguments are evaluated, so the
     /// front end uses it only when they are side-effect free.
-    CallMethod { dst: Reg, obj: Reg, name: u32, args: Vec<Reg>, kwnames: Vec<u32> },
+    CallMethod { dst: Reg, obj: Reg, name: u32, args: Vec<Reg>, kwnames: Vec<u32>, direct: Option<Direct> },
     /// `func(*args, **kwargs)` with a tuple and a dict (calls with `*`/`**`).
     CallEx { dst: Reg, func: Reg, args: Reg, kwargs: Option<Reg> },
     /// `list.extend(iter)`
@@ -213,6 +213,17 @@ pub enum Instr {
     F32Bin { dst: Reg, op: BinOp, a: Reg, b: Reg },
     /// Raise `TypeError` unless `reg` passes `checks[check]`.
     Check { reg: Reg, check: u32 },
+}
+
+/// What the checker resolved a call to: a function of the same module with
+/// plain positional parameters (`key` as in `FuncIr::key`). When the
+/// function called at runtime is that one, the checks of the parameters in
+/// `skip` (bit i: parameter i, the receiver first for a method) can be
+/// skipped: the arguments' static types already satisfy them.
+#[derive(Clone, Debug)]
+pub struct Direct {
+    pub key: String,
+    pub skip: u64,
 }
 
 /// An exception raised by an instruction in one of `ranges` (`start..end`)

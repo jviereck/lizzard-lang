@@ -191,6 +191,38 @@ class Programs(unittest.TestCase):
         code, out, err = run("-c", "import lizzard._lizzard as L; s = L._stats(); print(s['fast_paths'], s['inline_values'])")
         self.assertEqual((code, out), (0, "True True\n"), err)
 
+    def test_skipped_checks_need_the_resolved_callee(self):
+        # A call site skips the parameter checks its argument types prove,
+        # but only for the function the checker resolved: after the global
+        # is rebound to another function, that one's checks apply.
+        with Scratch() as s:
+            s.write("m.py", """\
+                # lizzard: module
+                def f(x: float) -> float:
+                    return x
+
+                def g(x: int) -> float:
+                    return 2.0 * x
+
+                def call(v: float) -> float:
+                    return f(v)
+                """)
+            p = s.write("main.py", """\
+                import lizzard
+                import m
+                print(m.call(1.5), m.call(2.5))
+                m.f = m.g
+                print(m.call(3))
+                try:
+                    m.call(1.5)
+                except TypeError as e:
+                    print("TypeError:", e)
+                """)
+            for jit in ("1", "0"):
+                code, out, err = run(str(p), cwd=s.path, env={"LIZZARD_JIT": jit})
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.splitlines(), ["1.5 2.5", "6.0", "TypeError: g() argument 'x': expected int, got float"])
+
     def test_deep_recursion_raises(self):
         # Lizzard calls recurse on the C stack: CPython's stack check turns
         # runaway recursion into RecursionError, in both engines.
