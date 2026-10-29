@@ -151,7 +151,7 @@ name = "embed_geom"
 version = "0.1.0"
 dependencies = [
  "geom_ext",
- "slim",
+ "lizzard",
 ]
 
 [[package]]
@@ -170,7 +170,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 name = "geom_ext"
 version = "0.1.0"
 dependencies = [
- "slim-ext",
+ "lizzard-ext",
 ]
 
 [[package]]
@@ -287,6 +287,70 @@ checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link",
+]
+
+[[package]]
+name = "lizzard"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "lizzard-abi",
+ "lizzard-compiler",
+ "lizzard-ext",
+ "lizzard-syntax",
+ "lizzard-vm",
+]
+
+[[package]]
+name = "lizzard-abi"
+version = "0.1.0"
+
+[[package]]
+name = "lizzard-compiler"
+version = "0.1.0"
+dependencies = [
+ "lizzard-syntax",
+ "lizzard-vm",
+]
+
+[[package]]
+name = "lizzard-ext"
+version = "0.1.0"
+dependencies = [
+ "lizzard-abi",
+]
+
+[[package]]
+name = "lizzard-py"
+version = "0.1.0"
+dependencies = [
+ "lizzard-py-front",
+ "pyo3",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "lizzard-py-front"
+version = "0.1.0"
+dependencies = [
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_source_file",
+ "ruff_text_size",
+]
+
+[[package]]
+name = "lizzard-syntax"
+version = "0.1.0"
+
+[[package]]
+name = "lizzard-vm"
+version = "0.1.0"
+dependencies = [
+ "lizzard-abi",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -705,70 +769,6 @@ name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
-
-[[package]]
-name = "slim"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "slim-abi",
- "slim-compiler",
- "slim-ext",
- "slim-syntax",
- "slim-vm",
-]
-
-[[package]]
-name = "slim-abi"
-version = "0.1.0"
-
-[[package]]
-name = "slim-compiler"
-version = "0.1.0"
-dependencies = [
- "slim-syntax",
- "slim-vm",
-]
-
-[[package]]
-name = "slim-ext"
-version = "0.1.0"
-dependencies = [
- "slim-abi",
-]
-
-[[package]]
-name = "slim-py"
-version = "0.1.0"
-dependencies = [
- "pyo3",
- "pyo3-build-config",
- "slim-py-front",
-]
-
-[[package]]
-name = "slim-py-front"
-version = "0.1.0"
-dependencies = [
- "ruff_python_ast",
- "ruff_python_parser",
- "ruff_source_file",
- "ruff_text_size",
-]
-
-[[package]]
-name = "slim-syntax"
-version = "0.1.0"
-
-[[package]]
-name = "slim-vm"
-version = "0.1.0"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
- "slim-abi",
-]
 
 [[package]]
 name = "smallvec"

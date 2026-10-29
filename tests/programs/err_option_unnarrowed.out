@@ -1,4 +1,4 @@
-  File "err_option_unnarrowed.slim", line 3
+  File "err_option_unnarrowed.lz", line 3
         print(x.upper())
                      ^
 TypeError: `x` is `Option<str>` and may be `None`; narrow it first (`if x is not None:`) or use `.some_or(default)` before calling `.upper()`

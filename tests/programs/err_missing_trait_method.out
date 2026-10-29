@@ -1,4 +1,4 @@
-  File "err_missing_trait_method.slim", line 7
+  File "err_missing_trait_method.lz", line 7
     impl Shape for Square:
     ^
 TypeError: `impl Shape for Square`: `Square` does not define required method `area`

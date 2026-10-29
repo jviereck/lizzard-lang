@@ -1,4 +1,4 @@
-  File "err_impl_overlap.slim", line 8
+  File "err_impl_overlap.lz", line 8
     impl D for list<int>:
     ^
 TypeError: conflicting implementations of `D`: `impl D for list<int>` overlaps `impl D for list<T>`

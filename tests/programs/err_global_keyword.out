@@ -1,5 +1,5 @@
-  File "err_global_keyword.slim", line 3
+  File "err_global_keyword.lz", line 3
         global count
         ^
-SyntaxError: slim has no module variables, so no `global`: pass values as arguments, or keep them in a struct
+SyntaxError: lizzard has no module variables, so no `global`: pass values as arguments, or keep them in a struct
 [exit 1]

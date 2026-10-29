@@ -5,5 +5,5 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-slim = { path = "../../crates/slim" }
+lizzard = { path = "../../crates/lizzard" }
 geom_ext = { path = "../geom_ext" }

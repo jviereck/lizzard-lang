@@ -1,4 +1,4 @@
-  File "err_send_spawn.slim", line 14
+  File "err_send_spawn.lz", line 14
         spawn(work).join()
               ^
 TypeError: spawn(): the function is not `Send` (`function`) and cannot be sent to another thread

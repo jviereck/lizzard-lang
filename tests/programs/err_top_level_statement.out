@@ -1,4 +1,4 @@
-  File "err_top_level_statement.slim", line 5
+  File "err_top_level_statement.lz", line 5
     print("not allowed")
     ^
 SyntaxError: statements must be inside a function: the program starts at `main` (`def main() -> ():`)

@@ -1,4 +1,4 @@
-  File "err_bound_missing.slim", line 3
+  File "err_bound_missing.lz", line 3
         if a < b:
              ^
 TypeError: `<` on `T` requires a bound `T: Ord`

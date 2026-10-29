@@ -1,7 +1,7 @@
-# slim — Python-syntax toy language with a derived Cranelift JIT
+# Lizzard (lizzard-lang) — Python-syntax toy language with a derived Cranelift JIT
 
 ## Context
-Greenfield project in `/Users/jmeivier/dev/slim_lang` (empty; rustc 1.96). The goal is a research-style VM inspired by Deegen and Druid. **Each opcode's semantics is written once**, and from that single definition we get both the interpreter and a hot-function Cranelift JIT. The transitions between them (JIT entry, OSR, deopt, exception exits, generator resume) are generated rather than hand-written.
+Greenfield project in `lizzard-lang` (empty; rustc 1.96). The goal is a research-style VM inspired by Deegen and Druid. **Each opcode's semantics is written once**, and from that single definition we get both the interpreter and a hot-function Cranelift JIT. The transitions between them (JIT entry, OSR, deopt, exception exits, generator resume) are generated rather than hand-written.
 
 **Sequencing: language first, JIT later.**
 - Milestones 1–6 build the complete language on the interpreter, so we can see how it feels.
@@ -98,7 +98,7 @@ def main(args: list<str>) -> int:                # the entry point (or `main() -
   - Parameters follow the same rules as functions: borrowed by default, with `+ keep` allowed. Captures move move-type values in (`++` a value first to keep it) and copy copy-type values.
   - A lambda is itself a move-type object.
 - **Programs start at `main`, as in Rust.** The top level holds only items: functions, structs, traits, impls and imports (a docstring is allowed). Any other statement there is a compile error, and there are no module variables (nor `global`): state lives in `main`'s locals and is passed on. Items are defined before `main` runs, in any order.
-  - `main` takes nothing or the program's arguments, `def main(args: list<str>)` (`slim prog.slim a b` passes `["a", "b"]`), and returns `()` or an `int` exit status (its low 8 bits, as the OS keeps them). It cannot be generic or a generator.
+  - `main` takes nothing or the program's arguments, `def main(args: list<str>)` (`lizzard prog.lz a b` passes `["a", "b"]`), and returns `()` or an `int` exit status (its low 8 bits, as the OS keeps them). It cannot be generic or a generator.
   - A program without `main` is a compile error. An exception escaping `main` prints the traceback and exits with status 1.
   - Embedders set the arguments with `Runtime::args`; `run_source` returns the exit status.
 - **Mandatory struct typing.**
@@ -215,15 +215,15 @@ A decrement never frees anything inline; it only does bookkeeping.
 ### Cargo workspace
 | crate | contents |
 |---|---|
-| `slim-syntax` | Indentation-aware lexer with an indent-context stack (lambda `{}` blocks), `<-`, `++`, `+ keep`, `<...>` generics in type position; recursive-descent parser, AST, spans/diagnostics |
-| `slim-compiler` | Scope analysis (including lambda captures), **type/ownership checker** (moves, borrows, keep masks, definite assignment, `Option` narrowing), AST → register bytecode, exception tables, liveness, the borrow-escape check, and insertion of epoch pins |
-| `slim-runtime` | `Value`, object header + atomic RC, QSBR, classes/traits, str/tuple/list/dict/bigint/boxed float, exceptions, `Thread` state, `extern "C"` helpers |
-| `slim-vm` | `ops.rs` opcode table + **semantics written once**; `backend/mod.rs` trait; `backend/interp.rs`; dispatch loop; frames; generators |
-| `slim-jit` | `backend/jit.rs` Cranelift backend; compile-queue thread; entry/exit generation; code installation |
-| `slim-abi` | The C ABI between the interpreter and native modules: `SlimApi`, descriptors, `ABI_VERSION` |
-| `slim-ext` | The Rust binding API (`Module`, `ClassBuilder`, `FromSlim`, ...) over `slim-abi`; `module!` declares an extension library |
-| `slim` (bin) | CLI: `slim run file.slim [--jit=off\|auto\|always] [--dis]` |
-| `tests/` | Golden `.slim` programs with `.out` files (including expected compile errors), run under every JIT mode |
+| `lizzard-syntax` | Indentation-aware lexer with an indent-context stack (lambda `{}` blocks), `<-`, `++`, `+ keep`, `<...>` generics in type position; recursive-descent parser, AST, spans/diagnostics |
+| `lizzard-compiler` | Scope analysis (including lambda captures), **type/ownership checker** (moves, borrows, keep masks, definite assignment, `Option` narrowing), AST → register bytecode, exception tables, liveness, the borrow-escape check, and insertion of epoch pins |
+| `lizzard-runtime` | `Value`, object header + atomic RC, QSBR, classes/traits, str/tuple/list/dict/bigint/boxed float, exceptions, `Thread` state, `extern "C"` helpers |
+| `lizzard-vm` | `ops.rs` opcode table + **semantics written once**; `backend/mod.rs` trait; `backend/interp.rs`; dispatch loop; frames; generators |
+| `lizzard-jit` | `backend/jit.rs` Cranelift backend; compile-queue thread; entry/exit generation; code installation |
+| `lizzard-abi` | The C ABI between the interpreter and native modules: `LizzardApi`, descriptors, `ABI_VERSION` |
+| `lizzard-ext` | The Rust binding API (`Module`, `ClassBuilder`, `FromLizzard`, ...) over `lizzard-abi`; `module!` declares an extension library |
+| `lizzard` (bin) | CLI: `lizzard run file.lz [--jit=off\|auto\|always] [--dis]` |
+| `tests/` | Golden `.lz` programs with `.out` files (including expected compile errors), run under every JIT mode |
 
 Dependencies:
 - `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`
@@ -231,7 +231,7 @@ Dependencies:
 - dev only: `loom`
 
 ### Opcode table (declared once)
-A `macro_rules! opcodes { Add { dst: Reg, lhs: Reg, rhs: Reg, site: Site } ... }` in `slim-vm/src/ops.rs` generates:
+A `macro_rules! opcodes { Add { dst: Reg, lhs: Reg, rhs: Reg, site: Site } ... }` in `lizzard-vm/src/ops.rs` generates:
 - the `Op` enum
 - the encoder and decoder
 - the disassembler
@@ -350,7 +350,7 @@ pub trait Backend {
 9. **`array<T>`:** fixed-size packed scalars. **9b:** static element types.
 9c. **Runtime types:** reified generics for containers. **9d:** user generics with bounds. **9e:** thread locality (redesigned in **9f**/**9g**: `Send` as in Rust).
 10. **Rust bindings** (static embedding). **10b:** generic native classes. **10c:** native traits and `impl Trait for NativeClass`. **10d:** `struct` + `impl` blocks replace `class`. **10e:** trait-qualified methods (`Trait::m(x)`). **10f:** impls for builtin types, native classes, specialized and conditional targets (orphan rule, coherence, registered impls).
-11. **Extension modules:** a stable C ABI (`slim-abi`), the binding API as an interpreter-independent crate (`slim-ext`), and loading `cdylib` modules at `import`.
+11. **Extension modules:** a stable C ABI (`lizzard-abi`), the binding API as an interpreter-independent crate (`lizzard-ext`), and loading `cdylib` modules at `import`.
 12. **`main` entry point:** items only at the top level, no module variables or `global`, `main(args: list<str>) -> int` optional forms; spawned threads hand their reclamation queues off before they report completion.
 
 ### Phase B: the derived JIT (later)
@@ -374,7 +374,7 @@ pub trait Backend {
 ## Verification
 - `cargo test --workspace` runs:
   - unit tests for the lexer, parser, compiler and ownership checker
-  - golden tests: every `tests/programs/*.slim` is checked against its `.out`. In Phase B the same tests also run under `--jit=always` and `--jit=auto` (low threshold).
+  - golden tests: every `tests/programs/*.lz` is checked against its `.out`. In Phase B the same tests also run under `--jit=always` and `--jit=auto` (low threshold).
   - RC tests:
     - with `rc_auto(False)`, objects stay alive until `rc_run()`
     - `rc_run(limit)` frees at most `limit` objects
@@ -383,13 +383,13 @@ pub trait Backend {
   - expression tests: implicit returns, `if`/`try` values, an `if` without `else` producing `()`, the discarded last value in a `-> ()` function, and `TypeError` on a wrongly typed implicit return
   - negative tests: use-after-move, `x = foo.bar` without `++`/`<-`, a borrow escaping (bound, stored, returned or yielded without `++`), moving a borrowed param, missing annotations, using an `Option` without narrowing, `None` assigned to a non-Option, lambda indentation errors, `TypeError`/`OverflowError`/`OwnershipError` messages
 - A debug-build refcount audit at exit: with the immortals excluded, every non-leaked object must reach rc 0.
-- `slim run --dis file.slim` lets you inspect bytecode, with every RC op visible.
+- `lizzard run --dis file.lz` lets you inspect bytecode, with every RC op visible.
 - From M6, thread stress tests: N threads racing `<-` stores and borrowed reads on shared objects, and shared list/dict under Lock. `cargo +nightly test -Zsanitizer=thread` on the runtime.
-- In Phase B, `SLIM_JIT_DUMP=1` dumps the Cranelift IR, and benchmarks in `benches/` compare interpreter and JIT time. The JIT should be several times faster on integer and float code.
+- In Phase B, `LIZZARD_JIT_DUMP=1` dumps the Cranelift IR, and benchmarks in `benches/` compare interpreter and JIT time. The JIT should be several times faster on integer and float code.
 
 ## Implementation notes (Phase A as built)
 Refinements made while building milestones 1–6. Where they conflict with the sections above, these take precedence.
-- **Crates.** The runtime lives in `slim-vm` (no separate `slim-runtime` crate). The crates are `slim-syntax`, `slim-compiler`, `slim-vm` and `slim` (CLI). `slim-jit` arrives with Phase B.
+- **Crates.** The runtime lives in `lizzard-vm` (no separate `lizzard-runtime` crate). The crates are `lizzard-syntax`, `lizzard-compiler`, `lizzard-vm` and `lizzard` (CLI). `lizzard-jit` arrives with Phase B.
 - **Minimal freeze.** Borrows freeze nothing, with one exception: a local can't be moved into a call that also borrows that same local, e.g. `f(x, x)` where the first parameter is `keep`. This is checked statically, and at runtime for dynamic calls.
 - **Epoch-gated frees.** Every free is stamped with an epoch, whether it comes from a refcount reaching 0 or a deferred decref. `rc_run` processes only entries older than the horizon, which is the minimum over threads of the last safepoint and the oldest pin.
   - Children freed while releasing a parent cascade in the same run.
@@ -406,7 +406,7 @@ Refinements made while building milestones 1–6. Where they conflict with the s
 ## Implementation notes (milestones 7–10)
 - **Refcount word flags.** Bit 60 is `LOCAL` (see "Thread locality" below). Bit 63 is `IMMORTAL`. Bit 62 is `REVIVED`, set by an increment from zero: a borrow of shared memory took a new reference to an object already queued for freeing. Bit 61 is `QUEUED`: the object has a pending-free entry. When an entry's grace period has passed, `rc_run` frees it only if the count is still zero and it was not revived. A revived object waits a new grace period; a live one is dropped from the queue and is queued again when it next reaches zero.
 - **`rc::retire(ptr, free)`** frees raw memory (an old list buffer, an old dict table) after the same grace period as objects.
-- **Poison mode** (`SLIM_POISON=1`, debug builds): freed objects are overwritten and leaked, and any later refcount operation on them panics. The golden tests run in this mode.
+- **Poison mode** (`LIZZARD_POISON=1`, debug builds): freed objects are overwritten and leaked, and any later refcount operation on them panics. The golden tests run in this mode.
 - **Containers without read locks.** `list` and `dict` reads (`l[i]`, `len`, `in`, iteration, lookups) take no lock. Writers serialize on a spin lock (for a list, the odd state of its version counter) and never run user code while holding it. Values and buffers leave through the epoch system, so a racing reader may see an old, new or duplicated element, or get an `IndexError`, but never freed memory or memory out of bounds. `sort` compares outside the lock and raises `RuntimeError` if the list changed meanwhile. Dict iteration works on a snapshot.
 - **No negative indexes** on any sequence: `0 <= i < len` or `IndexError`. `pop()` returns `Option<T>` (`None` when empty); `first()` / `last()` return `Option<T>` holding a new reference.
 - **`array<T>`** (`i8`…`u64`, `f32`, `f64`, `bool`): fixed length, packed memory accessed with relaxed atomics, bounds-checked. Out-of-range integers raise `OverflowError`. `a.view(start, n)` shares memory and keeps its base alive.
@@ -452,30 +452,30 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     - channel sends are checked;
     - a `+ Send` generator checks its owned registers at creation and at each `yield`.
   - **Freeing.** A local object only reaches zero on its own thread. When a thread exits, its queued local objects are freed on that thread without waiting for a grace period: no other thread can reach them. So destructors of non-`Send` Rust values always run on their owner thread.
-- **Rust bindings (10).** `crates/slim` is a library plus the CLI binary. `slim::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding API lives in `crates/slim-ext` and reaches the interpreter only through the C ABI of `crates/slim-abi` (milestone 11); the interpreter's side is `crates/slim-vm/src/native.rs` and `ext.rs`.
-  - **Functions.** `m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| ...)` accepts any `Fn` of up to 8 arguments. A first parameter `&mut Ctx` gives access to the interpreter: `ctx.call(&func, (args,))` calls a slim function or closure, and `ctx.offline(|| ...)` runs a `Send` closure with the thread marked offline, so a long computation or a blocking wait doesn't hold back `rc_run` on other threads. A result of `Result<T, SlimError>` raises on `Err`. `SlimError::new("ZeroDivisionError", msg)` names any builtin exception class (an unknown name becomes `RuntimeError`), and an exception raised by a callback passes through unchanged when the native returns its error. A panic becomes `RuntimeError: native panic in f(): <message>`.
-  - **Conversions.** The `SlimType` trait maps each Rust type to the slim type the compiler sees. `FromSlim` converts arguments; `IntoSlim` converts results.
+- **Rust bindings (10).** `crates/lizzard` is a library plus the CLI binary. `lizzard::Runtime` is the embedding API: `rt.module("geom", |m| ...)` registers a native module, then `rt.run_source`/`run_file` compiles and runs a program that can import it. `examples/embed_geom` is a complete example. The binding API lives in `crates/lizzard-ext` and reaches the interpreter only through the C ABI of `crates/lizzard-abi` (milestone 11); the interpreter's side is `crates/lizzard-vm/src/native.rs` and `ext.rs`.
+  - **Functions.** `m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| ...)` accepts any `Fn` of up to 8 arguments. A first parameter `&mut Ctx` gives access to the interpreter: `ctx.call(&func, (args,))` calls a lizzard function or closure, and `ctx.offline(|| ...)` runs a `Send` closure with the thread marked offline, so a long computation or a blocking wait doesn't hold back `rc_run` on other threads. A result of `Result<T, LizzardError>` raises on `Err`. `LizzardError::new("ZeroDivisionError", msg)` names any builtin exception class (an unknown name becomes `RuntimeError`), and an exception raised by a callback passes through unchanged when the native returns its error. A panic becomes `RuntimeError: native panic in f(): <message>`.
+  - **Conversions.** The `LizzardType` trait maps each Rust type to the lizzard type the compiler sees. `FromLizzard` converts arguments; `IntoLizzard` converts results.
     - Scalars: `i8`–`i64`, `u8`–`u64` and `usize` are range-checked, so `300` passed as a `u8` raises `OverflowError`. `f64` and `f32` accept ints too. Also `bool`, `String`, `()` and `Option<T>`.
     - `Vec<T>` copies a `list<T>`.
     - `Any` holds an arbitrary value.
     - `Func` holds a callable.
     - `ListRef<T>`, `DictRef<K, V>` and `ArrayRef<T>` are typed handles that read and write a container in place. Their type is checked once, by comparing the container's reified type (O(1)), and writes go through the container's element check.
     - `Native<T>` holds an instance of a native class.
-  - **Static signatures.** Calls of natives are checked against the Rust signature, like calls of slim functions: "argument `#2` expects `int`, got `str`". Parameters are named `#1`, `#2`, and so on. An argument typed `any` is checked at runtime instead. `NativeFn::scalar_sig` exposes all-scalar signatures, which the JIT can use to call natives directly.
+  - **Static signatures.** Calls of natives are checked against the Rust signature, like calls of lizzard functions: "argument `#2` expects `int`, got `str`". Parameters are named `#1`, `#2`, and so on. An argument typed `any` is checked at runtime instead. `NativeFn::scalar_sig` exposes all-scalar signatures, which the JIT can use to call natives directly.
   - **Ownership.** Native parameters always borrow; there is no `keep`. A handle (`ListRef`, `Func`, `Native<T>`, ...) holds its own counted reference, so a native may keep one past the call. Handles are `!Send`, so they stay on the interpreter thread that created them. That is why `Any` and `Func` are typed `any` and `function`, which may hold values that are not `Send`.
-  - **Classes.** `m.class::<T>("Point", |c| { c.init(...); c.method(...); c.method_mut(...); c.repr(...); })`. `init` takes the constructor's arguments and returns `T` (or `Result<T, SlimError>`). `method` gets `&T`, and `method_mut` gets `&mut T`. Instances are slim objects of type `geom.Point`. They work with `isinstance` and in annotations (after `from geom import Point`), and their Rust value is dropped when the count reaches zero. Which registration function to use depends on `T`'s auto traits:
+  - **Classes.** `m.class::<T>("Point", |c| { c.init(...); c.method(...); c.method_mut(...); c.repr(...); })`. `init` takes the constructor's arguments and returns `T` (or `Result<T, LizzardError>`). `method` gets `&T`, and `method_mut` gets `&mut T`. Instances are lizzard objects of type `geom.Point`. They work with `isinstance` and in annotations (after `from geom import Point`), and their Rust value is dropped when the count reaches zero. Which registration function to use depends on `T`'s auto traits:
 
     | Registration | Requires | Behavior |
     |---|---|---|
     | `class` | `T: Send + Sync` | `&self` methods run concurrently from any thread; `&mut self` methods are exclusive |
     | `class_send` | `T: Send` | every call is exclusive |
-    | `class_not_send` | any `T` | the slim class is not `Send` either: instances never leave their thread; each call also checks the owner thread (`ThreadError`) as a safety net |
+    | `class_not_send` | any `T` | the lizzard class is not `Send` either: instances never leave their thread; each call also checks the owner thread (`ThreadError`) as a safety net |
 
     Access is tracked by an atomic borrow counter on the object. A call that conflicts with a running call, such as a re-entrant `&mut self` call from a callback, raises `BorrowError`. A class registered with `c.locked()` waits instead: it goes offline and yields until the conflicting call finishes. Waiting is only useful across threads; a re-entrant conflict on one thread would never finish.
-  - **Generic classes (10b).** A generic Rust type is registered once per supported instantiation. `T` may be any `SlimType` (scalars, `String`, `Native<P>`, ...), and a tuple `(A, B)` gives several type arguments:
+  - **Generic classes (10b).** A generic Rust type is registered once per supported instantiation. `T` may be any `LizzardType` (scalars, `String`, `Native<P>`, ...), and a tuple `(A, B)` gives several type arguments:
 
     ```rust
-    fn stack<T: FromSlim + IntoSlim + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) { c.init(..); c.method_mut("push", ..); }
+    fn stack<T: FromLizzard + IntoLizzard + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) { c.init(..); c.method_mut("push", ..); }
     m.generic_class("Stack", &["T"], |g| {
         g.class::<i64, _>(stack::<i64>);                              // Stack<int>
         g.class::<String, _>(stack::<String>);                        // Stack<str>
@@ -483,62 +483,62 @@ Refinements made while building milestones 1–6. Where they conflict with the s
     });
     ```
 
-    - **Classes.** Each instantiation is an ordinary native class over its own Rust type, with its own methods and mode (`class`/`class_send`/`class_not_send`, chosen by the Rust type's auto traits as above). Slim sees one generic class `Stack<T>`, a family object that is the global `geom.Stack` and has no constructor or methods of its own.
-    - **Types and checks.** An instance's runtime type is `Stack<int>` (`Ctor::Class(family)` with the type arguments), so `isinstance(s, Stack)`, annotations and runtime checks work as for slim generics. `Send` follows the instantiation: `Stack<int>` is `Send`, `Stack<Point>` is not.
+    - **Classes.** Each instantiation is an ordinary native class over its own Rust type, with its own methods and mode (`class`/`class_send`/`class_not_send`, chosen by the Rust type's auto traits as above). Lizzard sees one generic class `Stack<T>`, a family object that is the global `geom.Stack` and has no constructor or methods of its own.
+    - **Types and checks.** An instance's runtime type is `Stack<int>` (`Ctor::Class(family)` with the type arguments), so `isinstance(s, Stack)`, annotations and runtime checks work as for lizzard generics. `Send` follows the instantiation: `Stack<int>` is `Send`, `Stack<Point>` is not.
     - **Construction.** `Stack::<int>()`, or `s: Stack<str> = Stack()` with the arguments taken from the expected type, dispatches to the instantiation for those arguments. When they are known statically, the call is checked against that instantiation's constructor and its methods' signatures, and an unsupported instantiation, written or annotated, is a compile error: "`geom.Stack<float>` is not available: `geom.Stack` supports `geom.Stack<int>`, `geom.Stack<str>`". Inside a generic function (`Stack::<T>()`), the runtime picks the instantiation and raises `TypeError` for an unsupported one; method calls on such a value are dynamic.
-    - **Natives.** A native function may take or return `Native<Stack<i64>>`, which slim sees as `geom.Stack<int>`.
+    - **Natives.** A native function may take or return `Native<Stack<i64>>`, which lizzard sees as `geom.Stack<int>`.
     - **Registration errors panic:** a wrong number of type arguments, or the same instantiation registered twice.
   - **Traits (10c).**
     - **Rust traits.** A module defines a trait whose methods are all required: `m.trait_def("Shape", |t| { t.method::<(), f64>("area"); t.method::<(f64,), ()>("scale"); })`. The argument types are a tuple (`()`, `(f64,)`, ...). Its classes, defined after it, implement it with `c.implements("Shape")`.
-      - Slim imports it like a class (`from geom import Shape`) and uses it as any trait: `s: Shape`, `list<Shape + Send>`, `T: Shape`, `impl Shape for Square:`.
+      - Lizzard imports it like a class (`from geom import Shape`) and uses it as any trait: `s: Shape`, `list<Shape + Send>`, `T: Shape`, `impl Shape for Square:`.
       - A struct must define every method.
     - **Builtin traits through dunders.** `c.implements("Ord" | "Num" | "Len")` with `__lt__`, the arithmetic dunders (`Num` implies `Ord`) or `__len__`. Operators, `sorted` and `len()` call a native object's dunder methods like an instance's. `Send` is never implemented this way: it follows the Rust type.
     - **Registration checks.** At registration, the class's methods are checked against the trait's signatures; a missing or mismatched method panics with the class, trait and method names.
     - **Program traits for native classes** are registered impls (10f): `impl Describe for Polygon` (bodiless: the class's Rust methods and the trait's defaults), `impl Describe for Polygon:` with methods, `impl<T> Count for Stack<T>:` for every instantiation, `impl Top for Stack<str>:` for one. A required method the impl does not define must be a Rust method of the class (of every instantiation it covers), with the trait's parameter types and a compatible return type. Native classes get no inherent `impl` (their methods are defined in Rust), and a native or builtin trait is implemented for them in Rust (`c.implements(..)`, the orphan rule).
-  - **Imports.** `import geom [as g]` and `from geom import dot [as d], Point` are only allowed at module level. Before compiling, imports are resolved by an AST rewrite (`crates/slim-compiler/src/imports.rs`): every name an import binds (`dot`, `g.dot`) becomes the qualified global `geom.dot`, and the compiler registers the native signatures under those names. A function's parameters and locals shadow imported names. Redefining an imported name at module level is an error, and so is using a module as a value. Unknown modules and items are compile-time `NameError`s.
+  - **Imports.** `import geom [as g]` and `from geom import dot [as d], Point` are only allowed at module level. Before compiling, imports are resolved by an AST rewrite (`crates/lizzard-compiler/src/imports.rs`): every name an import binds (`dot`, `g.dot`) becomes the qualified global `geom.dot`, and the compiler registers the native signatures under those names. A function's parameters and locals shadow imported names. Redefining an imported name at module level is an error, and so is using a module as a value. Unknown modules and items are compile-time `NameError`s.
   - **Limitations.**
     - Rust traits have no default methods and no type parameters.
     - Natives cannot implement `Iterable`/`Iterator`.
     - `impl Trait for NativeClass` applies to the program that declares it: native trait objects are shared by programs, the program's traits are not.
-    - A generic native class supports only its registered instantiations: there is no generic Rust code behind `Stack<T>` for an arbitrary `T`, and each instantiation's values are converted (`FromSlim`/`IntoSlim`) when they cross into Rust.
+    - A generic native class supports only its registered instantiations: there is no generic Rust code behind `Stack<T>` for an arbitrary `T`, and each instantiation's values are converted (`FromLizzard`/`IntoLizzard`) when they cross into Rust.
     - Annotations need the class imported by name (`from m import C`); dotted type names (`m.C`) are not supported.
     - Error messages show qualified names such as `geom.Point`.
-    - `ThreadError` cannot be reached from slim code, since a local value never reaches another thread; the check exists for misuse from Rust.
+    - `ThreadError` cannot be reached from lizzard code, since a local value never reaches another thread; the check exists for misuse from Rust.
     - A local native object freed off its owner thread would be a VM bug. Debug builds panic; release builds leak the Rust value with a warning rather than drop it on the wrong thread.
-- **Extension modules (11).** A native module can also be a dynamic library that the `slim` interpreter loads at `import`, like a Python extension module. The same module definition works both ways (`examples/geom_ext` is loaded by `slim` and linked by `examples/embed_geom`):
+- **Extension modules (11).** A native module can also be a dynamic library that the `lizzard` interpreter loads at `import`, like a Python extension module. The same module definition works both ways (`examples/geom_ext` is loaded by `lizzard` and linked by `examples/embed_geom`):
 
   ```rust
-  // Cargo.toml: [lib] name = "geom", crate-type = ["cdylib"]; [dependencies] slim-ext
-  pub fn build(m: &mut slim_ext::Module) { m.function("dot", ..); m.class::<Polygon>("Polygon", ..); }
-  slim_ext::module!(geom, build);
+  // Cargo.toml: [lib] name = "geom", crate-type = ["cdylib"]; [dependencies] lizzard-ext
+  pub fn build(m: &mut lizzard_ext::Module) { m.function("dot", ..); m.class::<Polygon>("Polygon", ..); }
+  lizzard_ext::module!(geom, build);
   ```
 
-  - **Loading.** Before compiling, the runtime lists the program's imports. A module that no `Runtime::module` registered is looked up as `libgeom.so` / `libgeom.dylib` / `geom.dll` in the program's directory, then in each directory of `SLIM_PATH` (`Runtime::search_path`). Not found: the compiler's `NameError: no module named`. Found but unusable (not a library, no entry points, another ABI version, a panic while building, another module name): `ImportError: cannot load module ...`. A loaded library is never unloaded: the interpreter keeps its function pointers.
-  - **The ABI (`slim-abi`).** An extension exports `slim_ext_abi_version() -> u32` and `slim_ext_init(api, err) -> module`. The interpreter checks the version, then passes its function table `SlimApi` (`#[repr(C)]`, versioned by `ABI_VERSION` and its size). Everything goes through it:
+  - **Loading.** Before compiling, the runtime lists the program's imports. A module that no `Runtime::module` registered is looked up as `libgeom.so` / `libgeom.dylib` / `geom.dll` in the program's directory, then in each directory of `LIZZARD_PATH` (`Runtime::search_path`). Not found: the compiler's `NameError: no module named`. Found but unusable (not a library, no entry points, another ABI version, a panic while building, another module name): `ImportError: cannot load module ...`. A loaded library is never unloaded: the interpreter keeps its function pointers.
+  - **The ABI (`lizzard-abi`).** An extension exports `lizzard_ext_abi_version() -> u32` and `lizzard_ext_init(api, err) -> module`. The interpreter checks the version, then passes its function table `LizzardApi` (`#[repr(C)]`, versioned by `ABI_VERSION` and its size). Everything goes through it:
     - **Values** are `u64`s that the table's functions interpret (`incref`, `list_get`, `obj_enter`, ...). Each function says whether it borrows or takes the values it is given.
-    - **Scalars are read inline**, like CPython's macros: the table carries a `ValueLayout` (ABI version 2) with the small-int tagging, the `None`/`()`/`False`/`True` constants, and for heap objects the header bits that mark a boxed `int` or `float` and the offsets of their payloads. `slim-ext` reads ints, floats and bools, makes small ints and bools, and skips reference counting of immediates without calling the interpreter. The header bits (58–59 of the rc word, set at allocation and never changed) are the only object layout an extension sees; the payload offsets are measured on probe objects, since Rust does not fix the layout of `Body`.
+    - **Scalars are read inline**, like CPython's macros: the table carries a `ValueLayout` (ABI version 2) with the small-int tagging, the `None`/`()`/`False`/`True` constants, and for heap objects the header bits that mark a boxed `int` or `float` and the offsets of their payloads. `lizzard-ext` reads ints, floats and bools, makes small ints and bools, and skips reference counting of immediates without calling the interpreter. The header bits (58–59 of the rc word, set at allocation and never changed) are the only object layout an extension sees; the payload offsets are measured on probe objects, since Rust does not fix the layout of `Body`.
     - **Memory** is freed by the side that allocated it. The interpreter frees an extension's closures, formatters and Rust values with the extension's `FreeFn`s. Strings cross as borrowed `Str`s that the receiver copies (into a `StrOut` sink when the interpreter answers).
-    - **Errors.** An interpreter error is an owned `HostErr` that the extension reads (`err_read`), then frees or re-raises; a slim exception from a callback passes through unchanged. A native call reports failure by raising in its `Ctx` and returning false.
-    - **Panics** never cross the boundary. `slim-ext` catches them in every callback (`RuntimeError: native panic in f(): ...`), and the interpreter's module-building functions return errors instead of panicking.
+    - **Errors.** An interpreter error is an owned `HostErr` that the extension reads (`err_read`), then frees or re-raises; a lizzard exception from a callback passes through unchanged. A native call reports failure by raising in its `Ctx` and returning false.
+    - **Panics** never cross the boundary. `lizzard-ext` catches them in every callback (`RuntimeError: native panic in f(): ...`), and the interpreter's module-building functions return errors instead of panicking.
     - **Types and signatures** are byte descriptors (a tag per type; `CLASS` carries a class key). Class keys are allocated by the interpreter (`class_key_new`) and stand for the Rust type a class wraps: the extension maps each `TypeId` to its key, and the interpreter and compiler identify native classes by key. `TypeId`s are not comparable across separately built libraries.
     - **Native objects** hold an opaque pointer to the Rust value. The interpreter keeps the borrow counter, the thread check and the mode (`obj_enter`/`obj_leave`); the extension checks the class key before casting the pointer back to `&T`.
-  - **One binding implementation.** `slim-ext` holds the whole binding API (`Module`, `ClassBuilder`, `FromSlim`, `ListRef`, `Native<T>`, ...) and does not link the interpreter. A statically registered module (`Runtime::module`) is built through the same table, handed over directly, so the native tests exercise the ABI. An extension contains only `slim-ext` (two exported symbols), so it works with any interpreter of the same ABI version, whatever compiler built either.
+  - **One binding implementation.** `lizzard-ext` holds the whole binding API (`Module`, `ClassBuilder`, `FromLizzard`, `ListRef`, `Native<T>`, ...) and does not link the interpreter. A statically registered module (`Runtime::module`) is built through the same table, handed over directly, so the native tests exercise the ABI. An extension contains only `lizzard-ext` (two exported symbols), so it works with any interpreter of the same ABI version, whatever compiler built either.
   - **Cost.** Scalars cost no calls; other value accesses are a call through the table. Runtime types of containers are cached per thread by Rust type (except types that mention classes), and snapshots of small containers take one call. A native method call costs a few nanoseconds more than with direct access, and `dot` of two 3-element lists about 7 ns more (release build; it was 70 ns before the inline scalars and caches).
-  - **Limitations.** Compatibility is all or nothing: any change to the function table needs a new `ABI_VERSION`. A process connects `slim-ext` to one interpreter (`install` refuses a second table). A loaded extension's module is rebuilt (`slim_ext_init`) for each program a runtime runs.
+  - **Limitations.** Compatibility is all or nothing: any change to the function table needs a new `ABI_VERSION`. A process connects `lizzard-ext` to one interpreter (`install` refuses a second table). A loaded extension's module is rebuilt (`lizzard_ext_init`) for each program a runtime runs.
 
 ## Implementation notes (interpreter performance)
 - **Objects are 48 bytes**: the 8-byte rc word and a `Body` of at most 40 bytes (a compile-time assertion). Large or rare bodies (classes, traits, runtime types, iterators, generators, channels, native functions, classes and objects) are boxed, so ints, floats, strings, tuples, lists, dicts, instances and bound methods are one allocation of the common size.
 - **Free list.** Freed object memory goes to a per-thread free list (up to 8192 objects, returned at thread exit) that `alloc` reuses, as CPython does for floats; all objects have the same size, so one list serves every kind.
 - **Live-object count** (`rc_live()`, `--rc-audit`): threads count allocations minus frees locally and add them to the global count at each `rc_run` and at thread exit, so it is exact once other threads have finished.
 - **Peephole pass** (compiler, per function): within a basic block, drops of temporaries that hold an immediate or a constant are removed, and `op tmp, ..; Mov dst, tmp` becomes `op dst, ..` for simple ops.
-- **Fast calls.** A call of a known, non-generic slim function, or of an inherent method of a non-generic struct, whose arguments' types the compiler proved and that has no `keep` parameters, is marked `ArgList::fast`: the arguments are passed as they are and the callee starts at `Code::entry`, after its parameter checks. Other calls go through `invoke`.
+- **Fast calls.** A call of a known, non-generic lizzard function, or of an inherent method of a non-generic struct, whose arguments' types the compiler proved and that has no `keep` parameters, is marked `ArgList::fast`: the arguments are passed as they are and the callee starts at `Code::entry`, after its parameter checks. Other calls go through `invoke`.
 - **Registers on the native stack.** Frames with at most 24 registers live in a buffer on the native stack (interpreter threads have 256–512 MB stacks); generators and larger frames use the heap. Argument lists of up to 6 entries are collected inline too.
 - **Inline caches** (`Code::ics`, one `AtomicU64` per instruction): field loads and stores keep `(class id + 1) << 32 | slot`, method calls `(class id + 1) << 48 | method pointer` for inherent methods (which `find_method` tries first, so the cached result is exact). Classes are immutable, so entries never go stale; a miss looks the name up and refills the entry.
 - **Raw float arithmetic.** A `+ - * /` tree over `float`s (an `int` operand is converted, as `arith` does) compiles to raw f64 temporaries: `UnboxF` reads a leaf once, `LoadFieldF` reads a `float` field without boxing, `LoadRawF` loads a literal, `FArith` computes (`/` by zero raises `ZeroDivisionError`), and only the root is boxed (`BoxF`). Raw temporaries live in non-owned registers, so frame cleanup never sees them as values, and they never outlive the expression.
 - **Unboxed stores.** `x = <float arithmetic>` to a float local is `StoreRawF`: it overwrites the local's box in place when the local holds the only reference (count 1, not queued or revived; floats are immutable to programs, so no one can observe it), else it boxes. A float result for a `float` field of a struct literal is passed to `BuildStruct` raw (`Arg::raw`).
 - **Builtin calls.** Builtin functions and methods (`len`, `str`, `xs.append`, ...) take their arguments straight from the caller's registers (`call_builtin_fast`) when every `keep` argument is a copy value or an owned temporary; other calls use `invoke`. Builtin methods share the method inline cache, tagged by builtin type.
 - **Dicts** hash ints to themselves (as CPython does, which keeps keys used in order close together in memory) and other keys with a fast non-cryptographic hash (FxHash's word step and splitmix64's finisher), and probe like CPython (`i = 5i + 1 + perturb`, `perturb >>= 5`), so int patterns such as multiples of 2^20 do not cluster. Like CPython's int hash, neither resists deliberately colliding keys. A lookup compares the key words before calling `values_eq`.
-- **Strings** of up to 30 bytes are stored inside the object (`SlimStr::Inline`), so a short string is one allocation from the object free list; longer ones are a `Box<str>`. `str(int)` formats on the stack, and `+` writes the result directly.
+- **Strings** of up to 30 bytes are stored inside the object (`LizzardStr::Inline`), so a short string is one allocation from the object free list; longer ones are a `Box<str>`. `str(int)` formats on the stack, and `+` writes the result directly.
 - **Iterators** guard their state with a spin lock (never held across user code) instead of a mutex.
 - **Loops.** The peephole pass fuses a comparison with the conditional jump on its result (`CmpJump`, which still writes the result), a `for` loop's step with its variable's assignment (`ForIterSet`, which releases the old value), and reorders a range loop's `Dup tmp; Drop i; Mov i, tmp` into `Drop i; Dup i`. Back-edges pass a safepoint (and check the auto-rc threshold) every 64th iteration; skipping one only delays reclamation. A statement's `()` result is not dropped.
-- **Measured** (release, Apple M4 Pro, best of 5, against CPython 3.14, including startup: 2 ms for slim, 18 ms for CPython): `fib(32)` 0.27 s vs 0.15 s; a 30M-iteration int loop 0.77 s vs 0.60 s; 10M float updates 0.36 s vs 0.29 s; struct methods (`Vec2` add and dot) 0.52 s vs 0.35 s; building and iterating 10M list items 0.42 s vs 0.36 s; 4M dict operations 0.17 s vs 0.16 s; 1M string concatenations 0.095 s vs 0.080 s. What remains is mostly dispatch, which the JIT removes.
+- **Measured** (release, Apple M4 Pro, best of 5, against CPython 3.14, including startup: 2 ms for lizzard, 18 ms for CPython): `fib(32)` 0.27 s vs 0.15 s; a 30M-iteration int loop 0.77 s vs 0.60 s; 10M float updates 0.36 s vs 0.29 s; struct methods (`Vec2` add and dot) 0.52 s vs 0.35 s; building and iterating 10M list items 0.42 s vs 0.36 s; 4M dict operations 0.17 s vs 0.16 s; 1M string concatenations 0.095 s vs 0.080 s. What remains is mostly dispatch, which the JIT removes.

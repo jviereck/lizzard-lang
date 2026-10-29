@@ -1,4 +1,4 @@
-  File "err_struct_lit_infer.slim", line 6
+  File "err_struct_lit_infer.lz", line 6
         b = Box { items: [] }
                          ^
 TypeError: cannot infer the type of `[]`; annotate it (e.g. `xs: list<int> = []`)

@@ -1,3 +1,3 @@
-  File "err_no_main.slim"
+  File "err_no_main.lz"
 NameError: the program has no `main` function: define `def main() -> ():`
 [exit 1]

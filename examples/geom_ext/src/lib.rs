@@ -1,14 +1,14 @@
-//! The `geom` module: Rust functions, classes and a trait for slim.
+//! The `geom` module: Rust functions, classes and a trait for lizzard.
 //!
 //! Built two ways from this one definition:
 //! - an extension library (`libgeom.so` / `libgeom.dylib`), which the
-//!   `slim` interpreter loads when a program does `import geom`;
+//!   `lizzard` interpreter loads when a program does `import geom`;
 //! - a Rust library, which a host program links and registers statically
 //!   (`examples/embed_geom`: `rt.module("geom", geom::build)`).
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use slim_ext::{ClassBuilder, FromSlim, IntoSlim, ListRef, Module, SlimError};
+use lizzard_ext::{ClassBuilder, FromLizzard, IntoLizzard, ListRef, Module, LizzardError};
 
 /// Shared between threads: methods take `&self`.
 struct Counter(AtomicI64);
@@ -32,12 +32,12 @@ impl Polygon {
     }
 }
 
-/// A generic Rust type: slim sees `Stack<T>` for the registered `T`s.
+/// A generic Rust type: lizzard sees `Stack<T>` for the registered `T`s.
 struct Stack<T> {
     items: Vec<T>,
 }
 
-fn stack<T: FromSlim + IntoSlim + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) {
+fn stack<T: FromLizzard + IntoLizzard + Send + Sync + 'static>(c: &mut ClassBuilder<Stack<T>>) {
     c.init(|| Stack { items: Vec::new() });
     c.method_mut("push", |s: &mut Stack<T>, x: T| s.items.push(x));
     c.method_mut("pop", |s: &mut Stack<T>| s.items.pop());
@@ -46,9 +46,9 @@ fn stack<T: FromSlim + IntoSlim + Send + Sync + 'static>(c: &mut ClassBuilder<St
 
 /// Defines the module's items.
 pub fn build(m: &mut Module) {
-    m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| -> Result<f64, SlimError> {
+    m.function("dot", |a: ListRef<f64>, b: ListRef<f64>| -> Result<f64, LizzardError> {
         if a.len() != b.len() {
-            return Err(SlimError::value_error(format!("dot(): lengths {} and {} differ", a.len(), b.len())));
+            return Err(LizzardError::value_error(format!("dot(): lengths {} and {} differ", a.len(), b.len())));
         }
         Ok(a.to_vec().iter().zip(b.to_vec()).map(|(x, y)| x * y).sum())
     });
@@ -57,7 +57,7 @@ pub fn build(m: &mut Module) {
         c.method("inc", |c: &Counter| c.0.fetch_add(1, Ordering::Relaxed) + 1);
         c.method("get", |c: &Counter| c.0.load(Ordering::Relaxed));
     });
-    // A trait for Rust and slim classes alike.
+    // A trait for Rust and lizzard classes alike.
     m.trait_def("Shape", |t| {
         t.method::<(), f64>("area");
     });
@@ -76,4 +76,4 @@ pub fn build(m: &mut Module) {
     });
 }
 
-slim_ext::module!(geom, build);
+lizzard_ext::module!(geom, build);

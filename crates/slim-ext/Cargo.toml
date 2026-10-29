@@ -1,7 +1,0 @@
-[package]
-name = "slim-ext"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-slim-abi = { path = "../slim-abi" }

@@ -1,4 +1,4 @@
-  File "err_use_after_move.slim", line 4
+  File "err_use_after_move.lz", line 4
         print(a)
               ^
 OwnershipError: `a` was moved and can no longer be used; use `a++` before moving it to keep a reference

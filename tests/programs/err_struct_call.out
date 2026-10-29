@@ -1,4 +1,4 @@
-  File "err_struct_call.slim", line 7
+  File "err_struct_call.lz", line 7
         p = Point(1.0, 2.0)
                  ^
 TypeError: `Point` is a struct: create it with a literal `Point { .. }` or an associated function (`Point::new(...)`)

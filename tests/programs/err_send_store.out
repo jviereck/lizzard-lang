@@ -1,4 +1,4 @@
-  File "err_send_store.slim", line 12
+  File "err_send_store.lz", line 12
         shared["b"] <- mine
         ^
 TypeError: `Bag` is not `Send` and cannot be used as `any + Send`

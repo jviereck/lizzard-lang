@@ -1,0 +1,10 @@
+[package]
+name = "lizzard-vm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lizzard-abi = { path = "../lizzard-abi" }
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"

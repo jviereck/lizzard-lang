@@ -1,0 +1,12 @@
+[package]
+name = "lizzard"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lizzard-abi = { path = "../lizzard-abi" }
+lizzard-ext = { path = "../lizzard-ext" }
+lizzard-syntax = { path = "../lizzard-syntax" }
+lizzard-vm = { path = "../lizzard-vm" }
+lizzard-compiler = { path = "../lizzard-compiler" }
+libloading = "0.9"

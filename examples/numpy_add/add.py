@@ -1,11 +1,11 @@
-# slim: module
+# lizzard: module
 import numpy as np
 import numpy.typing as npt
 
 
 def add(a: npt.NDArray[np.float32], b: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     # A normal call into NumPy: the overlay resolves float32 + float32 to NDArray[float32],
-    # and slim checks the result's type and dtype when the call returns.
+    # and lizzard checks the result's type and dtype when the call returns.
     return a + b
 
 
@@ -24,4 +24,4 @@ if __name__ == "__main__":
     y = np.full(5, 0.5, dtype=np.float32)
     print(add(x, y))                       # [0.5 1.5 2.5 3.5 4.5]
     print(add_loop(x, y))                  # [0.5 1.5 2.5 3.5 4.5]
-    add(x, x.astype(np.float64))           # slim: static error, b must be float32
+    add(x, x.astype(np.float64))           # lizzard: static error, b must be float32

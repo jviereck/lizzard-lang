@@ -1,4 +1,4 @@
-  File "err_send_closure.slim", line 15
+  File "err_send_closure.lz", line 15
         job = Job { run: || str(b.item) }
                     ^
 TypeError: a `function` may hold values that are not `Send` and cannot be used as `function + Send`

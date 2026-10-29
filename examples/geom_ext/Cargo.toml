@@ -5,10 +5,10 @@ edition.workspace = true
 publish = false
 
 # The `geom` module as an extension (`libgeom.so` / `libgeom.dylib`), which
-# `slim` loads at `import geom`; also a library for static embedding.
+# `lizzard` loads at `import geom`; also a library for static embedding.
 [lib]
 name = "geom"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-slim-ext = { path = "../../crates/slim-ext" }
+lizzard-ext = { path = "../../crates/lizzard-ext" }

@@ -1,4 +1,4 @@
 target/
 .venv-*/
 __pycache__/
-crates/slim-py/python/slim/*.so
+crates/lizzard-py/python/lizzard/*.so

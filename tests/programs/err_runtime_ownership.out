@@ -2,6 +2,6 @@
 3
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_runtime_ownership.slim", line 9, in main
+  File "err_runtime_ownership.lz", line 9, in main
 OwnershipError: `data` was moved and can no longer be used
 [exit 1]

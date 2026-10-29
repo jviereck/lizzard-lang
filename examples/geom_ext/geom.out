@@ -5,7 +5,7 @@ Polygon(4 points) area: 4.0 points: 4
 shape area: 4.0
 shape area: 3.14159
 a shape of area 4.0
-stack: 2 slim
+stack: 2 lizzard
 stack: 1
 error: `Stack<float>` is not available: `Stack` supports `Stack<int>`, `Stack<str>`
 rc-audit: ok

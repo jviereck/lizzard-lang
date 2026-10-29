@@ -1,0 +1,8 @@
+[package]
+name = "lizzard-compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lizzard-syntax = { path = "../lizzard-syntax" }
+lizzard-vm = { path = "../lizzard-vm" }

@@ -1,0 +1,17 @@
+[package]
+name = "lizzard-py"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "_lizzard"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+lizzard-py-front = { path = "../lizzard-py-front" }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = "0.29"

@@ -1,7 +1,7 @@
 rc-audit: ok
 Traceback (most recent call last):
-  File "err_traceback.slim", line 9, in main
-  File "err_traceback.slim", line 5, in outer
-  File "err_traceback.slim", line 2, in inner
+  File "err_traceback.lz", line 9, in main
+  File "err_traceback.lz", line 5, in outer
+  File "err_traceback.lz", line 2, in inner
 KeyError: 'missing'
 [exit 1]

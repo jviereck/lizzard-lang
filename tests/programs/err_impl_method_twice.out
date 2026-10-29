@@ -1,4 +1,4 @@
-  File "err_impl_method_twice.slim", line 8
+  File "err_impl_method_twice.lz", line 8
     impl Box<int>:
     ^
 TypeError: method `get` is defined twice: in `impl Box<int>` and in the impl for every `Box`

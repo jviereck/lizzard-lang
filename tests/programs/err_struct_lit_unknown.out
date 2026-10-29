@@ -1,4 +1,4 @@
-  File "err_struct_lit_unknown.slim", line 6
+  File "err_struct_lit_unknown.lz", line 6
         a = A { x: 1, z: 2 }
                       ^
 AttributeError: struct `A` has no field `z`

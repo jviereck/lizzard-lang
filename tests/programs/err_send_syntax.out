@@ -1,4 +1,4 @@
-  File "err_send_syntax.slim", line 2
+  File "err_send_syntax.lz", line 2
     def show(x: any + Local) -> str:
                       ^
 SyntaxError: `+ Local` was removed: as in Rust, types are `Send` or not. `any`, `function`, `Iterator<T>` and trait types may hold values that are not `Send`; write `any + Send` for one that can cross threads

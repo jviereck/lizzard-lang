@@ -1,4 +1,4 @@
-  File "err_ambiguous_bound.slim", line 8
+  File "err_ambiguous_bound.lz", line 8
         x.area()
               ^
 TypeError: `area` is ambiguous for `T`: `Shape::area` or `Land::area`; call it as `Shape::area(x)`

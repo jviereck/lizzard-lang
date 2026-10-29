@@ -1,4 +1,4 @@
-  File "err_struct_init.slim", line 5
+  File "err_struct_init.lz", line 5
         def __init__(self, x: float) -> ():
         ^
 TypeError: structs have no `__init__`: define `def new(...) -> Self:` returning `Point { .. }` and call `Point::new(...)`

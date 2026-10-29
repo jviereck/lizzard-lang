@@ -1,4 +1,4 @@
-  File "err_impl_assoc_fn.slim", line 5
+  File "err_impl_assoc_fn.lz", line 5
         def zero() -> Self:
         ^
 TypeError: `zero`: associated functions need an impl of the whole struct (`impl<..> S<..>:`), not `impl Box<int>`

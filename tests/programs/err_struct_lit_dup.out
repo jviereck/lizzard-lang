@@ -1,4 +1,4 @@
-  File "err_struct_lit_dup.slim", line 6
+  File "err_struct_lit_dup.lz", line 6
         a = A { x: 1, x: 2 }
                       ^
 SyntaxError: field `x` is given twice

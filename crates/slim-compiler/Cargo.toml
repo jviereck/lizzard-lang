@@ -1,8 +1,0 @@
-[package]
-name = "slim-compiler"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-slim-syntax = { path = "../slim-syntax" }
-slim-vm = { path = "../slim-vm" }

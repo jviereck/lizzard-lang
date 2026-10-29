@@ -1,4 +1,4 @@
-  File "err_class_keyword.slim", line 2
+  File "err_class_keyword.lz", line 2
         class Point:
         ^
 SyntaxError: there are no classes: as in Rust, declare the data with `struct Name:` and the methods in `impl Name:` / `impl Trait for Name:` blocks

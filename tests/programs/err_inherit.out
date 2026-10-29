@@ -1,4 +1,4 @@
-  File "err_inherit.slim", line 5
+  File "err_inherit.lz", line 5
     impl Base for Child
          ^
 TypeError: `Base` is a struct, not a trait; structs cannot inherit (use a field and delegate by hand)

@@ -1,0 +1,6 @@
+[package]
+name = "lizzard-abi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
