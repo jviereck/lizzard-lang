@@ -428,6 +428,9 @@ impl<'a> Lower<'a> {
                 };
                 RtCheck::NdArray { scalar, ndim }
             }
+            // `isinstance` does not work with a Protocol (unless it is
+            // runtime-checkable): the static check is the check.
+            Ty::Inst(c, _) if self.db.is_protocol(*c) => RtCheck::Any,
             Ty::Inst(c, _) => RtCheck::Instance(self.db.runtime_class(t).unwrap_or_else(|| self.db.qualname(*c).to_string())),
             // A rigid variable (`Self`, a class's type parameter) is checked
             // against its bound.
@@ -538,6 +541,9 @@ impl<'a> Lower<'a> {
         for s in &cd.body {
             let soff = self.at(s);
             match s {
+                // A protocol's methods only declare an interface: they stay
+                // Python functions.
+                Stmt::FunctionDef(_) if self.db.is_protocol(c) => {}
                 Stmt::FunctionDef(d) => {
                     if d.name.as_str() == "__init__" {
                         init = Some(d);
@@ -3118,6 +3124,14 @@ impl<'a> Lower<'a> {
             }
             Ty::Func(FuncRef::Def(f)) => self.call_result(f, None, &pos, &kws, off, origin),
             Ty::Func(FuncRef::Bound(f, recv)) => self.call_result(f, Some(*recv), &pos, &kws, off, origin),
+            // An instance with `__call__`.
+            t @ (Ty::Inst(..) | Ty::Var(_)) if matches!(self.lookup_ty(&t), Ty::Inst(c, _) if self.db.find_member(c, "__call__").is_some()) => {
+                let Ty::Inst(c, _) = self.lookup_ty(&t) else { unreachable!() };
+                match self.db.find_member(c, "__call__") {
+                    Some((_, Member::Method(f))) => self.call_result(f, Some(t), pos, kws, off, origin),
+                    _ => Ty::Any,
+                }
+            }
             Ty::Callable(ps, r) => {
                 if let Some(ps) = ps {
                     if !kws.is_empty() {
@@ -3447,15 +3461,12 @@ impl<'a> Lower<'a> {
             ast::Operator::FloorDiv => (BinOp::FloorDiv, "__floordiv__", "__rfloordiv__"),
             ast::Operator::Mod => (BinOp::Mod, "__mod__", "__rmod__"),
             ast::Operator::Pow => (BinOp::Pow, "__pow__", "__rpow__"),
+            ast::Operator::MatMult => (BinOp::MatMul, "__matmul__", "__rmatmul__"),
             ast::Operator::BitOr => (BinOp::BitOr, "__or__", "__ror__"),
             ast::Operator::BitAnd => (BinOp::BitAnd, "__and__", "__rand__"),
             ast::Operator::BitXor => (BinOp::BitXor, "__xor__", "__rxor__"),
             ast::Operator::LShift => (BinOp::LShift, "__lshift__", "__rlshift__"),
             ast::Operator::RShift => (BinOp::RShift, "__rshift__", "__rrshift__"),
-            _ => {
-                self.err(off, format!("operator `{}` is not supported by Lizzard yet", op.as_str()));
-                return self.any();
-            }
         };
         let (lt, rt) = (l.ty.clone(), r.ty.clone());
         let pow = match (bop, &lt, &rt) {
@@ -3466,7 +3477,20 @@ impl<'a> Lower<'a> {
             (BinOp::Pow, Ty::Int | Ty::Bool | Ty::Float, Ty::Float) => Some(Ty::Any),
             _ => None,
         };
-        let (ty, origin) = match pow.map(|t| (t, None)).or_else(|| self.binop_type(bop, dunder, rdunder, &lt, &rt)) {
+        // `a += b` uses `a.__iadd__(b)` when it is defined.
+        let in_place = if inplace && matches!(self.lookup_ty(&lt), Ty::Inst(..)) {
+            match self.dunder(&lt, &format!("__i{}", &dunder[2..]), std::slice::from_ref(&rt)) {
+                Some(Ok((t, file, doff))) => Some((t, self.origin(file, doff))),
+                Some(Err(m)) => {
+                    self.err(off, m);
+                    Some((Ty::Any, None))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (ty, origin) = match in_place.or_else(|| pow.map(|t| (t, None))).or_else(|| self.binop_type(bop, dunder, rdunder, &lt, &rt)) {
             Some(x) => x,
             None => {
                 let (ls, rs) = (self.show(&lt), self.show(&rt));
@@ -3525,62 +3549,122 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// A comparison; a chain `a < b <= c` is `a < b and b <= c` with `b`
+    /// evaluated once, its value the first false result or the last one.
     fn compare(&mut self, c: &ast::ExprCompare, e: &Expr) -> Val {
-        let off: u32 = c.range().start().into();
-        if c.ops.len() != 1 {
-            self.err(off, "chained comparisons are not supported by Lizzard yet");
-            return self.any();
+        let mut l = self.expr(&c.operands[0]);
+        if c.ops.len() == 1 {
+            let r = self.expr(&c.operands[1]);
+            let what = self.src(e);
+            return self.compare_vals(c.ops[0], l, r, c.range().start().into(), what);
         }
-        let (op, dunder) = match c.ops[0] {
-            ast::CmpOp::Eq => (CmpOp::Eq, "__eq__"),
-            ast::CmpOp::NotEq => (CmpOp::Ne, "__ne__"),
-            ast::CmpOp::Lt => (CmpOp::Lt, "__lt__"),
-            ast::CmpOp::LtE => (CmpOp::Le, "__le__"),
-            ast::CmpOp::Gt => (CmpOp::Gt, "__gt__"),
-            ast::CmpOp::GtE => (CmpOp::Ge, "__ge__"),
-            ast::CmpOp::Is => (CmpOp::Is, ""),
-            ast::CmpOp::IsNot => (CmpOp::IsNot, ""),
-            ast::CmpOp::In => (CmpOp::In, "__contains__"),
-            ast::CmpOp::NotIn => (CmpOp::NotIn, "__contains__"),
+        let dst = self.reg(Repr::Obj);
+        let mut tys = Vec::new();
+        let mut exits = Vec::new();
+        for (i, op) in c.ops.iter().enumerate() {
+            let rhs = &c.operands[i + 1];
+            let r = self.expr(rhs);
+            let off: u32 = c.operands[i].range().start().into();
+            let what = format!("{} {} {}", self.src(&c.operands[i]), op.as_str(), self.src(rhs));
+            let v = self.compare_vals(*op, l, r.clone(), off, what);
+            tys.push(v.ty.clone());
+            let o = self.obj(&v);
+            self.emit(Instr::Move { dst, src: o });
+            if i + 1 < c.ops.len() {
+                let t = self.reg(Repr::Bool);
+                self.emit(Instr::Truthy { dst: t, src: dst });
+                exits.push(self.emit(Instr::JumpIfFalse { cond: t, target: 0 }));
+            }
+            l = r;
+        }
+        let h = self.here();
+        for j in exits {
+            self.patch(j, h);
+        }
+        Val { reg: dst, ty: union(tys), repr: Repr::Obj }
+    }
+
+    /// `l op r` for evaluated operands.
+    fn compare_vals(&mut self, cop: ast::CmpOp, l: Val, r: Val, off: u32, what: String) -> Val {
+        let (op, dunder, reflected) = match cop {
+            ast::CmpOp::Eq => (CmpOp::Eq, "__eq__", "__eq__"),
+            ast::CmpOp::NotEq => (CmpOp::Ne, "__ne__", "__ne__"),
+            ast::CmpOp::Lt => (CmpOp::Lt, "__lt__", "__gt__"),
+            ast::CmpOp::LtE => (CmpOp::Le, "__le__", "__ge__"),
+            ast::CmpOp::Gt => (CmpOp::Gt, "__gt__", "__lt__"),
+            ast::CmpOp::GtE => (CmpOp::Ge, "__ge__", "__le__"),
+            ast::CmpOp::Is => (CmpOp::Is, "", ""),
+            ast::CmpOp::IsNot => (CmpOp::IsNot, "", ""),
+            ast::CmpOp::In => (CmpOp::In, "__contains__", ""),
+            ast::CmpOp::NotIn => (CmpOp::NotIn, "__contains__", ""),
         };
-        let l = self.expr(&c.operands[0]);
-        let r = self.expr(&c.operands[1]);
-        let ty = match (&l.ty, &r.ty) {
+        let (lt, rt) = (l.ty.clone(), r.ty.clone());
+        let ty = match (&lt, &rt) {
             _ if dunder.is_empty() => Ty::Bool,
             // `x in container`: `container.__contains__(x)`.
-            (lt, rt) if matches!(op, CmpOp::In | CmpOp::NotIn) => {
-                let (lt, rt) = (lt.clone(), rt.clone());
-                match &rt {
-                    Ty::Any => {}
-                    _ => match self.dunder(&rt, "__contains__", std::slice::from_ref(&lt)) {
+            _ if matches!(op, CmpOp::In | CmpOp::NotIn) => {
+                if !matches!(rt, Ty::Any) {
+                    match self.dunder(&rt, "__contains__", std::slice::from_ref(&lt)) {
                         Some(Ok(_)) => {}
                         Some(Err(m)) => self.err(off, m),
                         None => {
                             let ts = self.show(&rt);
                             self.err(off, format!("{ts} does not support `in`"));
                         }
-                    },
+                    }
                 }
                 Ty::Bool
             }
             (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
-            (lt @ Ty::Inst(..), rt) => {
-                let (lt, rt) = (lt.clone(), rt.clone());
-                match self.dunder(&lt, dunder, &[rt]) {
-                    Some(Ok((t, _, _))) => t,
-                    Some(Err(_)) => Ty::Any,
-                    None => Ty::Bool,
-                }
-            }
-            _ => Ty::Bool,
+            _ => self.compare_type(op, dunder, reflected, &lt, &rt, off, cop),
         };
         let (a, b) = (self.obj(&l), self.obj(&r));
         let dst = self.reg(Repr::Obj);
         self.emit(Instr::Compare { dst, op, a, b });
         let v = Val { reg: dst, ty, repr: Repr::Obj };
-        let what = self.src(e);
         self.check(&v, what, None);
         v
+    }
+
+    /// The type of a rich comparison: the left operand's method, else the
+    /// right operand's reflected one (`a > b` is `b.__lt__(a)`), as Python
+    /// tries them. Ordering a user class that defines neither is an error;
+    /// `==` and `!=` fall back to identity.
+    fn compare_type(&mut self, op: CmpOp, dunder: &str, reflected: &str, lt: &Ty, rt: &Ty, off: u32, cop: ast::CmpOp) -> Ty {
+        let user = |l: &mut Self, t: &Ty| match l.lookup_ty(t) {
+            Ty::Inst(c, _) => l.db.is_user_class(c),
+            _ => false,
+        };
+        let mut first_err = None;
+        match self.dunder(lt, dunder, std::slice::from_ref(rt)) {
+            Some(Ok((t, _, _))) => return t,
+            Some(Err(m)) => first_err = Some(m),
+            None => {}
+        }
+        match self.dunder(rt, reflected, std::slice::from_ref(lt)) {
+            Some(Ok((t, _, _))) => return t,
+            Some(Err(m)) => first_err = first_err.or(Some(m)),
+            None => {}
+        }
+        // Ordering builtin values of unrelated kinds raises TypeError.
+        let kind = |t: &Ty| match t {
+            Ty::Int | Ty::Float | Ty::Bool => Some(0),
+            Ty::Str => Some(1),
+            Ty::None => Some(2),
+            _ => None,
+        };
+        let mismatched = matches!((kind(lt), kind(rt)), (Some(a), Some(b)) if a != b || a == 2);
+        if matches!(op, CmpOp::Eq | CmpOp::Ne) || !(user(self, lt) || user(self, rt) || mismatched) {
+            return Ty::Bool;
+        }
+        match first_err {
+            Some(m) => self.err(off, m),
+            None => {
+                let (a, b) = (self.show(lt), self.show(rt));
+                self.err(off, format!("`{}` is not supported between {a} and {b}", cop.as_str()));
+            }
+        }
+        Ty::Bool
     }
 
     fn boolop(&mut self, b: &ast::ExprBoolOp) -> Val {

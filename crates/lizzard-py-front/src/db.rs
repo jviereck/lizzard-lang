@@ -214,11 +214,16 @@ pub struct ClassInfo {
     mro: Option<Vec<ClassId>>,
     /// A base class is untyped (`Any`): unknown members are `Any`.
     any_base: bool,
+    /// Declared with `Protocol` among its bases: other classes match it
+    /// structurally.
+    protocol: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct DataclassOpts {
     pub frozen: bool,
+    /// `order=True`: `<`, `<=`, `>`, `>=` compare the fields as tuples.
+    pub order: bool,
     pub kw_only: bool,
     pub init: bool,
 }
@@ -789,7 +794,7 @@ impl Db {
         }
         let s = match self.modules[m].kind {
             ModKind::Typing => match name {
-                "Iterable" | "Iterator" | "Sequence" | "Generator" => self.builtin(name),
+                "Iterable" | "Iterator" | "Sequence" | "Generator" | "SupportsAbs" => self.builtin(name),
                 "List" | "Dict" | "Set" | "FrozenSet" => self.builtin(&name.to_lowercase()),
                 _ => special_sym(name),
             },
@@ -978,6 +983,7 @@ impl Db {
             self_tv: None,
             mro: None,
             any_base: false,
+            protocol: false,
         });
         let c = self.classes.len() - 1;
         self.class_keys.insert(key, c);
@@ -1042,8 +1048,13 @@ impl Db {
                     Expr::Subscript(s) => &s.value,
                     e => e,
                 };
-                if matches!(self.sym_of_expr(m, target), Some(Sym::Special(_))) {
-                    continue;
+                match self.sym_of_expr(m, target) {
+                    Some(Sym::Special(Special::Protocol)) => {
+                        self.classes[c].protocol = true;
+                        continue;
+                    }
+                    Some(Sym::Special(_)) => continue,
+                    _ => {}
                 }
                 let tps = self.class_tparams(c);
                 let ty = self.eval_type(base, &Scope { m, tparams: &tps, self_ty: None });
@@ -1131,6 +1142,84 @@ impl Db {
         out
     }
 
+    /// Whether `c` is a `Protocol` class (declared with `Protocol` among its
+    /// bases, or a protocol's subclass that adds `Protocol` again).
+    pub fn is_protocol(&mut self, c: ClassId) -> bool {
+        self.class_bases(c);
+        self.classes[c].protocol
+    }
+
+    /// The members a protocol declares: its own and its protocol bases'.
+    fn protocol_members(&mut self, p: ClassId) -> Vec<String> {
+        let mut names = Vec::new();
+        for k in self.mro(p) {
+            if !self.is_protocol(k) {
+                continue;
+            }
+            let decl = self.classes[k].decl.clone();
+            for (stmt, _) in decl.overlay.iter().chain(decl.base.iter()) {
+                let mut flat = Vec::new();
+                self.flatten(&stmt.body, &mut flat);
+                for st in flat {
+                    let n = match st {
+                        Stmt::FunctionDef(f) => f.name.to_string(),
+                        Stmt::AnnAssign(a) => match &*a.target {
+                            Expr::Name(n) => n.id.to_string(),
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    if !names.contains(&n) && !matches!(n.as_str(), "__init__" | "__slots__" | "__class_getitem__") {
+                        names.push(n);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// `src` (an instance of `c`) as an instance of protocol `p`: it has
+    /// every member `p` declares, with compatible types.
+    fn structural_assign(&mut self, c: ClassId, src: &Ty, p: ClassId, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
+        for name in self.protocol_members(p) {
+            let Some((_, want)) = self.find_member(p, &name) else { return false };
+            let Some((cowner, got)) = self.find_member(c, &name) else { return false };
+            let ok = match (want, got) {
+                (Member::Method(fp), Member::Method(fc)) => {
+                    let (w, g) = (self.callable_of(&Ty::Func(FuncRef::Bound(fp, Box::new(dst.clone())))), self.callable_of(&Ty::Func(FuncRef::Bound(fc, Box::new(src.clone())))));
+                    match (w, g) {
+                        (Some(w), Some(g)) => self.assign(&g, &w, s, any),
+                        // Overloaded: present is enough.
+                        _ => true,
+                    }
+                }
+                (want @ (Member::Attr(_) | Member::Property(_)), got) => {
+                    let tp = match want {
+                        Member::Property(f) => self.sigs(f).first().map_or(Ty::Any, |sg| sg.ret.clone()),
+                        Member::Attr(t) => t,
+                        Member::Method(_) => unreachable!(),
+                    };
+                    let pmap: Subst = self.class_params(p).into_iter().zip(match dst { Ty::Inst(_, a) => a.clone(), _ => Vec::new() }).collect();
+                    let tp = deep_subst(&tp, &pmap);
+                    let tc = match got {
+                        Member::Attr(t) => {
+                            let cmap: Subst = self.class_params(cowner).into_iter().zip(match src { Ty::Inst(_, a) => a.clone(), _ => Vec::new() }).collect();
+                            deep_subst(&t, &cmap)
+                        }
+                        Member::Property(f) => self.sigs(f).first().map_or(Ty::Any, |sg| sg.ret.clone()),
+                        Member::Method(_) => return false,
+                    };
+                    self.assign(&tc, &tp, s, any)
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The builtin exception class a class derives from, if any.
     pub fn exc_base(&mut self, c: ClassId) -> Option<String> {
         for k in self.mro(c) {
@@ -1167,7 +1256,7 @@ impl Db {
                 kws.and_then(|k| k.iter().find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name)))
                     .map_or(default, |k| matches!(k.value, Expr::BooleanLiteral(ref b) if b.value))
             };
-            return Some(DataclassOpts { frozen: flag("frozen", false), kw_only: flag("kw_only", false), init: flag("init", true) });
+            return Some(DataclassOpts { frozen: flag("frozen", false), order: flag("order", false), kw_only: flag("kw_only", false), init: flag("init", true) });
         }
         None
     }
@@ -1327,8 +1416,27 @@ impl Db {
         if found.is_none() && name == "__init__" && self.dataclass_opts(c).is_some_and(|o| o.init) {
             found = Some(Member::Method(self.dataclass_init(c)));
         }
+        if found.is_none() && matches!(name, "__lt__" | "__le__" | "__gt__" | "__ge__") && self.dataclass_opts(c).is_some_and(|o| o.order) {
+            found = Some(Member::Method(self.dataclass_order(c, name)));
+        }
         self.classes[c].members.insert(name.to_string(), found.clone());
         found
+    }
+
+    /// An ordering method `@dataclass(order=True)` generates: it compares
+    /// with an instance of the same class.
+    fn dataclass_order(&mut self, c: ClassId, name: &str) -> FuncId {
+        let m = self.classes[c].m;
+        let f = self.func_for(m, Some(c), name, Vec::new());
+        let self_ty = Ty::Var(self.self_tv(c));
+        let params = vec![
+            Param { name: "self".into(), ty: self_ty.clone(), kind: PKind::PosOnly, default: false },
+            Param { name: "other".into(), ty: self_ty, kind: PKind::PosOnly, default: false },
+        ];
+        let file = self.modules[m].file.unwrap_or(0);
+        let off = self.header(c).range().start().into();
+        self.funcs[f].sigs = Some(Rc::new(vec![Sig { params, ret: Ty::Bool, file, off }]));
+        f
     }
 
     /// The `__init__` `@dataclass` generates, as a function with a signature
@@ -1778,7 +1886,16 @@ impl Db {
     /// with `__iter__` (and `__next__`) of the right types is one.
     fn protocol_assign(&mut self, src: &Ty, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
         let (Ty::Inst(c, _), Ty::Inst(d, dargs)) = (src, dst) else { return false };
-        if !self.is_builtin_class(*d) || dargs.len() != 1 || self.protocol_depth > 4 {
+        if self.protocol_depth > 4 {
+            return false;
+        }
+        if self.is_protocol(*d) {
+            self.protocol_depth += 1;
+            let ok = self.structural_assign(*c, src, *d, dst, s, any);
+            self.protocol_depth -= 1;
+            return ok;
+        }
+        if !self.is_builtin_class(*d) || dargs.len() != 1 {
             return false;
         }
         let want = match self.classes[*d].name.as_str() {

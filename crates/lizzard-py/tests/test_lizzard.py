@@ -27,6 +27,7 @@ GENERICS = HERE / "programs" / "generics.py"
 CLOSURES = HERE / "programs" / "closures.py"
 DATACLASSES = HERE / "programs" / "dataclasses_demo.py"
 GENERATORS = HERE / "programs" / "generators.py"
+OPERATORS = HERE / "programs" / "operators.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -166,7 +167,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS):
             with self.subTest(prog.name):
                 lizzard = run("-m", "lizzard", str(prog))
                 plain = run(str(prog))

@@ -382,3 +382,37 @@ fn generators_are_typed() {
         ]
     );
 }
+
+#[test]
+fn operator_overloading_is_checked() {
+    let d = check(
+        "class Acc:\n    def __init__(self) -> None:\n        self.n: int = 0\n    def __iadd__(self, k: int) -> Acc:\n        self.n += k\n        return self\n    def __lt__(self, o: Acc) -> bool:\n        return self.n < o.n\n    def __matmul__(self, o: Acc) -> int:\n        return self.n * o.n\n    def __call__(self, k: int) -> str:\n        return \"\"\n\nclass Plain:\n    pass\n\ndef f() -> None:\n    a = Acc()\n    a += 2\n    a += \"x\"\n    ok: bool = Acc() > Acc()\n    m: int = a @ a\n    s: str = a(1)\n    a(\"x\")\n    b = Plain() < Plain()\n    c = Acd() if False else Acc() < 3\n    e = Plain() == Plain()\n    Plain()(1)\n    h = 1 < 2 < \"x\"\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "argument `k` of __iadd__(): expected int, got str",
+            "argument `k` of __call__(): expected int, got str",
+            "`<` is not supported between Plain and Plain",
+            "name `Acd` is not defined",
+            "argument `o` of __lt__(): expected Acc, got int",
+            "Plain is not callable",
+            "`<` is not supported between int and str",
+        ]
+    );
+}
+
+#[test]
+fn protocols_match_structurally() {
+    let d = check(
+        "from typing import Protocol\n\nclass Shape(Protocol):\n    def area(self) -> float: ...\n\nclass Sq:\n    def area(self) -> float:\n        return 1.0\n\nclass Named:\n    def area(self) -> str:\n        return \"x\"\n\nclass V:\n    def __abs__(self) -> float:\n        return 1.0\n\ndef total(shapes: list[Shape]) -> float:\n    return shapes[0].area()\n\ndef f() -> None:\n    total([Sq()])\n    total([Named()])\n    s: Shape = Sq()\n    a: float = abs(V())\n    b: str = abs(V())\n    abs(Sq())\n",
+    );
+    assert_eq!(
+        d,
+        [
+            "a list item must be Shape, got Named",
+            "cannot assign float to `b` of type str",
+            "no overload of abs() accepts (Sq)",
+        ]
+    );
+}

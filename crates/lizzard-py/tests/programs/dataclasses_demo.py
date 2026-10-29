@@ -21,7 +21,7 @@ class Point3(Point):
     z: float = 0.0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Version:
     major: int
     minor: int
@@ -62,7 +62,7 @@ def main() -> None:
     q = Point3(1.0, 2.0, 3.0)
     print(q, q.z, Point3(1.0, z=5.0))
     v = Version(1, 2)
-    print(v, v.bump(), v < v.bump() if False else v == Version(1, 2))
+    print(v, v.bump(), v < v.bump(), v >= Version(2, 0), v == Version(1, 2), max(v, v.bump()))
     inv = Inventory("ann")
     inv.add("apple")
     inv.add("apple")

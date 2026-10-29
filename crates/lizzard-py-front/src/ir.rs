@@ -32,6 +32,7 @@ pub enum BinOp {
     FloorDiv,
     Mod,
     Pow,
+    MatMul,
     BitOr,
     BitAnd,
     BitXor,
