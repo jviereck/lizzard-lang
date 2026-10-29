@@ -14,6 +14,7 @@ use lizzard_py_front::ir::{BinOp, CmpOp, Const, Direct, FuncIr, Instr, ParamKind
 
 use crate::array;
 use crate::frame::{unbound, Regs};
+use crate::bytecode::{self, Opc};
 use crate::globals;
 use crate::jit;
 use crate::ops;
@@ -43,6 +44,8 @@ pub struct FuncRt {
     pub(crate) ics: Vec<ops::AttrIc>,
     /// A method cache per instruction (used by `CallMethod`).
     pub(crate) mics: Vec<ops::MethodIc>,
+    /// The interpreter's encoding of `ir.code` (`bytecode`).
+    pub(crate) ops: Vec<bytecode::Op>,
     /// Per call site: the function its `direct` resolved to, once seen.
     pub(crate) cics: Vec<OnceLock<Arc<FuncRt>>>,
     /// A global-lookup cache per instruction (used by `LoadGlobal`).
@@ -104,8 +107,9 @@ impl FuncRt {
         let gics = ir.code.iter().map(|_| globals::GlobalIc::default()).collect();
         let mics = ir.code.iter().map(|_| ops::MethodIc::default()).collect();
         let cics = ir.code.iter().map(|_| OnceLock::new()).collect();
+        let ops = bytecode::lower(&ir);
         let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
-        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, cics, gics, table })
+        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, ops, cics, gics, table })
     }
 }
 
@@ -551,13 +555,17 @@ fn run_interp<'py>(
 ) -> PyResult<Exit<'py>> {
     use lizzard_jit::{NEXT, TAKEN};
     let ir = &f.ir;
-    let code = &ir.code[..];
+    let ops = &f.ops[..];
     let slots = regs.as_mut_ptr();
-    // SAFETY (for the raw slot accesses below): the front end emits register
-    // numbers below `ir.reprs.len()`, the number of slots, and `step` never
-    // reallocates them.
+    // SAFETY (for the unchecked accesses below): `bytecode::lower` checked
+    // every register, constant, name and check index and every jump target
+    // of the records that use them; `step` never reallocates the slots.
     let get = |r: u32| unsafe { *slots.add(r as usize) };
     let set = |r: u32, v: u64| unsafe { *slots.add(r as usize) = v };
+    let consts = f.consts.as_ptr() as *const *mut ffi::PyObject;
+    let names = f.names.as_ptr() as *const *mut ffi::PyObject;
+    let konst = |i: u32| unsafe { *consts.add(i as usize) };
+    let name = |i: u32| unsafe { *names.add(i as usize) };
     let mut p = *pc;
     let mut err = pending;
     loop {
@@ -579,117 +587,133 @@ fn run_interp<'py>(
             }
         }
         loop {
-            let instr = &code[p];
-            // `Some(status)` when handled here, None for `step`.
-            let fast = match instr {
-                Instr::Jump { target } => {
-                    p = *target as usize;
+            // SAFETY: `p` is a valid pc: 0, a checked jump target, a handler
+            // target, or the one after an instruction that falls through.
+            let o = unsafe { *ops.get_unchecked(p) };
+            let status = match o.op {
+                Opc::Jump => {
+                    p = o.x as usize;
                     continue;
                 }
-                Instr::JumpIfFalse { cond, target } => {
-                    p = if get(*cond) == 0 { *target as usize } else { p + 1 };
+                Opc::JumpIfFalse => {
+                    p = if get(o.x) == 0 { o.y as usize } else { p + 1 };
                     continue;
                 }
-                Instr::JumpIfTrue { cond, target } => {
-                    p = if get(*cond) != 0 { *target as usize } else { p + 1 };
+                Opc::JumpIfTrue => {
+                    p = if get(o.x) != 0 { o.y as usize } else { p + 1 };
                     continue;
                 }
-                Instr::I64Const { dst, value } => {
-                    set(*dst, *value as u64);
-                    Some(NEXT)
+                Opc::I64Const => {
+                    set(o.x, o.y as u64 | (o.z as u64) << 32);
+                    NEXT
                 }
-                Instr::I64Lt { dst, a, b } => {
-                    set(*dst, ((get(*a) as i64) < (get(*b) as i64)) as u64);
-                    Some(NEXT)
+                Opc::I64Lt => {
+                    set(o.x, ((get(o.y) as i64) < (get(o.z) as i64)) as u64);
+                    NEXT
                 }
-                Instr::I64Add { dst, a, b } => {
-                    set(*dst, (get(*a) as i64).wrapping_add(get(*b) as i64) as u64);
-                    Some(NEXT)
+                Opc::I64Add => {
+                    set(o.x, (get(o.y) as i64).wrapping_add(get(o.z) as i64) as u64);
+                    NEXT
                 }
-                Instr::Not { dst, src } => {
-                    set(*dst, get(*src) ^ 1);
-                    Some(NEXT)
+                Opc::Not => {
+                    set(o.x, get(o.y) ^ 1);
+                    NEXT
                 }
-                Instr::Const { dst, idx } => {
-                    ops::lz_const(slots, *dst, f.consts[*idx as usize].as_ptr());
-                    Some(NEXT)
+                Opc::Nop => NEXT,
+                Opc::Const => {
+                    ops::lz_const(slots, o.x, konst(o.y));
+                    NEXT
                 }
-                Instr::Move { dst, src } if f.objs[*src as usize] => Some(ops::lz_move(slots, *dst, *src)),
-                Instr::Move { dst, src } => {
-                    set(*dst, get(*src));
-                    Some(NEXT)
+                Opc::MoveObj => ops::lz_move(slots, o.x, o.y),
+                Opc::MoveScalar => {
+                    set(o.x, get(o.y));
+                    NEXT
                 }
-                Instr::Take { dst, src } if f.objs[*src as usize] => Some(ops::lz_take(slots, *dst, *src)),
-                Instr::Unbind { reg } => {
-                    regs.clear(*reg);
-                    Some(NEXT)
+                Opc::TakeObj => ops::lz_take(slots, o.x, o.y),
+                Opc::UnbindObj => {
+                    let old = get(o.x) as *mut ffi::PyObject;
+                    set(o.x, 0);
+                    if !old.is_null() {
+                        // SAFETY: the frame owned it.
+                        unsafe { crate::rc::decref(old) };
+                    }
+                    NEXT
                 }
-                Instr::CompareBool { dst, op, a, b } if ops::rich_code(*op).is_some() => Some(ops::lz_compare_bool(slots, *dst, *a, *b, ops::rich_code(*op).unwrap())),
-                Instr::LoadGlobal { dst, name } => Some(match builtins_dict(py).and_then(|b| globals::load(py, &f.gics[p], globals, b, f.names[*name as usize].bind(py))) {
+                Opc::LoadAttr => ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
+                Opc::LoadAttrCheck => {
+                    let st = ops::lz_load_attr(slots, o.x, o.y, name(o.z), &f.ics[p]);
+                    if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
+                        p += 2;
+                        continue;
+                    }
+                    st
+                }
+                Opc::StoreAttr => ops::lz_store_attr(slots, o.x, o.y, name(o.z), &f.ics[p]),
+                Opc::LoadGlobal => match builtins_dict(py).and_then(|b| globals::load(py, &f.gics[p], globals, b, f.names[o.y as usize].bind(py))) {
                     Ok(v) => {
-                        regs.set_obj(*dst, v);
+                        regs.set_obj(o.x, v);
                         NEXT
                     }
                     Err(e) => {
                         err = Some(e);
                         break;
                     }
-                }),
-                Instr::LoadAttr { dst, obj, name } => Some(ops::lz_load_attr(slots, *dst, *obj, f.names[*name as usize].as_ptr(), &f.ics[p])),
-                Instr::StoreAttr { obj, name, val } => Some(ops::lz_store_attr(slots, *obj, *val, f.names[*name as usize].as_ptr(), &f.ics[p])),
-                Instr::BinOp { dst, op, a, b, inplace } => Some(ops::lz_binop(slots, *dst, *a, *b, *op as u32 + if *inplace { 16 } else { 0 })),
-                Instr::Compare { dst, op, a, b } if ops::rich_code(*op).is_some() => Some(ops::lz_compare(slots, *dst, *a, *b, ops::rich_code(*op).unwrap())),
-                Instr::Truthy { dst, src } => Some(ops::lz_truthy(slots, *dst, *src)),
-                Instr::Box { dst, src } if ir.reprs[*src as usize] == Repr::I64 => Some(ops::lz_box_i64(slots, *dst, *src)),
-                Instr::Check { reg, check } => {
-                    let o = get(*reg) as *mut ffi::PyObject;
-                    // SAFETY: a non-null object slot holds a valid object.
-                    (!o.is_null() && unsafe { rt::quick(o, f.ck(py, *check)) }).then_some(NEXT)
+                },
+                Opc::BinOp => ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32),
+                Opc::BinOpCheck => {
+                    let st = ops::lz_binop(slots, o.x, o.y, o.z, o.sub as u32);
+                    if st == NEXT && quick_ok(f, py, get(o.x), o.w) {
+                        p += 2;
+                        continue;
+                    }
+                    st
                 }
+                Opc::Compare => ops::lz_compare(slots, o.x, o.y, o.z, o.sub as u32),
+                Opc::CompareBool => ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32),
+                Opc::CompareBoolJump => {
+                    let st = ops::lz_compare_bool(slots, o.x, o.y, o.z, o.sub as u32);
+                    if st == NEXT {
+                        p = if get(o.x) == 0 { o.w as usize } else { p + 2 };
+                        continue;
+                    }
+                    st
+                }
+                Opc::Truthy => ops::lz_truthy(slots, o.x, o.y),
+                Opc::BoxI64 => ops::lz_box_i64(slots, o.x, o.y),
+                Opc::Check if quick_ok(f, py, get(o.x), o.y) => NEXT,
                 // The frame ends: its reference is the return value.
-                Instr::Return { src } if f.objs[*src as usize] && get(*src) != 0 => {
+                Opc::Return if get(o.x) != 0 => {
                     *pc = p;
-                    let v = regs.take_obj(*src);
+                    let v = regs.take_obj(o.x);
                     // SAFETY: an owned reference out of the frame.
                     return Ok(Exit::Return(unsafe { Bound::from_owned_ptr(py, v) }));
                 }
-                Instr::Call { dst, .. } | Instr::CallMethod { dst, .. } => Some(match call_at(py, f, p, regs) {
+                Opc::Call => match call_at(py, f, p, regs) {
                     Ok(v) => {
-                        regs.set_obj(*dst, v);
+                        regs.set_obj(o.x, v);
                         NEXT
                     }
                     Err(e) => {
                         err = Some(e);
                         break;
                     }
-                }),
-                Instr::ForIter { dst, iter, target } => {
-                    let it = get(*iter) as *mut ffi::PyObject;
-                    // SAFETY: a type pointer comparison on a valid object.
-                    if it.is_null() || unsafe { ffi::Py_TYPE(it) } == generator::type_ptr() {
-                        None
-                    } else {
-                        match ops::lz_for_iter_py(slots, *dst, it) {
-                            TAKEN => {
-                                p = *target as usize;
-                                continue;
-                            }
-                            st => Some(st),
+                },
+                Opc::ForIter if get(o.y) != 0 && unsafe { ffi::Py_TYPE(get(o.y) as *mut ffi::PyObject) } != generator::type_ptr() => {
+                    match ops::lz_for_iter_py(slots, o.x, get(o.y) as *mut ffi::PyObject) {
+                        TAKEN => {
+                            p = o.z as usize;
+                            continue;
                         }
+                        st => st,
                     }
                 }
-                _ => None,
-            };
-            match fast {
-                Some(NEXT) => p += 1,
-                Some(_) => {
-                    err = Some(PyErr::fetch(py));
-                    break;
-                }
-                None => {
+                _ => {
                     let mut q = p;
                     match step(py, f, globals, closure, regs, &mut q) {
-                        Ok(None) => p = q,
+                        Ok(None) => {
+                            p = q;
+                            continue;
+                        }
                         Ok(Some(exit)) => {
                             *pc = q;
                             return Ok(exit);
@@ -700,9 +724,22 @@ fn run_interp<'py>(
                         }
                     }
                 }
+            };
+            if status == NEXT {
+                p += 1;
+            } else {
+                err = Some(PyErr::fetch(py));
+                break;
             }
         }
     }
+}
+
+/// Whether the object in a slot passes check `idx` by type pointers alone.
+#[inline(always)]
+fn quick_ok(f: &FuncRt, py: Python<'_>, o: u64, idx: u32) -> bool {
+    // SAFETY: a non-null object slot holds a valid object.
+    o != 0 && unsafe { rt::quick(o as *mut ffi::PyObject, f.ck(py, idx)) }
 }
 
 macro_rules! obj {

@@ -2,6 +2,7 @@
 //! functions inside CPython.
 
 mod array;
+mod bytecode;
 mod frame;
 mod generator;
 mod globals;

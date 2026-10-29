@@ -732,16 +732,3 @@ pub extern "C" fn lz_compare_bool(slots: *mut u64, dst: u32, a: u32, b: u32, op:
     }
 }
 
-/// CPython's `Py_LT`... code of a rich comparison (None for `is`, `in`).
-pub fn rich_code(op: lizzard_py_front::ir::CmpOp) -> Option<u32> {
-    use lizzard_py_front::ir::CmpOp;
-    Some(match op {
-        CmpOp::Lt => 0,
-        CmpOp::Le => 1,
-        CmpOp::Eq => 2,
-        CmpOp::Ne => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-        _ => return None,
-    })
-}
