@@ -206,6 +206,16 @@ pub struct ClassInfo {
     members: HashMap<String, Option<Member>>,
     /// `Self` in this class's methods: a variable bounded by the class.
     self_tv: Option<TvId>,
+    mro: Option<Vec<ClassId>>,
+    /// A base class is untyped (`Any`): unknown members are `Any`.
+    any_base: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    Normal,
+    Static,
+    Class,
 }
 
 struct AssignDecl {
@@ -272,7 +282,15 @@ pub struct Db {
     aliases_resolved: HashSet<ModId>,
     pub diags: Vec<(FileId, u32, String)>,
     pub warnings: Vec<String>,
+    /// Type variables of the function being checked (its class's type
+    /// parameters and `Self`): they stand for one unknown type, so only
+    /// themselves (or `Any`) are assignable to them.
+    pub rigid: Vec<TvId>,
 }
+
+/// Lizzard's definitions for the builtins it types (see the file's header).
+pub const BUILTINS_PYI: &str = include_str!("../stubs/builtins.pyi");
+pub const BUILTINS_PATH: &str = "<lizzard>/builtins.pyi";
 
 fn is_name(e: &Expr, s: &str) -> bool {
     match e {
@@ -353,6 +371,7 @@ impl Db {
             aliases_resolved: HashSet::new(),
             diags: Vec::new(),
             warnings: Vec::new(),
+            rigid: Vec::new(),
         }
     }
 
@@ -425,6 +444,14 @@ impl Db {
             _ if self.env.stdlib.contains(top) => Some(ModKind::Opaque),
             _ => None,
         };
+        if kind == Some(ModKind::Builtins) {
+            let body: Vec<Stmt> = ruff_python_parser::parse_module(BUILTINS_PYI).expect("bundled builtins.pyi parses").into_syntax().body.into_iter().collect();
+            let f = self.add_file(BUILTINS_PATH.to_string(), BUILTINS_PYI.to_string());
+            let m = self.push_module(name, Some(f), false, ModKind::Builtins);
+            let decls = self.collect(m, f, &body, false);
+            self.modules[m].decls = decls;
+            return Some(m);
+        }
         if let Some(kind) = kind {
             return Some(self.push_module(name, None, false, kind));
         }
@@ -675,7 +702,58 @@ impl Db {
     pub fn lookup_name(&mut self, m: ModId, name: &str) -> Sym {
         match self.lookup_in(m, name) {
             Some(s) => s,
+            None => self.builtin(name),
+        }
+    }
+
+    /// A builtin name: the checker's own (`int`, exceptions) or one declared
+    /// in the bundled builtins.pyi; `Any` if neither.
+    pub fn builtin(&mut self, name: &str) -> Sym {
+        match self.load_module("builtins") {
+            Some(b) => self.lookup_in(b, name).unwrap_or(Sym::Any),
             None => builtin_sym(name),
+        }
+    }
+
+    /// Whether builtins.pyi declares `name` (not the checker's own names).
+    pub fn is_declared_builtin(&mut self, name: &str) -> bool {
+        matches!(builtin_sym(name), Sym::Any) && self.load_module("builtins").is_some_and(|b| self.modules[b].decls.contains_key(name))
+    }
+
+    /// The class builtins.pyi declares as `name` (also for `str` and
+    /// `tuple`, which the checker otherwise types structurally).
+    pub fn builtin_class(&mut self, name: &str) -> Option<ClassId> {
+        let b = self.load_module("builtins")?;
+        match self.modules[b].decls.get(name)?.clone() {
+            Decl::Class(cd) => Some(self.class_for(b, name, cd)),
+            _ => None,
+        }
+    }
+
+    /// The class type through which a structural type finds its methods and
+    /// base classes: `str` and tuples.
+    pub fn nominal(&mut self, t: &Ty) -> Option<Ty> {
+        match t {
+            Ty::Str => Some(Ty::Inst(self.builtin_class("str")?, Vec::new())),
+            Ty::TupleVar(x) => Some(Ty::Inst(self.builtin_class("tuple")?, vec![(**x).clone()])),
+            Ty::Tuple(v) => {
+                let elem = match v.first() {
+                    None => Ty::Any,
+                    Some(f) if v.iter().all(|x| x == f) => f.clone(),
+                    Some(_) => Ty::Object,
+                };
+                Some(Ty::Inst(self.builtin_class("tuple")?, vec![elem]))
+            }
+            _ => None,
+        }
+    }
+
+    /// A type variable's bound stands in for it where a concrete type is
+    /// needed (attributes of `self`).
+    pub fn upper(&self, t: &Ty) -> Ty {
+        match t {
+            Ty::Var(v) => self.tvs[*v].bound.clone().unwrap_or(Ty::Any),
+            t => t.clone(),
         }
     }
 
@@ -686,9 +764,9 @@ impl Db {
         }
         let s = match self.modules[m].kind {
             ModKind::Typing => special_sym(name),
-            ModKind::Builtins => builtin_sym(name),
+            ModKind::Builtins if !matches!(builtin_sym(name), Sym::Any) || !self.modules[m].decls.contains_key(name) => builtin_sym(name),
             ModKind::Opaque => Sym::Any,
-            ModKind::Files => {
+            ModKind::Files | ModKind::Builtins => {
                 let d = self.modules[m].decls.get(name)?.clone();
                 // Placeholder against cycles.
                 self.modules[m].syms.insert(name.to_string(), Sym::Any);
@@ -775,7 +853,7 @@ impl Db {
         }
     }
 
-    fn new_tv(&mut self, name: &str, variance: Variance) -> TvId {
+    pub fn new_tv(&mut self, name: &str, variance: Variance) -> TvId {
         self.tvs.push(TvInfo { name: name.to_string(), variance, bound: None });
         self.tvs.len() - 1
     }
@@ -869,6 +947,8 @@ impl Db {
             bases: None,
             members: HashMap::new(),
             self_tv: None,
+            mro: None,
+            any_base: false,
         });
         let c = self.classes.len() - 1;
         self.class_keys.insert(key, c);
@@ -936,14 +1016,113 @@ impl Db {
                 if matches!(self.sym_of_expr(m, target), Some(Sym::Special(_))) {
                     continue;
                 }
-                let ty = self.eval_type(base, &Scope { m, tparams: &[], self_ty: None });
-                if !matches!(ty, Ty::Any) {
+                let tps = self.class_tparams(c);
+                let ty = self.eval_type(base, &Scope { m, tparams: &tps, self_ty: None });
+                if matches!(ty, Ty::Any) {
+                    self.classes[c].any_base = true;
+                } else {
                     bases.push(ty);
                 }
             }
         }
         self.classes[c].bases = Some(bases.clone());
         bases
+    }
+
+    /// The PEP 695 type parameters of class `c`, by name (in scope in its
+    /// body); old-style `TypeVar`s are module names and need no scope.
+    pub fn class_tparams(&mut self, c: ClassId) -> Vec<(String, TvId)> {
+        if self.header(c).type_params.is_none() {
+            return Vec::new();
+        }
+        self.class_params(c).into_iter().map(|tv| (self.tvs[tv].name.clone(), tv)).collect()
+    }
+
+    /// Whether `c` or a class in its MRO has an untyped base.
+    pub fn has_any_base(&mut self, c: ClassId) -> bool {
+        self.mro(c).iter().any(|k| self.classes[*k].any_base)
+    }
+
+    pub fn is_builtin_class(&self, c: ClassId) -> bool {
+        self.modules[self.classes[c].m].kind == ModKind::Builtins
+    }
+
+    /// The number of `def`s of a function (more than one is a redefinition,
+    /// unless they are overloads).
+    pub fn def_count(&self, f: FuncId) -> usize {
+        self.funcs[f].defs.len()
+    }
+
+    pub fn is_user_class(&self, c: ClassId) -> bool {
+        self.modules[self.classes[c].m].user
+    }
+
+    /// The class's own statement in a Lizzard module.
+    pub fn user_class_def(&self, c: ClassId) -> Option<Rc<ast::StmtClassDef>> {
+        self.is_user_class(c).then(|| self.header(c))
+    }
+
+    /// The method resolution order (C3, as CPython computes it) over the
+    /// class bases that are classes.
+    pub fn mro(&mut self, c: ClassId) -> Vec<ClassId> {
+        if let Some(m) = &self.classes[c].mro {
+            return m.clone();
+        }
+        self.classes[c].mro = Some(vec![c]);
+        let bases: Vec<ClassId> = self.class_bases(c).iter().filter_map(|b| if let Ty::Inst(bc, _) = b { Some(*bc) } else { None }).collect();
+        let mut seqs: Vec<Vec<ClassId>> = bases.iter().map(|b| self.mro(*b)).collect();
+        seqs.push(bases.clone());
+        let mut out = vec![c];
+        let merged = loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break true;
+            }
+            let head = seqs.iter().map(|s| s[0]).find(|h| !seqs.iter().any(|s| s[1..].contains(h)));
+            let Some(h) = head else { break false };
+            out.push(h);
+            for s in seqs.iter_mut() {
+                if s[0] == h {
+                    s.remove(0);
+                }
+            }
+        };
+        if !merged {
+            // No consistent order (CPython raises TypeError): depth-first.
+            out = vec![c];
+            for b in bases {
+                for x in self.mro(b) {
+                    if !out.contains(&x) {
+                        out.push(x);
+                    }
+                }
+            }
+        }
+        self.classes[c].mro = Some(out.clone());
+        out
+    }
+
+    /// The builtin exception class a class derives from, if any.
+    pub fn exc_base(&mut self, c: ClassId) -> Option<String> {
+        for k in self.mro(c) {
+            for b in self.class_bases(k) {
+                if let Ty::Exc(n) = b {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn method_kind(&self, f: FuncId) -> MethodKind {
+        let defs = &self.funcs[f].defs;
+        if defs.iter().any(|(d, _)| decorated(d, "staticmethod")) {
+            MethodKind::Static
+        } else if defs.iter().any(|(d, _)| decorated(d, "classmethod")) {
+            MethodKind::Class
+        } else {
+            MethodKind::Normal
+        }
     }
 
     fn func_for(&mut self, m: ModId, owner: Option<ClassId>, name: &str, defs: Vec<(Rc<ast::StmtFunctionDef>, FileId)>) -> FuncId {
@@ -986,11 +1165,32 @@ impl Db {
                 Stmt::AnnAssign(a) if matches!(&*a.target, Expr::Name(n) if n.id.as_str() == name) => Some((*a.annotation).clone()),
                 _ => None,
             });
+            let tps = self.class_tparams(c);
+            let self_ty = Ty::Var(self.self_tv(c));
             if let Some(ann) = ann {
-                let params: Vec<(String, TvId)> = Vec::new();
-                let ty = self.eval_type(&ann, &Scope { m, tparams: &params, self_ty: None });
+                let ty = self.eval_type(&ann, &Scope { m, tparams: &tps, self_ty: Some(&self_ty) });
                 found = Some(Member::Attr(ty));
                 break;
+            }
+            let plain = flat.iter().find_map(|s| match s {
+                Stmt::Assign(a) if matches!(a.targets.as_slice(), [Expr::Name(n)] if n.id.as_str() == name) => Some(literal_type(&a.value)),
+                _ => None,
+            });
+            if let Some(ty) = plain {
+                found = Some(Member::Attr(ty));
+                break;
+            }
+            // `self.name: T = ...` in `__init__`.
+            let init = flat.iter().find_map(|s| match s {
+                Stmt::FunctionDef(f) if f.name.as_str() == "__init__" => Some(f),
+                _ => None,
+            });
+            if let Some(init) = init {
+                if let Some(ann) = init_attr_annotation(init, name) {
+                    let ty = self.eval_type(ann, &Scope { m, tparams: &tps, self_ty: Some(&self_ty) });
+                    found = Some(Member::Attr(ty));
+                    break;
+                }
             }
         }
         self.classes[c].members.insert(name.to_string(), found.clone());
@@ -999,20 +1199,17 @@ impl Db {
 
     /// A member of `c` or its bases, with the class that declares it.
     pub fn find_member(&mut self, c: ClassId, name: &str) -> Option<(ClassId, Member)> {
-        let mut seen = HashSet::new();
-        let mut stack = vec![c];
-        while let Some(c) = stack.pop() {
-            if !seen.insert(c) {
-                continue;
-            }
-            if let Some(m) = self.class_member(c, name) {
-                return Some((c, m));
-            }
-            let bases = self.class_bases(c);
-            for b in bases.iter().rev() {
-                if let Ty::Inst(bc, _) = b {
-                    stack.push(*bc);
-                }
+        self.find_member_after(c, None, name)
+    }
+
+    /// A member found in `c`'s MRO, starting after class `after` if given
+    /// (`super()`).
+    pub fn find_member_after(&mut self, c: ClassId, after: Option<ClassId>, name: &str) -> Option<(ClassId, Member)> {
+        let mro = self.mro(c);
+        let start = after.and_then(|a| mro.iter().position(|&k| k == a)).map_or(0, |i| i + 1);
+        for &k in &mro[start..] {
+            if let Some(m) = self.class_member(k, name) {
+                return Some((k, m));
             }
         }
         None
@@ -1037,7 +1234,11 @@ impl Db {
     fn sig_of(&mut self, f: FuncId, d: &ast::StmtFunctionDef, file: FileId) -> Sig {
         let m = self.funcs[f].m;
         let owner = self.funcs[f].owner;
-        let tparams = self.type_params(m, d.type_params.as_deref());
+        let mut tparams = match owner {
+            Some(c) => self.class_tparams(c),
+            None => Vec::new(),
+        };
+        tparams.extend(self.type_params(m, d.type_params.as_deref()));
         // `self` (unannotated) and `Self` are the class's `Self` variable: it
         // solves to the receiver's own type and, through its bound, the
         // class's type parameters.
@@ -1082,6 +1283,7 @@ impl Db {
         }
         let ret = match &d.returns {
             Some(r) => self.eval_type(r, &Scope { m, tparams: &tparams, self_ty: self_ty.as_ref() }),
+            None if owner.is_some() && d.name.as_str() == "__init__" => Ty::None,
             None => {
                 self.err(m, d.name.range().start().into(), format!("function `{}` needs a return type annotation", d.name.as_str()));
                 Ty::Any
@@ -1208,6 +1410,16 @@ impl Db {
     /// typing spec's ambiguous overload match).
     pub fn assign(&mut self, src: &Ty, dst: &Ty, s: &mut Subst, any: &mut bool) -> bool {
         if let Ty::Var(v) = dst {
+            if self.rigid.contains(v) {
+                return match src {
+                    Ty::Var(w) if w == v => true,
+                    Ty::Any => {
+                        *any = true;
+                        true
+                    }
+                    _ => false,
+                };
+            }
             return match s.get(v).cloned() {
                 Some(b) => self.assign(src, &b, s, any),
                 None => {
@@ -1223,6 +1435,10 @@ impl Db {
         }
         match (src, dst) {
             (_, Ty::Any | Ty::Object) => true,
+            (Ty::Var(w), _) if self.rigid.contains(w) => match self.tvs[*w].bound.clone() {
+                Some(b) => self.assign(&b, dst, s, any),
+                None => false,
+            },
             (Ty::Any | Ty::Var(_), _) => {
                 *any = true;
                 true
@@ -1239,6 +1455,10 @@ impl Db {
             (Ty::Type(a), Ty::Type(b)) => self.assign(a, b, s, any),
             (Ty::Exc(a), Ty::Exc(b)) => exc_sub(a, b),
             (Ty::Inst(c, args), _) => self.inst_assign(*c, args, dst, s, any),
+            (Ty::Str | Ty::Tuple(_) | Ty::TupleVar(_), Ty::Inst(..)) => match self.nominal(src) {
+                Some(n) => self.assign(&n, dst, s, any),
+                None => false,
+            },
             (Ty::Module(a), Ty::Module(b)) => a == b,
             _ => false,
         }
@@ -1359,6 +1579,49 @@ impl Db {
         }
     }
 
+    /// `t` with unsolved type variables replaced by `Any`, except the rigid
+    /// ones of the function being checked.
+    pub fn erase(&self, t: &Ty) -> Ty {
+        match t {
+            Ty::Var(v) if self.rigid.contains(v) => t.clone(),
+            Ty::Var(_) => Ty::Any,
+            Ty::Tuple(v) => Ty::Tuple(v.iter().map(|x| self.erase(x)).collect()),
+            Ty::TupleVar(x) => Ty::TupleVar(Box::new(self.erase(x))),
+            Ty::Inst(c, args) => Ty::Inst(*c, args.iter().map(|x| self.erase(x)).collect()),
+            Ty::Type(x) => Ty::Type(Box::new(self.erase(x))),
+            Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(self.erase(r)))),
+            t => t.clone(),
+        }
+    }
+
+    /// Fresh copies of the rigid type variables occurring in `tys` (and in
+    /// their bounds): a callee's own signature mentions the same variables
+    /// as the body being checked, but there they are solved per call.
+    pub fn fresh_rigid(&mut self, tys: &[&Ty]) -> Subst {
+        let mut vars = Vec::new();
+        for t in tys {
+            collect_vars(t, &mut vars);
+        }
+        let mut i = 0;
+        while i < vars.len() {
+            if let Some(b) = self.tvs[vars[i]].bound.clone() {
+                collect_vars(&b, &mut vars);
+            }
+            i += 1;
+        }
+        let mut map = Subst::new();
+        vars.retain(|v| self.rigid.contains(v));
+        for v in vars {
+            let (name, variance) = (self.tvs[v].name.clone(), self.tvs[v].variance);
+            map.insert(v, Ty::Var(self.new_tv(&name, variance)));
+        }
+        let pairs: Vec<(TvId, TvId)> = map.iter().map(|(k, v)| (*k, if let Ty::Var(n) = v { *n } else { unreachable!() })).collect();
+        for (old, new) in pairs {
+            self.tvs[new].bound = self.tvs[old].bound.as_ref().map(|b| subst(b, &map));
+        }
+        map
+    }
+
     pub fn qualname(&self, c: ClassId) -> &str {
         &self.classes[c].qualname
     }
@@ -1379,6 +1642,60 @@ pub fn subst(t: &Ty, s: &Subst) -> Ty {
         Ty::Func(FuncRef::Bound(f, r)) => Ty::Func(FuncRef::Bound(*f, Box::new(subst(r, s)))),
         t => t.clone(),
     }
+}
+
+/// `subst`, following variables solved to other solved variables.
+pub fn deep_subst(t: &Ty, s: &Subst) -> Ty {
+    let mut t = subst(t, s);
+    for _ in 0..8 {
+        let mut vars = Vec::new();
+        collect_vars(&t, &mut vars);
+        if !vars.iter().any(|v| s.get(v).is_some_and(|x| *x != Ty::Var(*v))) {
+            break;
+        }
+        t = subst(&t, s);
+    }
+    t
+}
+
+/// The type of a class attribute assigned without annotation.
+fn literal_type(e: &Expr) -> Ty {
+    match e {
+        Expr::NumberLiteral(n) => match n.value {
+            ast::Number::Int(_) => Ty::Int,
+            ast::Number::Float(_) => Ty::Float,
+            ast::Number::Complex { .. } => Ty::Any,
+        },
+        Expr::StringLiteral(_) => Ty::Str,
+        Expr::BooleanLiteral(_) => Ty::Bool,
+        _ => Ty::Any,
+    }
+}
+
+/// The annotation of `self.name: T = ...` in an `__init__` body.
+pub fn init_attr_annotation<'a>(init: &'a ast::StmtFunctionDef, name: &str) -> Option<&'a Expr> {
+    let this = init.parameters.posonlyargs.iter().chain(init.parameters.args.iter()).next()?.parameter.name.as_str();
+    fn find<'a>(body: &'a [Stmt], this: &str, name: &str) -> Option<&'a Expr> {
+        for s in body {
+            let found = match s {
+                Stmt::AnnAssign(a) => match &*a.target {
+                    Expr::Attribute(at) if at.attr.as_str() == name && matches!(&*at.value, Expr::Name(n) if n.id.as_str() == this) => {
+                        Some(&*a.annotation)
+                    }
+                    _ => None,
+                },
+                Stmt::If(i) => find(&i.body, this, name).or_else(|| i.elif_else_clauses.iter().find_map(|c| find(&c.body, this, name))),
+                Stmt::For(f) => find(&f.body, this, name),
+                Stmt::While(w) => find(&w.body, this, name),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    find(&init.body, this, name)
 }
 
 /// Replace unsolved type variables by `Any`.
@@ -1418,7 +1735,23 @@ pub fn collect_vars(t: &Ty, out: &mut Vec<TvId>) {
     }
 }
 
-pub const EXCEPTIONS: &[&str] = &["BaseException", "Exception", "ValueError", "TypeError", "IndexError", "KeyError", "RuntimeError", "ZeroDivisionError", "OverflowError"];
+pub const EXCEPTIONS: &[&str] = &[
+    "BaseException",
+    "Exception",
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "LookupError",
+    "NotImplementedError",
+    "ValueError",
+    "TypeError",
+    "IndexError",
+    "KeyError",
+    "RuntimeError",
+    "StopIteration",
+    "ZeroDivisionError",
+    "OverflowError",
+];
 
 fn exc_sub(a: &str, b: &str) -> bool {
     a == b || b == "BaseException" || (b == "Exception" && a != "BaseException")

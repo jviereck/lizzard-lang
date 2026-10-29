@@ -1,5 +1,5 @@
 """End-to-end tests of Lizzard's typed-Python slice: the NumPy example, the
-float32 fast path, runtime checks and diagnostics.
+float32 fast path, classes, containers, runtime checks and diagnostics.
 
 Every program runs in a fresh subprocess, under Lizzard and under plain CPython.
 """
@@ -16,6 +16,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 EXAMPLE = ROOT / "examples" / "numpy_add" / "add.py"
 VEC32 = HERE / "programs" / "vec32.py"
+CLASSES = HERE / "programs" / "classes.py"
+CONTAINERS = HERE / "programs" / "containers.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -153,6 +155,81 @@ class Float32Path(unittest.TestCase):
         ])
 
 
+class Programs(unittest.TestCase):
+    def test_output_matches_cpython(self):
+        for prog in (CLASSES, CONTAINERS):
+            with self.subTest(prog.name):
+                lizzard = run("-m", "lizzard", str(prog))
+                plain = run(str(prog))
+                self.assertEqual(lizzard[0], 0, lizzard[2])
+                self.assertEqual(plain[0], 0, plain[2])
+                self.assertEqual(lizzard[1], plain[1])
+
+    def test_methods_are_compiled(self):
+        code, out, err = run("-c", textwrap.dedent("""\
+            import lizzard
+            import classes as c
+
+            print(type(c.Shape.__dict__["area"]).__name__, c.Circle.area.__qualname__, c.Circle.area.__name__)
+            print(type(c.Rect.__dict__["square"].__func__).__name__)
+            print(type(c.Vec.__dict__["zero"].__func__).__name__)
+            print(type(c.Vec.__dict__["norm2"].fget).__name__)
+            print(type(c.Stack.__dict__["push"]).__name__, type(c.total_area).__name__)
+            """), cwd=CLASSES.parent)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            "LizzardFunction Circle.area area",
+            "LizzardFunction",
+            "LizzardFunction",
+            "LizzardFunction",
+            "LizzardFunction LizzardFunction",
+        ])
+
+    def test_checks_at_the_boundary(self):
+        code, out, err = run("-c", textwrap.dedent("""\
+            import lizzard
+            import classes as c
+            import containers as k
+
+            def attempt(f):
+                try:
+                    print("ok:", f())
+                except Exception as e:
+                    print(type(e).__name__ + ":", str(e).split(": ", 1)[-1] if ".py:" in str(e) else e)
+
+            attempt(lambda: c.Circle("x"))
+            circle = c.Circle(1.0)
+            circle.r = "oops"
+            attempt(lambda: circle.area())
+            attempt(lambda: c.total_area([c.Circle(1.0), 3]))
+            attempt(lambda: k.divmod_pair("a", 1))
+            attempt(lambda: c.Savings("ann", 0.1).withdraw(500.0))
+
+            # Python subclasses of Lizzard classes: compiled code calls their
+            # overrides and checks what they return.
+            class Loud(c.Dog):
+                def sound(self):
+                    return "WOOF"
+
+            class Broken(c.Dog):
+                def sound(self):
+                    return 42
+
+            attempt(lambda: Loud("max").speak())
+            attempt(lambda: Broken("bug").speak())
+            """), cwd=CLASSES.parent)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            "TypeError: Circle.__init__() argument 'r': expected float, got str",
+            "TypeError: self.r should be float, got str",
+            "TypeError: item of shapes should be Shape, got int",
+            "TypeError: divmod_pair() argument 'a': expected int, got str",
+            "InsufficientFunds: need 400.00 more",
+            "ok: max says WOOF",
+            "TypeError: self.sound(...) should be str, got int",
+        ])
+
+
 class Checker(unittest.TestCase):
     def check(self, source):
         with Scratch() as s:
@@ -170,7 +247,7 @@ class Checker(unittest.TestCase):
                 return a
 
             def h(a) -> None:
-                while a:
+                with a:
                     pass
 
             f("x")
@@ -183,6 +260,32 @@ class Checker(unittest.TestCase):
             "parameter `a` needs a type annotation",
             "this statement is not supported by Lizzard yet",
             "argument `a` of f(): expected int, got str",
+        ])
+
+    def test_class_errors(self):
+        code, _, err = self.check("""\
+            class Animal:
+                def __init__(self, name: str) -> None:
+                    self.name: str = name
+
+                def speak(self) -> str:
+                    return self.name
+
+            class Dog(Animal):
+                def speak(self) -> int:
+                    return 1
+
+                def rename(self) -> None:
+                    self.nick = "x"
+
+            Animal(1)
+            """)
+        self.assertEqual(code, 1)
+        lines = [l.split(": error: ", 1)[1] for l in err.splitlines()]
+        self.assertEqual(lines, [
+            "`Dog.speak` returns int, but `Animal.speak` returns str: an override must return a compatible type",
+            "Dog has no attribute `nick`; declare it in the class body (`nick: T`) or in `__init__` (`self.nick: T = ...`)",
+            "argument `name` of Animal(): expected str, got int",
         ])
 
     def test_missing_module_and_attribute(self):

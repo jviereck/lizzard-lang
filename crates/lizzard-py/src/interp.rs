@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyNameError, PyTypeError, PyUnboundLocalError};
+use pyo3::exceptions::{PyNameError, PyTypeError, PyUnboundLocalError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyString, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBool, PyDict, PyIterator, PyList, PyString, PyTuple};
 use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, Repr};
 
 use crate::array;
@@ -55,7 +57,7 @@ impl LizzardFunction {
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let ir = &self.rt.ir;
-        let bound = bind_args(ir, args, kwargs)?;
+        let bound = bind_args(ir, &self.rt.consts, args, kwargs)?;
         for (p, v) in ir.params.iter().zip(&bound) {
             let c = &ir.checks[p.check as usize];
             if let Err(got) = rt::check(py, v, &c.check)? {
@@ -65,9 +67,22 @@ impl LizzardFunction {
         run(py, &self.rt, self.globals.bind(py), bound)
     }
 
+    /// Bind as a method when stored in a class, like a Python function.
+    fn __get__<'py>(slf: Bound<'py, Self>, instance: Option<Bound<'py, PyAny>>, _owner: Option<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        match instance {
+            Some(obj) if !obj.is_none() => {
+                static METHOD_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+                let mt = METHOD_TYPE.get_or_try_init(py, || py.import("types")?.getattr("MethodType").map(|m| m.unbind()))?;
+                mt.bind(py).call1((slf, obj))
+            }
+            _ => Ok(slf.into_any()),
+        }
+    }
+
     #[getter]
     fn __name__(&self) -> &str {
-        &self.rt.ir.name
+        self.rt.ir.name.rsplit('.').next().unwrap_or(&self.rt.ir.name)
     }
 
     #[getter]
@@ -86,7 +101,7 @@ impl LizzardFunction {
 }
 
 /// Bind call arguments to parameters, with CPython's error messages.
-fn bind_args<'py>(ir: &FuncIr, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+fn bind_args<'py>(ir: &FuncIr, consts: &[Py<PyAny>], args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let n = ir.params.len();
     let name = &ir.name;
     if args.len() > n {
@@ -106,12 +121,12 @@ fn bind_args<'py>(ir: &FuncIr, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound
             }
         }
     }
-    let missing: Vec<String> = ir.params.iter().zip(&slots).filter(|(_, s)| s.is_none()).map(|(p, _)| format!("'{}'", p.name)).collect();
+    let missing: Vec<String> = ir.params.iter().zip(&slots).filter(|(p, s)| s.is_none() && p.default.is_none()).map(|(p, _)| format!("'{}'", p.name)).collect();
     if !missing.is_empty() {
         let s = if missing.len() == 1 { "" } else { "s" };
         return Err(PyTypeError::new_err(format!("{name}() missing {} required positional argument{s}: {}", missing.len(), missing.join(" and "))));
     }
-    Ok(slots.into_iter().map(|s| s.unwrap()).collect())
+    Ok(slots.into_iter().zip(&ir.params).map(|(s, p)| s.unwrap_or_else(|| consts[p.default.unwrap() as usize].bind(args.py()).clone())).collect())
 }
 
 enum V<'py> {
@@ -213,21 +228,135 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
             let v = obj!(regs, *func).call(PyTuple::new(py, pos)?, kwargs.as_ref())?;
             regs[*dst as usize] = V::O(v);
         }
-        Instr::BinOp { dst, op, a, b } => {
+        Instr::BinOp { dst, op, a, b, inplace } => {
             let (x, y) = (obj!(regs, *a), obj!(regs, *b));
-            let v = match op {
-                BinOp::Add => x.add(y)?,
-                BinOp::Sub => x.sub(y)?,
-                BinOp::Mul => x.mul(y)?,
-                BinOp::Div => x.div(y)?,
+            let v = if *inplace {
+                let f = match op {
+                    BinOp::Add => ffi::PyNumber_InPlaceAdd,
+                    BinOp::Sub => ffi::PyNumber_InPlaceSubtract,
+                    BinOp::Mul => ffi::PyNumber_InPlaceMultiply,
+                    BinOp::Div => ffi::PyNumber_InPlaceTrueDivide,
+                    BinOp::FloorDiv => ffi::PyNumber_InPlaceFloorDivide,
+                    BinOp::Mod => ffi::PyNumber_InPlaceRemainder,
+                };
+                // SAFETY: both arguments are valid objects; the result is a
+                // new reference or NULL with an exception set.
+                unsafe { Bound::from_owned_ptr_or_err(py, f(x.as_ptr(), y.as_ptr()))? }
+            } else {
+                match op {
+                    BinOp::Add => x.add(y)?,
+                    BinOp::Sub => x.sub(y)?,
+                    BinOp::Mul => x.mul(y)?,
+                    BinOp::Div => x.div(y)?,
+                    BinOp::FloorDiv => x.floor_div(y)?,
+                    BinOp::Mod => x.rem(y)?,
+                }
             };
             regs[*dst as usize] = V::O(v);
+        }
+        Instr::Neg { dst, src } => {
+            let v = obj!(regs, *src).neg()?;
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::StoreAttr { obj, name, val } => obj!(regs, *obj).setattr(f.names[*name as usize].bind(py), obj!(regs, *val))?,
+        Instr::DelItem { obj, key } => obj!(regs, *obj).del_item(obj!(regs, *key))?,
+        Instr::BuildList { dst, items } => {
+            let mut v = Vec::with_capacity(items.len());
+            for r in items {
+                v.push(obj!(regs, *r).clone());
+            }
+            regs[*dst as usize] = V::O(PyList::new(py, v)?.into_any());
+        }
+        Instr::BuildTuple { dst, items } => {
+            let mut v = Vec::with_capacity(items.len());
+            for r in items {
+                v.push(obj!(regs, *r).clone());
+            }
+            regs[*dst as usize] = V::O(PyTuple::new(py, v)?.into_any());
+        }
+        Instr::BuildDict { dst, keys, vals } => {
+            let d = PyDict::new(py);
+            for (k, v) in keys.iter().zip(vals) {
+                d.set_item(obj!(regs, *k), obj!(regs, *v))?;
+            }
+            regs[*dst as usize] = V::O(d.into_any());
+        }
+        Instr::BuildSlice { dst, lower, upper, step } => {
+            let (a, b, c) = (obj!(regs, *lower), obj!(regs, *upper), obj!(regs, *step));
+            // SAFETY: valid objects in, a new reference or NULL out.
+            let v = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PySlice_New(a.as_ptr(), b.as_ptr(), c.as_ptr()))? };
+            regs[*dst as usize] = V::O(v);
+        }
+        Instr::ListAppend { list, val } => {
+            let l = obj!(regs, *list).cast::<PyList>().map_err(PyErr::from)?;
+            l.append(obj!(regs, *val))?;
+        }
+        Instr::GetIter { dst, obj } => {
+            let it = obj!(regs, *obj).try_iter()?;
+            regs[*dst as usize] = V::O(it.into_any());
+        }
+        Instr::ForIter { dst, iter, target } => {
+            let mut it = obj!(regs, *iter).cast::<PyIterator>().map_err(PyErr::from)?.clone();
+            match it.next() {
+                Some(v) => regs[*dst as usize] = V::O(v?),
+                None => next = *target as usize,
+            }
+        }
+        Instr::Unpack { src, dsts } => {
+            let o = obj!(regs, *src).clone();
+            let n = dsts.len();
+            let known = if o.is_exact_instance_of::<PyTuple>() || o.is_exact_instance_of::<PyList>() || o.is_exact_instance_of::<PyDict>() { Some(o.len()?) } else { None };
+            if let Some(k) = known {
+                if k < n {
+                    return Err(PyValueError::new_err(format!("not enough values to unpack (expected {n}, got {k})")));
+                }
+                if k > n {
+                    return Err(PyValueError::new_err(format!("too many values to unpack (expected {n}, got {k})")));
+                }
+            }
+            let mut it = o.try_iter()?;
+            for (i, d) in dsts.iter().enumerate() {
+                match it.next() {
+                    Some(v) => regs[*d as usize] = V::O(v?),
+                    None => return Err(PyValueError::new_err(format!("not enough values to unpack (expected {n}, got {i})"))),
+                }
+            }
+            if let Some(extra) = it.next() {
+                extra?;
+                return Err(PyValueError::new_err(format!("too many values to unpack (expected {n})")));
+            }
+        }
+        Instr::Format { dst, val, conv, spec } => {
+            let v = obj!(regs, *val);
+            let v = match conv {
+                b's' => v.str()?.into_any(),
+                b'r' => v.repr()?.into_any(),
+                // SAFETY: a valid object in, a new reference or NULL out.
+                b'a' => unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyObject_ASCII(v.as_ptr()))? },
+                _ => v.clone(),
+            };
+            let spec = match spec {
+                Some(r) => obj!(regs, *r).clone(),
+                None => PyString::new(py, "").into_any(),
+            };
+            // SAFETY: as above.
+            let s = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyObject_Format(v.as_ptr(), spec.as_ptr()))? };
+            regs[*dst as usize] = V::O(s);
+        }
+        Instr::BuildString { dst, parts } => {
+            let mut s = String::new();
+            for r in parts {
+                s.push_str(&obj!(regs, *r).cast::<PyString>().map_err(PyErr::from)?.to_cow()?);
+            }
+            regs[*dst as usize] = V::O(PyString::new(py, &s).into_any());
         }
         Instr::Compare { dst, op, a, b } => {
             let (x, y) = (obj!(regs, *a), obj!(regs, *b));
             let v = match op {
                 CmpOp::Is => PyBool::new(py, x.is(y)).to_owned().into_any(),
                 CmpOp::IsNot => PyBool::new(py, !x.is(y)).to_owned().into_any(),
+                CmpOp::In => PyBool::new(py, y.contains(x)?).to_owned().into_any(),
+                CmpOp::NotIn => PyBool::new(py, !y.contains(x)?).to_owned().into_any(),
                 op => {
                     let o = match op {
                         CmpOp::Eq => CompareOp::Eq,
@@ -306,6 +435,7 @@ fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, regs: &m
                 BinOp::Sub => x - y,
                 BinOp::Mul => x * y,
                 BinOp::Div => x / y,
+                BinOp::FloorDiv | BinOp::Mod => unreachable!("no float32 floor division or modulo"),
             });
         }
         Instr::Check { reg, check } => {

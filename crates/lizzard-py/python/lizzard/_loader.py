@@ -74,10 +74,7 @@ def run_source(source, path, module):
     namespace = module.__dict__
     functions = {name: compiled.make_function(name, namespace) for name in compiled.function_names()}
     tree = ast.parse(source, path)
-    for i, node in enumerate(tree.body):
-        if isinstance(node, ast.FunctionDef) and node.name in functions:
-            load = ast.Subscript(ast.Name("__lizzard_functions__", ast.Load()), ast.Constant(node.name), ast.Load())
-            tree.body[i] = ast.copy_location(ast.Assign([ast.Name(node.name, ast.Store())], load), node)
+    _replace_defs(tree.body, functions, "")
     ast.fix_missing_locations(tree)
     code = compile(tree, path, "exec")
     namespace["__lizzard_functions__"] = functions
@@ -85,6 +82,19 @@ def run_source(source, path, module):
         exec(code, namespace)
     finally:
         namespace.pop("__lizzard_functions__", None)
+
+
+def _replace_defs(body, functions, prefix):
+    """Replace each checked ``def`` (and method, ``Class.name``) by its Lizzard
+    function, with the same decorators applied."""
+    for i, node in enumerate(body):
+        if isinstance(node, ast.FunctionDef) and prefix + node.name in functions:
+            value = ast.Subscript(ast.Name("__lizzard_functions__", ast.Load()), ast.Constant(prefix + node.name), ast.Load())
+            for dec in reversed(node.decorator_list):
+                value = ast.Call(dec, [value], [])
+            body[i] = ast.copy_location(ast.Assign([ast.Name(node.name, ast.Store())], value), node)
+        elif isinstance(node, ast.ClassDef) and not prefix:
+            _replace_defs(node.body, functions, node.name + ".")
 
 
 class LizzardLoader(importlib.machinery.SourceFileLoader):

@@ -190,22 +190,39 @@ A first end-to-end slice runs the float32 NumPy example (`examples/numpy_add/add
   - runtime checks and qualified-name resolution (`rt.rs`);
   - direct float32 element access with a layout check (`array.rs`).
 - **The Python package** (`crates/lizzard-py/python/lizzard`): the import hook, `python -m lizzard`, and the NumPy overlay `stubs/numpy/__init__.pyi`.
-- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14) and runs `crates/lizzard-py/tests`.
+- **Bundled builtins definitions** (`crates/lizzard-py-front/stubs/builtins.pyi`, compiled into the front end): `list`, `dict`, `tuple` and `str` methods, `Iterable`/`Iterator`/`Sequence`, `range`, and `isinstance`, `enumerate`, `zip`, `sorted`, `reversed`, `sum`, `abs`, `min`, `max`, `repr`. They stand in for typeshed until it is bundled.
+- **`crates/lizzard-py/dev.sh`** builds into `.venv-ft` (3.14t) and `.venv-gil` (3.14), each with its own target directory, and runs `crates/lizzard-py/tests`. `tests/programs/classes.py` and `containers.py` must print exactly what plain CPython prints.
 
 **Supported language subset:**
 - imports;
-- annotated functions with plain positional parameters;
+- annotated functions with positional parameters and literal defaults;
 - `type X = ...` aliases;
-- assignments (including annotated and subscript assignments);
-- `if`/`elif`/`else`, `for i in range(...)`, `raise`, `return`;
-- calls with keyword arguments, attributes, subscripts;
-- `+ - * /`, single comparisons, `and`/`or`/`not`.
+- **classes** (see below);
+- **lists, dicts and tuples:** displays, comprehensions (`[...]`, `{k: v ...}`), indexing and slicing, `del x[k]`, methods from the bundled definitions, `in` / `not in`, iteration and unpacking (`a, b = t`, `for k, v in d.items()`);
+- assignments (including annotated, attribute, subscript, tuple and augmented assignments; `+=` is in place, as in Python);
+- `if`/`elif`/`else`, `for` over `range(...)` (unboxed) or any iterable, `while`, `break`, `continue`, `raise`, `assert`, `return`;
+- calls with keyword arguments, attributes, subscripts, conditional expressions, f-strings;
+- `+ - * / // %`, unary `-`, single comparisons, `and`/`or`/`not`.
 
 Top-level code is checked and then run by CPython.
+
+**Classes.** A class's methods are compiled to `LizzardFunction`s, which bind like Python functions (`__get__`), so the class itself is an ordinary CPython class:
+- Attributes are declared in the class body (`x: float`, optionally with a value) or annotated on their first assignment in `__init__` (`self.x: float = x`). Assigning an undeclared attribute is an error. Reads from the instance are checked at runtime, since Python code can set any attribute.
+- `__init__` may omit its return annotation. A call of the class is checked against `__init__` (inherited ones too); a class without `__init__` takes no arguments, unless it derives from an exception.
+- Single and multiple inheritance with CPython's MRO (C3), `super().name` in methods, `@staticmethod`, `@classmethod`, `@property` (getters), and dunders (`__add__`, `__eq__`, `__len__`, `__getitem__`, ...) used by operators.
+- Overrides must be compatible: the same arguments with parameter types at least as wide, and a return type at least as narrow. A redeclared attribute keeps its type.
+- PEP 695 generic classes (`class Stack[T]:`), with explicit arguments (`Stack[int]()`) or inferred from `__init__` (`Pair("a", 1)` is `Pair[str, int]`). Inside the class, `T` and `Self` are *rigid*: only values of that type itself are assignable to them, so `return 5` in a method returning `T` is an error.
+- `isinstance(x, C)` narrows a local to a subclass in the `if` body.
+- Python code may subclass Lizzard classes. Compiled code calls the Python overrides and checks their results against the declared types.
 
 **Behaviour decisions:**
 - **A type error in top-level code is a static error.** The example's last line therefore stops the import with a diagnostic. The runtime check is what Python callers see.
 - **`a[i]` on `npt.NDArray` (unknown ndim) is `Any`**, by the typing spec's rule for overloads matched through `Any`. The unboxed float32 path needs a shape-typed array: `np.ndarray[tuple[int], np.dtype[np.float32]]`.
+- **Container items are checked when read**, as planned: a `list[float]` from Python is only checked to be a `list` at the boundary, and `xs[i]` or a `for` loop item is checked against `float`.
+- **Literals take the expected type.** `[1, 2]` is `list[int]`, but where a `list[float]` is expected (an annotation, a parameter, an attribute) it is a `list[float]`. Empty `[]` and `{}` need an expected type. Without one, mixed items join to their common base class, or `object`.
+- **A local keeps the type of its first assignment.** Reusing a name for a value of another type is an error, as in mypy.
+- **`dict.get(key)` is `Any`** until unions exist (typeshed has `V | None`); `get(key, default)` is `V`.
+- **Generator expressions are rejected** rather than compiled eagerly as lists, which would change when their items are computed. List comprehensions work.
 
 **Findings:**
 - **Overlays must use only public names.** NumPy 2.5 renamed the private TypeVar `_NBit1` to `_NBitT`, which silently degraded an overlay that used it. The overlay now uses `Self` and method-level type parameters. `Self` is a TypeVar bounded by its class, solved to the receiver's own type.
@@ -214,6 +231,8 @@ Top-level code is checked and then run by CPython.
 
 **Deferred:**
 - checking that overlays only refine the base declarations;
-- bundled typeshed (stdlib modules are `Any`), unions and narrowing, classes, `while`, and other statements;
+- bundled typeshed (stdlib modules are `Any`), unions (`T | None`) and narrowing beyond `isinstance` on a local;
+- `try`/`except`/`with`, lambdas and nested functions, generator expressions, sets, `*args`/`**kwargs`, keyword-only parameters, property setters, class decorators (`@dataclass`), nested classes, generic functions, and module globals read by functions;
+- `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);
 - vectorcall entry points, the JIT, and safepoints;
 - direct access for other dtypes and dimensions.

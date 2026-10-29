@@ -29,6 +29,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    FloorDiv,
+    Mod,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,8 @@ pub enum CmpOp {
     Ge,
     Is,
     IsNot,
+    In,
+    NotIn,
 }
 
 /// A runtime type check, derived from a static type.
@@ -81,12 +85,34 @@ pub enum Instr {
     LoadGlobal { dst: Reg, name: u32 },
     Move { dst: Reg, src: Reg },
     LoadAttr { dst: Reg, obj: Reg, name: u32 },
+    StoreAttr { obj: Reg, name: u32, val: Reg },
     /// `func(*args[..n - kwnames.len()], **{kwnames: args[rest]})`
     Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32> },
-    BinOp { dst: Reg, op: BinOp, a: Reg, b: Reg },
+    /// `a op b`, or `a op= b` (`__iadd__`, ...) when `inplace`.
+    BinOp { dst: Reg, op: BinOp, a: Reg, b: Reg, inplace: bool },
+    Neg { dst: Reg, src: Reg },
     Compare { dst: Reg, op: CmpOp, a: Reg, b: Reg },
     GetItem { dst: Reg, obj: Reg, key: Reg },
     SetItem { obj: Reg, key: Reg, val: Reg },
+    DelItem { obj: Reg, key: Reg },
+    BuildList { dst: Reg, items: Vec<Reg> },
+    BuildTuple { dst: Reg, items: Vec<Reg> },
+    BuildDict { dst: Reg, keys: Vec<Reg>, vals: Vec<Reg> },
+    BuildSlice { dst: Reg, lower: Reg, upper: Reg, step: Reg },
+    /// `list.append(val)` for comprehensions.
+    ListAppend { list: Reg, val: Reg },
+    /// `dst = iter(obj)`
+    GetIter { dst: Reg, obj: Reg },
+    /// `dst = next(iter)`, or jump to `target` when the iterator is
+    /// exhausted.
+    ForIter { dst: Reg, iter: Reg, target: u32 },
+    /// `dsts[0], dsts[1], ... = src`, with CPython's errors.
+    Unpack { src: Reg, dsts: Vec<Reg> },
+    /// `format(conv(val), spec)` for an f-string field; `conv` is `0`, `b's'`,
+    /// `b'r'` or `b'a'`.
+    Format { dst: Reg, val: Reg, conv: u8, spec: Option<Reg> },
+    /// The concatenation of string registers.
+    BuildString { dst: Reg, parts: Vec<Reg> },
     /// `dst: Bool = bool(src)`
     Truthy { dst: Reg, src: Reg },
     Not { dst: Reg, src: Reg },
@@ -119,10 +145,13 @@ pub struct ParamIr {
     pub name: String,
     /// Index into `checks`.
     pub check: u32,
+    /// The default value, an index into `consts`.
+    pub default: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FuncIr {
+    /// The qualified name: `f`, or `C.m` for a method.
     pub name: String,
     pub file: String,
     pub line: u32,

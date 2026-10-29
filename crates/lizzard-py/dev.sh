@@ -15,6 +15,8 @@ for kind in ${which[@]}; do
         VIRTUAL_ENV="$venv" uv pip install -q numpy maturin
     fi
     echo "== $kind: $("$venv/bin/python" -c 'import sys; print(sys.version.split()[0], "free-threaded" if not sys._is_gil_enabled() else "GIL")')"
-    (cd crates/lizzard-py && unset CONDA_PREFIX && VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH" maturin develop -q --uv >/dev/null)
+    # One target directory per interpreter: PyO3's FFI layout differs between
+    # the free-threaded and GIL builds, and a shared cache can keep the wrong one.
+    (cd crates/lizzard-py && unset CONDA_PREFIX && CARGO_TARGET_DIR="$root/target/py-$kind" VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH" maturin develop -q --uv >/dev/null)
     "$venv/bin/python" -m unittest discover -s crates/lizzard-py/tests -t crates/lizzard-py/tests "${UNITTEST_ARGS:--q}"
 done
