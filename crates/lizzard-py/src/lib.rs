@@ -8,6 +8,7 @@ mod globals;
 mod interp;
 mod jit;
 mod ops;
+mod rc;
 mod rt;
 
 use std::path::PathBuf;
@@ -98,6 +99,7 @@ fn _stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     d.set_item("generic", array::GENERIC.load(Ordering::Relaxed))?;
     d.set_item("inline_values", ops::inline_values_on())?;
     d.set_item("fast_paths", ops::fast_paths_on())?;
+    d.set_item("inline_refcounts", rc::inline_on())?;
     Ok(d)
 }
 
@@ -107,6 +109,7 @@ fn _lizzard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LizzardFunction>()?;
     m.add_class::<generator::LizzardGenerator>()?;
     generator::init_type(m.py());
+    rc::init();
     ops::init_fast_paths();
     ops::init_inline_values();
     m.add_function(wrap_pyfunction!(compile_module, m)?)?;

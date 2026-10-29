@@ -279,3 +279,143 @@ pub struct FuncIr {
 pub struct ModuleIr {
     pub functions: Vec<FuncIr>,
 }
+
+impl Instr {
+    /// The registers it reads.
+    pub fn reads(&self) -> Vec<Reg> {
+        use Instr::*;
+        let mut v: Vec<Reg> = Vec::new();
+        match self {
+            Const { .. } | LoadGlobal { .. } | MakeCell { .. } | LoadFree { .. } | LoadFreeCell { .. } | Jump { .. } | GetHandled { .. } | Unbind { .. } | I64Const { .. } => {}
+            StoreGlobal { val, .. } | StoreFree { val, .. } => v.push(*val),
+            LoadCell { cell, .. } => v.push(*cell),
+            StoreCell { cell, val } => v.extend([*cell, *val]),
+            MakeFunction { closure, defaults, .. } => v.extend(closure.iter().chain(defaults)),
+            Move { src, .. } | Take { src, .. } | Neg { src, .. } | Invert { src, .. } | Pos { src, .. } | ListToTuple { src, .. } | Truthy { src, .. } | Not { src, .. } | TypeOf { src, .. } | Box { src, .. } | Unbox { src, .. } | SetHandled { src } | Return { src } | Unpack { src, .. } => v.push(*src),
+            LoadAttr { obj, .. } | DelAttr { obj, .. } | GetIter { obj, .. } | LoadSpecial { obj, .. } | Len { obj, .. } => v.push(*obj),
+            StoreAttr { obj, val, .. } => v.extend([*obj, *val]),
+            Call { func, args, .. } => {
+                v.push(*func);
+                v.extend(args);
+            }
+            CallMethod { obj, args, .. } => {
+                v.push(*obj);
+                v.extend(args);
+            }
+            CallEx { func, args, kwargs, .. } => {
+                v.extend([*func, *args]);
+                v.extend(kwargs);
+            }
+            ListExtend { list, iter } => v.extend([*list, *iter]),
+            DictMerge { dict, src, func } => v.extend([*dict, *src, *func]),
+            BinOp { a, b, .. } | Compare { a, b, .. } | CompareBool { a, b, .. } | I64Lt { a, b, .. } | I64Add { a, b, .. } | F32Bin { a, b, .. } => v.extend([*a, *b]),
+            GetItem { obj, key, .. } | DelItem { obj, key } => v.extend([*obj, *key]),
+            SetItem { obj, key, val } => v.extend([*obj, *key, *val]),
+            BuildList { items, .. } | BuildTuple { items, .. } | BuildSet { items, .. } => v.extend(items),
+            BuildDict { keys, vals, .. } => v.extend(keys.iter().chain(vals)),
+            SetAdd { set, val } => v.extend([*set, *val]),
+            BuildSlice { lower, upper, step, .. } => v.extend([*lower, *upper, *step]),
+            ListAppend { list, val } => v.extend([*list, *val]),
+            ForIter { iter, .. } | YieldFrom { iter, .. } => v.push(*iter),
+            Format { val, spec, .. } => {
+                v.push(*val);
+                v.extend(spec);
+            }
+            BuildString { parts, .. } => v.extend(parts),
+            JumpIfFalse { cond, .. } | JumpIfTrue { cond, .. } => v.push(*cond),
+            Raise { exc, cause } => {
+                v.push(*exc);
+                v.extend(cause);
+            }
+            Yield { src, .. } => v.push(*src),
+            Reraise { exc } => v.push(*exc),
+            ExcMatch { exc, cls, .. } => v.extend([*exc, *cls]),
+            ArrLoadF32 { arr, idx, .. } => v.extend([*arr, *idx]),
+            ArrStoreF32 { arr, idx, val } => v.extend([*arr, *idx, *val]),
+            Check { reg, .. } => v.push(*reg),
+        }
+        v
+    }
+
+    /// The registers it writes (`Unbind` and `Take` clear theirs: a write).
+    pub fn writes(&self) -> Vec<Reg> {
+        use Instr::*;
+        match self {
+            Const { dst, .. } | LoadGlobal { dst, .. } | MakeCell { dst } | LoadCell { dst, .. } | LoadFree { dst, .. } | LoadFreeCell { dst, .. } | MakeFunction { dst, .. } | Move { dst, .. } | LoadAttr { dst, .. } | Call { dst, .. } | CallMethod { dst, .. } | CallEx { dst, .. } | ListToTuple { dst, .. } | BinOp { dst, .. } | Neg { dst, .. } | Invert { dst, .. } | Pos { dst, .. } | Compare { dst, .. } | CompareBool { dst, .. } | GetItem { dst, .. } | BuildList { dst, .. } | BuildTuple { dst, .. } | BuildDict { dst, .. } | BuildSet { dst, .. } | BuildSlice { dst, .. } | GetIter { dst, .. } | ForIter { dst, .. } | Format { dst, .. } | BuildString { dst, .. } | Truthy { dst, .. } | Not { dst, .. } | Yield { dst, .. } | YieldFrom { dst, .. } | ExcMatch { dst, .. } | GetHandled { dst } | TypeOf { dst, .. } | LoadSpecial { dst, .. } | I64Const { dst, .. } | I64Lt { dst, .. } | I64Add { dst, .. } | Len { dst, .. } | Box { dst, .. } | Unbox { dst, .. } | ArrLoadF32 { dst, .. } | F32Bin { dst, .. } => vec![*dst],
+            Take { dst, src } => vec![*dst, *src],
+            Unbind { reg } => vec![*reg],
+            Unpack { dsts, .. } => dsts.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Where control can go next, besides an exception: the next
+    /// instruction (`pc + 1`) and jump targets.
+    pub fn successors(&self, pc: u32) -> Vec<u32> {
+        use Instr::*;
+        match self {
+            Jump { target } => vec![*target],
+            JumpIfFalse { target, .. } | JumpIfTrue { target, .. } | ForIter { target, .. } => vec![pc + 1, *target],
+            Return { .. } | Raise { .. } | Reraise { .. } => Vec::new(),
+            _ => vec![pc + 1],
+        }
+    }
+}
+
+impl FuncIr {
+    /// Turn a `Move` of an object whose source is not read again into a
+    /// `Take`: the reference moves instead of an incref and a decref.
+    pub fn moves_to_takes(&mut self) {
+        let n = self.code.len();
+        let nregs = self.reprs.len();
+        let words = nregs.div_ceil(64);
+        // Exception edges: an instruction a handler covers may continue at it.
+        let handler_of = |pc: u32| -> Vec<u32> { self.handlers.iter().filter(|h| h.ranges.iter().any(|(s, e)| *s <= pc && pc < *e)).map(|h| h.target).collect() };
+        let succ: Vec<Vec<usize>> = (0..n).map(|pc| self.code[pc].successors(pc as u32).into_iter().map(|t| t as usize).filter(|&t| t < n).collect()).collect();
+        let exc_succ: Vec<Vec<usize>> = (0..n).map(|pc| handler_of(pc as u32).into_iter().map(|t| t as usize).filter(|&t| t < n).collect()).collect();
+        let reads: Vec<Vec<Reg>> = self.code.iter().map(|i| i.reads()).collect();
+        let writes: Vec<Vec<Reg>> = self.code.iter().map(|i| i.writes()).collect();
+        // Live registers before each instruction, to a fixed point.
+        let mut live_in = vec![vec![0u64; words]; n];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for pc in (0..n).rev() {
+                let mut out = vec![0u64; words];
+                for &s in &succ[pc] {
+                    for w in 0..words {
+                        out[w] |= live_in[s][w];
+                    }
+                }
+                for r in &writes[pc] {
+                    out[*r as usize / 64] &= !(1 << (*r % 64));
+                }
+                for r in &reads[pc] {
+                    out[*r as usize / 64] |= 1 << (*r % 64);
+                }
+                // If it raises, its writes have not happened: what a handler
+                // reads is live before it.
+                for &h in &exc_succ[pc] {
+                    for w in 0..words {
+                        out[w] |= live_in[h][w];
+                    }
+                }
+                if out != live_in[pc] {
+                    live_in[pc] = out;
+                    changed = true;
+                }
+            }
+        }
+        for pc in 0..n {
+            if let Instr::Move { dst, src } = self.code[pc] {
+                if dst == src || self.reprs[src as usize] != Repr::Obj {
+                    continue;
+                }
+                let live_after = succ[pc].iter().chain(&exc_succ[pc]).any(|&s| live_in[s][src as usize / 64] & (1 << (src % 64)) != 0);
+                if !live_after {
+                    self.code[pc] = Instr::Take { dst, src };
+                }
+            }
+        }
+    }
+}

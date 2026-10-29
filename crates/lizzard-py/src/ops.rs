@@ -24,7 +24,7 @@ pub unsafe fn put(slots: *mut u64, r: u32, v: *mut ffi::PyObject) {
     let s = unsafe { slots.add(r as usize) };
     let old = unsafe { std::mem::replace(&mut *s, v as u64) } as *mut ffi::PyObject;
     if !old.is_null() {
-        unsafe { ffi::Py_DecRef(old) };
+        unsafe { crate::rc::decref(old) };
     }
 }
 
@@ -179,7 +179,7 @@ mod inline {
             if r.is_null() {
                 ffi::PyErr_Clear();
             } else {
-                ffi::Py_DecRef(r);
+                crate::rc::decref(r);
             }
             let p = if ok { ffi::PyDict_GetItemString(globals, c"_p".as_ptr()) } else { std::ptr::null_mut() };
             ok &= !p.is_null();
@@ -193,11 +193,11 @@ mod inline {
                         Some(off) => *((p as *mut u8).add(off) as *const *mut ffi::PyObject) == want,
                         None => false,
                     };
-                    ffi::Py_DecRef(want);
-                    ffi::Py_DecRef(name);
+                    crate::rc::decref(want);
+                    crate::rc::decref(name);
                 }
             }
-            ffi::Py_DecRef(globals);
+            crate::rc::decref(globals);
             ON.store(ok, Ordering::Relaxed);
         }
     }
@@ -249,7 +249,7 @@ unsafe fn lookup(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject, s
             }
         } else {
             let m = (ffi::Py_TYPE(d) == &raw mut ffi::PyMemberDescr_Type).then(|| (*(d as *mut ffi::PyMemberDescrObject)).d_member);
-            ffi::Py_DecRef(d);
+            crate::rc::decref(d);
             m.map_or(Where::Generic, Where::Slot)
         };
         // Entries are small and a site replaces its entry at most
@@ -340,14 +340,14 @@ pub unsafe fn method(ic: &MethodIc, o: *mut ffi::PyObject, name: *mut ffi::PyObj
         })();
         let r = match entry {
             Some(m) => {
-                ffi::Py_IncRef(d);
+                crate::rc::incref(d);
                 // As for attribute entries, replaced ones are not freed.
                 ic.entry.store(Box::into_raw(Box::new(m)), Ordering::Release);
                 Some(d)
             }
             None => None,
         };
-        ffi::Py_DecRef(d);
+        crate::rc::decref(d);
         r
     }
 }
@@ -369,12 +369,12 @@ unsafe fn load_value(slot: *const AtomicPtr<ffi::PyObject>) -> *mut ffi::PyObjec
                 return std::ptr::null_mut();
             }
             if (*slot).load(Ordering::Acquire) != v {
-                ffi::Py_DecRef(v);
+                crate::rc::decref(v);
                 return std::ptr::null_mut();
             }
         }
         #[cfg(not(Py_GIL_DISABLED))]
-        ffi::Py_IncRef(v);
+        crate::rc::incref(v);
         v
     }
 }
@@ -401,13 +401,13 @@ unsafe fn store_value(o: *mut ffi::PyObject, off: usize, v: *mut ffi::PyObject) 
         let old = (*slot).load(Ordering::Relaxed);
         let ok = !old.is_null() && inline::valid(o) && inline::no_dict(o);
         if ok {
-            ffi::Py_IncRef(v);
+            crate::rc::incref(v);
             (*slot).store(v, Ordering::Release);
         }
         #[cfg(Py_GIL_DISABLED)]
         PyCriticalSection_End(&mut cs);
         if ok {
-            ffi::Py_DecRef(old);
+            crate::rc::decref(old);
         }
         ok
     }
@@ -453,7 +453,7 @@ pub extern "C" fn lz_store_attr(slots: *mut u64, obj: u32, val: u32, name: *mut 
 /// `dst = const` (a new reference to an object the function keeps).
 pub extern "C" fn lz_const(slots: *mut u64, dst: u32, obj: *mut ffi::PyObject) {
     unsafe {
-        ffi::Py_IncRef(obj);
+        crate::rc::incref(obj);
         put(slots, dst, obj);
     }
 }
@@ -464,7 +464,7 @@ pub extern "C" fn lz_move(slots: *mut u64, dst: u32, src: u32) -> u32 {
         if o.is_null() {
             return ERROR;
         }
-        ffi::Py_IncRef(o);
+        crate::rc::incref(o);
         put(slots, dst, o);
         NEXT
     }
@@ -542,14 +542,14 @@ pub fn init_fast_paths() {
         for v in [0i64, 1, -1, 7, -1234, (1 << 30) - 1, -((1 << 30) - 1)] {
             let o = ffi::PyLong_FromLongLong(v);
             ok &= small_int(o) == Some(v);
-            ffi::Py_DecRef(o);
+            crate::rc::decref(o);
         }
         let big = ffi::PyLong_FromLongLong(1 << 40);
         ok &= small_int(big).is_none();
-        ffi::Py_DecRef(big);
+        crate::rc::decref(big);
         let f = ffi::PyFloat_FromDouble(2.5);
         ok &= exact_float(f) == Some(2.5);
-        ffi::Py_DecRef(f);
+        crate::rc::decref(f);
         FAST.store(ok, Ordering::Relaxed);
     }
 }
@@ -664,7 +664,7 @@ pub extern "C" fn lz_compare(slots: *mut u64, dst: u32, a: u32, b: u32, op: u32)
         }
         if let Some(t) = fast_compare(x, y, op) {
             let b = if t { ffi::Py_True() } else { ffi::Py_False() };
-            ffi::Py_IncRef(b);
+            crate::rc::incref(b);
             return result(slots, dst, b);
         }
         result(slots, dst, ffi::PyObject_RichCompare(x, y, op as i32))
@@ -723,7 +723,7 @@ pub extern "C" fn lz_compare_bool(slots: *mut u64, dst: u32, a: u32, b: u32, op:
         } else {
             ffi::PyObject_IsTrue(r)
         };
-        ffi::Py_DecRef(r);
+        crate::rc::decref(r);
         if t < 0 {
             return ERROR;
         }

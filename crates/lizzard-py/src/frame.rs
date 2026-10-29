@@ -79,7 +79,7 @@ impl Regs {
         for i in 0..slots.len() {
             if objs[i] && slots[i] != 0 {
                 // SAFETY: the frame owns these references; attached.
-                unsafe { ffi::Py_DecRef(std::mem::take(&mut slots[i]) as *mut ffi::PyObject) };
+                unsafe { crate::rc::decref(std::mem::take(&mut slots[i]) as *mut ffi::PyObject) };
             }
         }
         // Nothing left for `Drop`.
@@ -114,7 +114,7 @@ impl Regs {
         if !old.is_null() {
             // SAFETY: the frame owned the old reference; the thread is
             // attached (`v` proves it).
-            unsafe { ffi::Py_DecRef(old) };
+            unsafe { crate::rc::decref(old) };
         }
     }
 
@@ -123,7 +123,7 @@ impl Regs {
         let old = std::mem::replace(&mut self.slots_mut()[r as usize], 0);
         if self.objs()[r as usize] && old != 0 {
             // SAFETY: as in `set_obj`; callers are attached.
-            unsafe { ffi::Py_DecRef(old as *mut ffi::PyObject) };
+            unsafe { crate::rc::decref(old as *mut ffi::PyObject) };
         }
     }
 

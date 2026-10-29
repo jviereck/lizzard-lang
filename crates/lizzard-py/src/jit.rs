@@ -178,7 +178,7 @@ pub extern "C" fn lz_return(ctx: *mut c_void, slots: *mut u64, src: u32) -> u32 
         if o.is_null() {
             return ERROR;
         }
-        ffi::Py_IncRef(o);
+        crate::rc::incref(o);
         (*(ctx as *mut Ctx<'_, '_>)).ret = o;
         NEXT
     }

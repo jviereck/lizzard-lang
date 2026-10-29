@@ -903,7 +903,7 @@ impl<'a> Lower<'a> {
                 l.emit(Instr::Return { src: r });
             }
         }
-        let ir = FuncIr {
+        let mut ir = FuncIr {
             name: l.fname,
             file: path,
             line: spec.line,
@@ -919,6 +919,7 @@ impl<'a> Lower<'a> {
             free: spec.free.into_iter().map(|(n, _)| n).collect(),
             generator,
         };
+        ir.moves_to_takes();
         let nested = l.nested;
         self.nested.extend(nested);
         self.db.rigid = saved_rigid;

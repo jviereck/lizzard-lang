@@ -193,7 +193,7 @@ impl LizzardFunction {
             let mut regs = Regs::new(&rt.objs);
             for (i, &a) in args.iter().enumerate() {
                 // SAFETY: a new reference for the frame.
-                unsafe { ffi::Py_IncRef(a) };
+                unsafe { crate::rc::incref(a) };
                 regs.init_obj(i as u32, a);
             }
             return run_frame(py, rt, self.globals.bind(py), &self.closure, &mut regs);
