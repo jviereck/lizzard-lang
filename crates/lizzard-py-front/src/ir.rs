@@ -284,7 +284,16 @@ pub struct FuncIr {
     pub free: Vec<String>,
     /// A generator function: calling it creates a generator object.
     pub generator: bool,
+    /// Per instruction, what the checker knows about a `BinOp`'s operands
+    /// (`HINT_FLOAT`, `HINT_INT`; 0 for nothing), for compiled code to
+    /// specialize on. Only a hint: the values are checked at runtime.
+    pub hints: Vec<u8>,
 }
+
+/// Both operands are statically `float` (at runtime: a float or an int).
+pub const HINT_FLOAT: u8 = 1;
+/// Both operands are statically `int`.
+pub const HINT_INT: u8 = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct ModuleIr {

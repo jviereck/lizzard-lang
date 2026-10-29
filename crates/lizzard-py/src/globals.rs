@@ -41,6 +41,19 @@ fn watcher() -> c_int {
     *ID.get_or_init(|| unsafe { PyDict_AddWatcher(on_change) })
 }
 
+/// The address of the epoch, for compiled code.
+pub fn epoch_addr() -> usize {
+    &EPOCH as *const AtomicU64 as usize
+}
+
+/// What a site's cache holds: the epoch and the value (borrowed).
+pub fn spec(ic: &GlobalIc) -> Option<(u64, *mut ffi::PyObject)> {
+    let s = ic.seq.load(Ordering::Acquire);
+    let (e, v) = (ic.epoch.load(Ordering::Relaxed), ic.value.load(Ordering::Relaxed));
+    fence(Ordering::Acquire);
+    (s & 1 == 0 && ic.seq.load(Ordering::Relaxed) == s && !v.is_null()).then_some((e, v))
+}
+
 #[derive(Default)]
 pub struct GlobalIc {
     seq: AtomicU32,

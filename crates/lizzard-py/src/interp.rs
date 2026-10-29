@@ -30,8 +30,10 @@ pub struct FuncRt {
     pub objs: Arc<[bool]>,
     /// All its parameters are plain positional ones.
     pub positional: bool,
-    /// Its compiled code, once it has run (None if it cannot be compiled).
-    pub jit: OnceLock<Option<lizzard_jit::Entry>>,
+    /// Its compiled code, once it is warm.
+    pub jit: jit::JitCell,
+    /// It never writes its parameters (see `lizzard_jit::Unit`).
+    pub borrow_params: bool,
     pub(crate) consts: Vec<Py<PyAny>>,
     pub(crate) names: Vec<Py<PyString>>,
     /// The keyword names of each call with keywords, by pc, as the tuple
@@ -112,7 +114,9 @@ impl FuncRt {
         let ops = bytecode::lower(&ir);
         let ctics = ir.code.iter().map(|_| ops::CtorIc::default()).collect();
         let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
-        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, table })
+        let nparams = ir.params.len() as u32;
+        let borrow_params = !ir.generator && ir.code.iter().all(|i| matches!(i, Instr::Unbind { .. }) || i.writes().iter().all(|&r| r >= nparams) || matches!(i, Instr::Take { dst, .. } if *dst >= nparams));
+        Ok(FuncRt { ir, objs, positional, jit: jit::JitCell::default(), borrow_params, consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, table })
     }
 }
 
@@ -121,11 +125,11 @@ impl FuncRt {
 pub struct LizzardFunction {
     /// CPython calls it through this pointer (vectorcall; see `create`).
     vectorcall: ffi::vectorcallfunc,
-    rt: Arc<FuncRt>,
-    globals: Py<PyDict>,
+    pub(crate) rt: Arc<FuncRt>,
+    pub(crate) globals: Py<PyDict>,
     module: String,
     /// Cells for the variables it captures (`ir.free`).
-    closure: Vec<Py<PyAny>>,
+    pub(crate) closure: Vec<Py<PyAny>>,
     /// Defaults evaluated where it was created (parameters with
     /// `dynamic_default`, in order).
     defaults: Vec<Py<PyAny>>,
@@ -364,7 +368,7 @@ impl LizzardFunction {
 static FUNCTION_TYPE: std::sync::atomic::AtomicPtr<ffi::PyTypeObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// `LizzardFunction`'s type object, once a function exists (null before).
-fn lizzard_function_type() -> *mut ffi::PyTypeObject {
+pub(crate) fn lizzard_function_type() -> *mut ffi::PyTypeObject {
     FUNCTION_TYPE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -623,10 +627,8 @@ pub(crate) fn exec<'py>(
     pc: &mut usize,
     pending: Option<PyErr>,
 ) -> PyResult<Exit<'py>> {
-    if jit::enabled() {
-        if let Some(entry) = jit::code(f) {
-            return jit::exec(py, entry, f, globals, closure, regs, pc, pending);
-        }
+    if let Some(entry) = jit::entry(py, f) {
+        return jit::exec(py, entry, f, globals, closure, regs, pc, pending);
     }
     run_interp(py, f, globals, closure, regs, pc, pending)
 }
@@ -640,7 +642,7 @@ pub(crate) fn exec<'py>(
 /// frame goes on `frames` and the loop continues in it; its return (or an
 /// exception leaving it) pops it and continues in the caller. Only the base
 /// frame (the one `exec` was given) can be a generator's, so only it yields.
-fn run_interp<'py>(
+pub(crate) fn run_interp<'py>(
     py: Python<'py>,
     f0: &FuncRt,
     globals0: &Bound<'py, PyDict>,
@@ -726,7 +728,51 @@ fn run_interp<'py>(
                 let o = unsafe { *ops.get_unchecked(p) };
                 let status = match o.op {
                     Opc::Jump => {
-                        p = o.x as usize;
+                        let t = o.x as usize;
+                        // A loop: once warm, it continues in compiled code.
+                        if t <= p {
+                            if let Some(e) = jit::osr(py, f) {
+                                let mut q = t;
+                                match jit::run(py, e, f, globals, closure, regs, &mut q, None) {
+                                    jit::Ran::Bail => {
+                                        p = q;
+                                        continue;
+                                    }
+                                    jit::Ran::Err(e) => {
+                                        p = q;
+                                        err = Some(e);
+                                        break;
+                                    }
+                                    jit::Ran::Exit(Exit::Return(v)) => match frames.pop() {
+                                        Some(t) => {
+                                            pop_frame(&mut stack, &t);
+                                            p = t.ret_pc + 1;
+                                            match t.instance {
+                                                None => ret = Some((t.ret_dst, v)),
+                                                Some(obj) => match init_returned(&v) {
+                                                    Ok(()) => ret = Some((t.ret_dst, obj)),
+                                                    Err(e) => {
+                                                        p -= 1;
+                                                        err = Some(e);
+                                                    }
+                                                },
+                                            }
+                                            continue 'frame;
+                                        }
+                                        None => {
+                                            *pc = q;
+                                            return Ok(Exit::Return(v));
+                                        }
+                                    },
+                                    jit::Ran::Exit(exit) => {
+                                        // Only the base frame can be a generator's.
+                                        *pc = q;
+                                        return Ok(exit);
+                                    }
+                                }
+                            }
+                        }
+                        p = t;
                         continue;
                     }
                     Opc::JumpIfFalse => {
@@ -984,7 +1030,7 @@ fn builtins(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
 }
 
 /// The builtins module's namespace.
-fn builtins_dict(py: Python<'_>) -> PyResult<&Bound<'_, PyDict>> {
+pub(crate) fn builtins_dict(py: Python<'_>) -> PyResult<&Bound<'_, PyDict>> {
     static DICT: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
     Ok(DICT.get_or_try_init(py, || builtins(py)?.getattr("__dict__")?.cast_into::<PyDict>().map(|d| d.unbind()).map_err(PyErr::from))?.bind(py))
 }
@@ -1178,8 +1224,9 @@ fn lizzard_call<'py>(
     args: &[u32],
     direct: Option<&Direct>,
 ) -> Option<PyResult<Called<'py>>> {
-    let interpreted = !jit::enabled() || jit::code(&lf.get().rt).is_none();
-    let Some(stack) = stack.filter(|_| interpreted) else {
+    // In the interpreter's loop unless it is compiled (this counts the call;
+    // without the loop, `exec` counts it).
+    let Some(stack) = stack.filter(|_| jit::entry(py, &lf.get().rt).is_none()) else {
         return lf.get().call_regs(py, f, pc, direct, regs, slf, args).map(|r| r.map(Called::Value));
     };
     let n = lf.get().rt.objs.len();
@@ -1229,7 +1276,7 @@ fn lizzard_call<'py>(
 
 /// `__init__` must return None (CPython's message otherwise).
 #[inline]
-fn init_returned(v: &Bound<'_, PyAny>) -> PyResult<()> {
+pub(crate) fn init_returned(v: &Bound<'_, PyAny>) -> PyResult<()> {
     if v.is_none() {
         return Ok(());
     }

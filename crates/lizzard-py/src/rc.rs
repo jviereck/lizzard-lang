@@ -166,6 +166,35 @@ pub fn init() {
     }
 }
 
+/// The thread id compiled code compares owners with (0 without the
+/// free-threaded build).
+pub fn tid() -> usize {
+    #[cfg(Py_GIL_DISABLED)]
+    if INLINE.load(Ordering::Relaxed) {
+        // SAFETY: inline counting is on only where there is one.
+        return unsafe { thread_id().unwrap_unchecked() };
+    }
+    0
+}
+
+/// How compiled code counts references, and the library functions it
+/// calls: `_Py_Dealloc` (GIL), `_Py_MergeZeroLocalRefcount` and
+/// `_Py_DecRefShared` (free-threaded).
+pub fn jit_model() -> (lizzard_jit::Rc, usize, usize, usize) {
+    if !INLINE.load(Ordering::Relaxed) {
+        return (lizzard_jit::Rc::Calls, 0, 0, 0);
+    }
+    #[cfg(Py_GIL_DISABLED)]
+    {
+        let ft = lizzard_jit::Rc::Ft { tid: layout::TID as i32, local: layout::LOCAL as i32, shared: layout::SHARED as i32 };
+        (ft, 0, _Py_MergeZeroLocalRefcount as *const () as usize, _Py_DecRefShared as *const () as usize)
+    }
+    #[cfg(not(Py_GIL_DISABLED))]
+    {
+        (lizzard_jit::Rc::Gil, _Py_Dealloc as *const () as usize, 0, 0)
+    }
+}
+
 /// Whether reference counting is inline (the start-up check passed).
 pub fn inline_on() -> bool {
     INLINE.load(Ordering::Relaxed)

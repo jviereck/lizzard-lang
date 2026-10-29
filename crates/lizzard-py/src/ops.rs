@@ -92,18 +92,18 @@ mod inline {
     pub const TPFLAGS_INLINE_VALUES: std::ffi::c_ulong = 1 << 2;
     pub const TPFLAGS_MANAGED_DICT: std::ffi::c_ulong = 1 << 4;
     /// `struct _dictvalues { uint8 capacity, size, embedded, valid; PyObject *values[]; }`
-    const VALID: usize = 3;
+    pub const VALID: usize = 3;
     const VALUES: usize = 8;
     /// Where the managed `__dict__` pointer lives, before the object.
     #[cfg(Py_GIL_DISABLED)]
-    const MANAGED_DICT: isize = -8;
+    pub const MANAGED_DICT: isize = -8;
     #[cfg(not(Py_GIL_DISABLED))]
-    const MANAGED_DICT: isize = -24;
+    pub const MANAGED_DICT: isize = -24;
     /// `struct _dictkeysobject`: kind at 10, entry count at 24, indices at
     /// 32 (`1 << dk_log2_index_bytes` bytes), then `{key, value}` entries.
     const DK_LOG2_INDEX_BYTES: usize = 9;
     const DK_KIND: usize = 10;
-    const DK_NENTRIES: usize = 24;
+    pub const DK_NENTRIES: usize = 24;
     const DK_INDICES: usize = 32;
     const DICT_KEYS_SPLIT: u8 = 2;
 
@@ -313,6 +313,47 @@ unsafe fn lookup(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject, s
     }
 }
 
+/// What compiled code may assume at an attribute site (`store`: a store):
+/// the type and version its cache saw, and where the attribute lives.
+pub fn attr_spec(ic: &AttrIc, store: bool) -> lizzard_jit::Spec {
+    unsafe {
+        let e = ic.entry.load(Ordering::Acquire);
+        if e.is_null() {
+            return lizzard_jit::Spec::None;
+        }
+        let e = &*e;
+        let (tp, version) = (e.tp as usize, e.version);
+        match e.at {
+            Where::Inline(off) => lizzard_jit::Spec::Inline {
+                tp,
+                version,
+                off: off as i32,
+                values: (*e.tp).tp_basicsize as i32,
+                dict: inline::MANAGED_DICT as i32,
+            },
+            Where::Slot(m) if (*m).type_code == ffi::Py_T_OBJECT_EX && (!store || (*m).flags & ffi::Py_READONLY == 0) => lizzard_jit::Spec::Member { tp, version, off: (*m).offset as i32 },
+            _ => lizzard_jit::Spec::None,
+        }
+    }
+}
+
+/// What a method call site's cache saw: the type, its version, the method
+/// (borrowed from the type's dict) and the unshadowed guard (the address of
+/// the shared keys' entry count, or 0, the count, and the offset of the
+/// values' valid byte).
+pub fn method_spec(ic: &MethodIc) -> Option<(usize, u32, *mut ffi::PyObject, usize, i64, i32)> {
+    unsafe {
+        let e = ic.entry.load(Ordering::Acquire);
+        if e.is_null() {
+            return None;
+        }
+        let e = &*e;
+        let keys = if e.keys.is_null() { 0 } else { e.keys as usize + inline::DK_NENTRIES };
+        let valid = ((*e.tp).tp_basicsize as usize + inline::VALID) as i32;
+        Some((e.tp as usize, e.version, e.func, keys, e.nentries as i64, valid))
+    }
+}
+
 /// A method call site's cache: for one type and version, the method
 /// (a method descriptor found on the type) and why no instance attribute
 /// can shadow it, as CPython's `LOAD_ATTR_METHOD_NO_DICT` and
@@ -427,6 +468,14 @@ struct CtorEntry {
 }
 
 const TPFLAGS_IS_ABSTRACT: std::ffi::c_ulong = 1 << 20;
+
+/// What a construction site's cache saw: the class, its version and its
+/// `__init__` (borrowed from the class's dict).
+pub fn ctor_spec(ic: &CtorIc) -> Option<(*mut ffi::PyTypeObject, u32, *mut ffi::PyObject)> {
+    let e = ic.entry.load(Ordering::Acquire);
+    // SAFETY: entries are never freed.
+    (!e.is_null()).then(|| unsafe { ((*e).tp, (*e).version, (*e).init) })
+}
 
 /// The `__init__` (a new reference) when constructing an instance of `tp`
 /// is allocating it and calling that; else None (the generic `type` call).

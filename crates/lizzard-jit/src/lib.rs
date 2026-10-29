@@ -2,32 +2,56 @@
 //! code that runs on the same frame as the interpreter.
 //!
 //! The frame is an array of 8-byte register slots (see `lizzard-py`'s
-//! `frame.rs`). Compiled code does the control flow itself (jumps,
-//! branches, exception handler dispatch, the entries a generator resumes
-//! at), and the unboxed `i64`/`f32`/bool instructions inline. Every other
-//! instruction calls the runtime's `step` helper, which executes that one
-//! instruction with the interpreter's semantics, so both engines behave
-//! the same and an instruction can move inline without changing the rest.
+//! `frame.rs`). A function is compiled once it is warm, with what the
+//! interpreter's caches saw (`Spec`, one per instruction): the type and
+//! version of an attribute's object and where the attribute lives, the value
+//! of a global, the function a call reaches. Compiled code checks each of
+//! these with a guard of a few machine instructions and then does the work
+//! inline; when a guard fails, the instruction takes its generic path (the
+//! runtime's helper, which works for anything), or, where the code after it
+//! depends on the specialization, the function *bails out*: compiled code
+//! returns `BAIL` with the frame in the interpreter's form and the pc to
+//! continue at, and the interpreter finishes the frame.
+//!
+//! Within a run of instructions without jumps into it (a block), registers
+//! can be *virtual*: compiled code knows their value without the slot
+//! holding it:
+//! - a float or int (`IR hints` say which arithmetic is on floats or ints)
+//!   kept unboxed in a machine register, boxed only if something needs the
+//!   object;
+//! - a borrowed pointer (an attribute's value, a constant, a global), whose
+//!   reference is only taken if the register outlives what keeps the object
+//!   alive.
+//! Before a jump to another block, a helper call (which may read the slots
+//! or run arbitrary code), an exception and a bail-out, the registers that
+//! are live there are *materialized*: boxed or given their reference, and
+//! stored in their slots. Scalar registers (`I64`, `Bool`) are Cranelift
+//! variables, written through to their slots.
 //!
 //! A compiled function is
 //! `extern "C" fn(ctx, regs: *mut u64, pc: *mut u32, pending: u32) -> u32`.
-//! It starts at `*pc`: 0, or where a generator resumes (after a `yield`, or
-//! at the `yield` itself with an exception pending, as `throw` raises it).
-//! It returns a status and leaves `*pc` at the instruction that returned,
-//! yielded or raised, like the interpreter's `exec`.
+//! It starts at `*pc`: 0, a loop header (on-stack replacement: the
+//! interpreter switches to compiled code in a hot loop), or where a
+//! generator resumes (after a `yield`, or at the `yield` itself with an
+//! exception pending, as `throw` raises it). It returns a status and leaves
+//! `*pc` at the instruction that returned, yielded or raised, or (`BAIL`)
+//! the one to continue at.
 //!
-//! This crate knows nothing about Python: the runtime passes the helpers'
-//! addresses, and `ctx` is opaque here.
+//! This crate knows nothing about Python's API: the runtime passes the
+//! helpers' addresses and the object layout (`Layout`), and `ctx` is opaque
+//! here but for the two fields at `CTX_TID` and `CTX_RET`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlagsData, SigRef, Signature, TrapCode, Value};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{types, AbiParam, AtomicRmwOp, Block, BlockArg, InstBuilder, MemFlagsData, SigRef, Signature, StackSlot, StackSlotData, StackSlotKind, TrapCode, Type, Value};
+use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Module};
-use lizzard_py_front::ir::{BinOp, CmpOp, FuncIr, Instr, Repr};
+use lizzard_py_front::ir::{BinOp, CmpOp, FuncIr, Instr, Reg, Repr, HINT_FLOAT, HINT_INT};
 
 /// The helper executed the instruction; continue with the next one.
 pub const NEXT: u32 = 0;
@@ -37,8 +61,56 @@ pub const TAKEN: u32 = 1;
 pub const EXIT: u32 = 2;
 /// An exception is set (in CPython's thread state).
 pub const ERROR: u32 = 3;
+/// Compiled code stopped: the interpreter continues the frame at `*pc`.
+pub const BAIL: u32 = 4;
 
-/// The runtime functions compiled code calls, by address.
+/// The context's thread id (free-threaded reference counting compares an
+/// object's owner with it), and where `Return` leaves its value (a new
+/// reference).
+pub const CTX_TID: i32 = 0;
+pub const CTX_RET: i32 = 8;
+
+pub type Entry = unsafe extern "C" fn(ctx: *mut c_void, regs: *mut u64, pc: *mut u32, pending: u32) -> u32;
+
+/// How objects are laid out, as far as compiled code reads them.
+#[derive(Clone, Copy)]
+pub struct Layout {
+    /// Offset of `ob_type` in an object, and of `tp_version_tag` in a type.
+    pub ob_type: i32,
+    pub tp_version: i32,
+    pub rc: Rc,
+    /// Exact ints and floats can be read directly (`fval`: a float's
+    /// double; `long_tag` and `long_digit`: a compact int's tag and digit).
+    pub numbers: bool,
+    pub float_type: usize,
+    pub long_type: usize,
+    pub fval: i32,
+    pub long_tag: i32,
+    pub long_digit: i32,
+    pub none: usize,
+    pub true_: usize,
+    pub false_: usize,
+    /// The address of the `u64` that changes whenever a watched globals or
+    /// builtins dict does.
+    pub epoch: usize,
+}
+
+/// How reference counts change.
+#[derive(Clone, Copy)]
+pub enum Rc {
+    /// Through `Helpers::incref` / `decref`.
+    Calls,
+    /// A 32-bit count at offset 0, immortal when negative (as `i32`).
+    Gil,
+    /// Free-threaded: the owner thread's id at `tid`, its 32-bit count at
+    /// `local` (`u32::MAX`: immortal), other threads' count at `shared` (in
+    /// units of 4).
+    Ft { tid: i32, local: i32, shared: i32 },
+}
+
+/// The runtime functions compiled code calls, by address. Those taking
+/// `(ctx, regs, ...)` and returning a status return `NEXT` or `ERROR`
+/// unless said otherwise.
 #[derive(Clone, Copy)]
 pub struct Helpers {
     /// `step(ctx, regs, pc) -> status`: execute instruction `pc`
@@ -48,21 +120,12 @@ pub struct Helpers {
     /// register `reg`, for a handler.
     pub catch: usize,
     /// `safepoint(ctx) -> status`: run pending signal handlers and let a
-    /// stop-the-world pause happen (`NEXT` or `ERROR`). Called every
-    /// `FUEL` loop iterations.
+    /// stop-the-world pause happen. Called every `FUEL` loop iterations.
     pub safepoint: usize,
-    /// The hot object instructions, with their operands as immediates
-    /// (`NEXT` or `ERROR`, except `konst`):
     /// `load_attr(regs, dst, obj, name, ic)`
     pub load_attr: usize,
     /// `store_attr(regs, obj, val, name, ic)`
     pub store_attr: usize,
-    /// `konst(regs, dst, obj)`: store a new reference to `obj`.
-    pub konst: usize,
-    /// `mov(regs, dst, src)` for objects.
-    pub mov: usize,
-    /// `box_i64(regs, dst, src)`
-    pub box_i64: usize,
     /// `truthy(regs, dst, src)`
     pub truthy: usize,
     /// `binop(regs, dst, a, b, op)`: `op` is the `BinOp`'s index, plus 16
@@ -72,11 +135,6 @@ pub struct Helpers {
     pub compare: usize,
     /// `compare_bool(regs, dst, a, b, op)`: the same, as a `Bool`.
     pub compare_bool: usize,
-    /// `take(regs, dst, src)`: move an object reference.
-    pub take: usize,
-    /// `ret(ctx, regs, src)`: hand `src` to the runtime as the return value
-    /// (`NEXT`, then the code exits) or `ERROR`.
-    pub ret: usize,
     /// `call(ctx, regs, pc)` for `Call` and `CallMethod`.
     pub call: usize,
     /// `for_iter(ctx, regs, dst, iter, pc)`: `NEXT`, `TAKEN` at the end, or
@@ -84,50 +142,135 @@ pub struct Helpers {
     pub for_iter: usize,
     /// `check(ctx, regs, reg, check, pc)`
     pub check: usize,
+    /// `load_global(ctx, regs, dst, pc)`
+    pub load_global: usize,
+    /// `enter(ctx, frame, desc) -> object`: call the function `desc`
+    /// describes (`CallSpec::desc`) on `frame`, its registers with the
+    /// arguments (borrowed) first and the others unbound; its result (a new
+    /// reference), or null with an exception set. It releases the frame.
+    pub enter: usize,
+    /// `Py_IncRef`, `Py_DecRef` (`Rc::Calls`), `_Py_Dealloc` (`Rc::Gil`),
+    /// `_Py_MergeZeroLocalRefcount` and `_Py_DecRefShared` (`Rc::Ft`).
+    pub incref: usize,
+    pub decref: usize,
+    pub dealloc: usize,
+    pub merge_zero: usize,
+    pub dec_shared: usize,
+    /// `PyFloat_FromDouble`, `PyLong_FromLongLong`.
+    pub float_new: usize,
+    pub long_new: usize,
+    /// `long_value(obj, out: *mut i64) -> u32`: 1 with the value of an exact
+    /// int that fits in an `i64`, else 0 (no exception).
+    pub long_value: usize,
+    /// `init_returned(obj)`: `__init__` returned `obj` (a new reference),
+    /// not None: release it and raise TypeError.
+    pub init_returned: usize,
+    /// `missed(ctx)`: the generic paths of sites compiled without what
+    /// their caches see (`Unit::misses`) ran `MISSES` times.
+    pub missed: usize,
 }
 
-/// CPython's `Py_LT`, `Py_LE`, `Py_EQ`, `Py_NE`, `Py_GT`, `Py_GE`.
-fn rich_code(op: CmpOp) -> Option<u32> {
-    Some(match op {
-        CmpOp::Lt => 0,
-        CmpOp::Le => 1,
-        CmpOp::Eq => 2,
-        CmpOp::Ne => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-        _ => return None,
-    })
+/// See `Helpers::missed`.
+pub const MISSES: u32 = 1000;
+
+/// A check by type pointers alone; `Slow` always asks the helper.
+#[derive(Clone, Copy, Debug)]
+pub enum Quick {
+    Slow,
+    Any,
+    /// The exact type.
+    Type(usize),
+    /// An exact float or an exact int.
+    FloatOrInt,
+    /// That very object (None).
+    Is(usize),
+    /// True or False.
+    Bool,
 }
 
-/// What follows a helper call's status.
-#[derive(Clone, Copy)]
-enum After {
-    /// No status: continue.
-    Nothing,
-    /// `NEXT` continues, anything else raises.
-    Next,
-    /// `NEXT` leaves the function (it returned).
-    Exit,
-    /// `NEXT` continues, `TAKEN` jumps to the target, else it raises.
-    Branch(u32),
+/// What the runtime's caches saw at an instruction.
+#[derive(Clone, Debug)]
+pub enum Spec {
+    None,
+    /// `LoadAttr` / `StoreAttr` of an instance attribute kept in inline
+    /// values, on instances of type `tp` at `version`: the value pointer is
+    /// at `off` from the object, in the values at `values` (CPython's
+    /// `struct _dictvalues { uint8 capacity, size, embedded, valid; PyObject
+    /// *values[capacity]; uint8 order[capacity]; }`), which are in use
+    /// while `valid` is not 0; no `__dict__` exists while the pointer at
+    /// `dict` is null.
+    Inline { tp: usize, version: u32, off: i32, values: i32, dict: i32 },
+    /// A `__slots__` member: an object pointer at `off` (null when unset).
+    Member { tp: usize, version: u32, off: i32 },
+    /// `LoadGlobal`: `value` while the epoch is `epoch`.
+    Global { epoch: u64, value: usize },
+    Check(Quick),
+    Call(CallSpec),
 }
 
-/// The objects compiled code refers to by address: the function's
-/// constants and interned names. They must outlive the code.
-pub struct Objects<'a> {
+/// A call (`Call` or `CallMethod`) that reaches a Lizzard function compiled
+/// code can enter directly.
+#[derive(Clone, Debug)]
+pub struct CallSpec {
+    pub guard: CallGuard,
+    /// For `Helpers::enter`.
+    pub desc: usize,
+    /// The callee's registers.
+    pub nregs: u32,
+    /// The checks of its parameters (the receiver first) a caller makes.
+    pub checks: Vec<Quick>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CallGuard {
+    /// `Call`: the function register holds this object.
+    Func(usize),
+    /// `Call` of class `tp` (at `version`) whose instances are created by
+    /// allocating them (`alloc(tp, 0)`, its `tp_alloc`) and calling the
+    /// `__init__` the call spec describes, the instance first.
+    Ctor { tp: usize, version: u32, alloc: usize },
+    /// `CallMethod`: the receiver's type and its version, and why no
+    /// instance attribute shadows the method: `keys` is null (no `__dict__`)
+    /// or the instance's inline values are in use (the byte at `valid`) and
+    /// the shared keys still have `nentries` entries (`keys` is the address
+    /// of their count).
+    Method { tp: usize, version: u32, keys: usize, nentries: i64, valid: i32 },
+}
+
+/// A constant's value, when it is a float or an int that fits in an `i64`.
+#[derive(Clone, Copy, Debug)]
+pub enum Num {
+    Other,
+    F64(f64),
+    I64(i64),
+}
+
+/// What to compile.
+pub struct Unit<'a> {
+    pub ir: &'a FuncIr,
+    /// Per instruction.
+    pub specs: &'a [Spec],
+    /// The constants (alive as long as the code) and their values.
     pub consts: &'a [usize],
+    pub nums: &'a [Num],
+    /// The interned names.
     pub names: &'a [usize],
-    /// Each instruction's inline cache.
+    /// Each instruction's attribute cache, for the helpers.
     pub ics: &'a [usize],
+    /// The parameters are never written: their slots may hold references
+    /// the frame does not own (a direct call's arguments), so compiled code
+    /// never releases them or moves them out (`Take` copies).
+    pub borrow_params: bool,
+    /// The address of a `u32` counting the generic executions of attribute
+    /// accesses, global loads and calls compiled without a spec.
+    pub misses: usize,
 }
 
 /// Loop iterations between safepoints.
 const FUEL: i64 = 1024;
 
-pub type Entry = unsafe extern "C" fn(ctx: *mut c_void, regs: *mut u64, pc: *mut u32, pending: u32) -> u32;
-
-/// Compile `ir`. The code lives as long as the process.
-pub fn compile(ir: &FuncIr, helpers: &Helpers, objects: &Objects) -> Result<Entry, String> {
+/// Compile `u`. The code lives as long as the process.
+pub fn compile(u: &Unit, h: &Helpers, l: &Layout) -> Result<Entry, String> {
     let jb = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).map_err(|e| e.to_string())?;
     let mut module = JITModule::new(jb);
     let ptr = module.target_config().pointer_type();
@@ -143,11 +286,10 @@ pub fn compile(ir: &FuncIr, helpers: &Helpers, objects: &Objects) -> Result<Entr
     let mut fctx = FunctionBuilderContext::new();
     {
         let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mut sigs = Sigs::default();
-        Lower::new(b, ir, helpers, objects, ptr, &mut sigs, &module).lower();
+        Lower::new(b, u, h, l, &module).lower();
     }
     if std::env::var_os("LIZZARD_JIT_DUMP").is_some() {
-        eprintln!("; {}\n{}", ir.name, ctx.func.display());
+        eprintln!("; {}\n{}", u.ir.name, ctx.func.display());
     }
     module.define_function(id, &mut ctx).map_err(|e| format!("{e:?}"))?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
@@ -158,91 +300,280 @@ pub fn compile(ir: &FuncIr, helpers: &Helpers, objects: &Objects) -> Result<Entr
     Ok(unsafe { std::mem::transmute::<*const u8, Entry>(code) })
 }
 
-#[derive(Default)]
-struct Sigs {
-    step: Option<SigRef>,
-    catch: Option<SigRef>,
-    safepoint: Option<SigRef>,
-    /// Helpers taking the slots and N 32-bit operands (plus a pointer
-    /// operand for some), returning a status.
-    by_shape: std::collections::HashMap<(bool, usize, usize, bool), SigRef>,
+/// The registers live before each instruction (a bit set per pc). An
+/// instruction a handler covers may continue at the handler, before its
+/// own writes: what the handler reads is live before it.
+fn liveness(ir: &FuncIr) -> Vec<Vec<u64>> {
+    let n = ir.code.len();
+    let words = ir.reprs.len().div_ceil(64).max(1);
+    let handler_of = |pc: u32| -> Vec<usize> { ir.handlers.iter().filter(|h| h.ranges.iter().any(|(s, e)| *s <= pc && pc < *e)).map(|h| h.target as usize).filter(|&t| t < n).collect() };
+    let succ: Vec<Vec<usize>> = (0..n).map(|pc| ir.code[pc].successors(pc as u32).into_iter().map(|t| t as usize).filter(|&t| t < n).collect()).collect();
+    let exc: Vec<Vec<usize>> = (0..n).map(|pc| handler_of(pc as u32)).collect();
+    let reads: Vec<Vec<Reg>> = ir.code.iter().map(|i| i.reads()).collect();
+    let writes: Vec<Vec<Reg>> = ir.code.iter().map(|i| i.writes()).collect();
+    let mut live = vec![vec![0u64; words]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for pc in (0..n).rev() {
+            let mut out = vec![0u64; words];
+            for &s in &succ[pc] {
+                for w in 0..words {
+                    out[w] |= live[s][w];
+                }
+            }
+            for r in &writes[pc] {
+                out[*r as usize / 64] &= !(1 << (*r % 64));
+            }
+            for r in &reads[pc] {
+                out[*r as usize / 64] |= 1 << (*r % 64);
+            }
+            for &h in &exc[pc] {
+                for w in 0..words {
+                    out[w] |= live[h][w];
+                }
+            }
+            if out != live[pc] {
+                live[pc] = out;
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
+/// CPython's `Py_LT`, `Py_LE`, `Py_EQ`, `Py_NE`, `Py_GT`, `Py_GE`.
+fn rich_code(op: CmpOp) -> Option<u32> {
+    Some(match op {
+        CmpOp::Lt => 0,
+        CmpOp::Le => 1,
+        CmpOp::Eq => 2,
+        CmpOp::Ne => 3,
+        CmpOp::Gt => 4,
+        CmpOp::Ge => 5,
+        _ => return None,
+    })
+}
+
+fn int_cc(op: CmpOp) -> IntCC {
+    match op {
+        CmpOp::Lt => IntCC::SignedLessThan,
+        CmpOp::Le => IntCC::SignedLessThanOrEqual,
+        CmpOp::Eq => IntCC::Equal,
+        CmpOp::Ne => IntCC::NotEqual,
+        CmpOp::Gt => IntCC::SignedGreaterThan,
+        _ => IntCC::SignedGreaterThanOrEqual,
+    }
+}
+
+/// Python's float comparisons: false with a NaN, but for `!=`.
+fn float_cc(op: CmpOp) -> FloatCC {
+    match op {
+        CmpOp::Lt => FloatCC::LessThan,
+        CmpOp::Le => FloatCC::LessThanOrEqual,
+        CmpOp::Eq => FloatCC::Equal,
+        CmpOp::Ne => FloatCC::NotEqual,
+        CmpOp::Gt => FloatCC::GreaterThan,
+        _ => FloatCC::GreaterThanOrEqual,
+    }
+}
+
+/// An unboxed number a register is known to hold.
+#[derive(Clone, Copy)]
+enum Unboxed {
+    None,
+    F64(Value),
+    I64(Value),
+}
+
+/// What compiled code knows about an object register beyond its slot.
+#[derive(Clone, Copy)]
+struct Virt {
+    /// A pointer to the object (never null).
+    ptr: Option<Value>,
+    /// The slot holds `ptr`, as its reference. Otherwise the slot holds a
+    /// stale reference (or null) that the next store releases, and `ptr`,
+    /// if any, is borrowed.
+    in_slot: bool,
+    num: Unboxed,
+    /// The object's exact type, when known (from how compiled code made
+    /// it: a guard's knowledge does not survive the join with its slow
+    /// path).
+    ty: Option<usize>,
+    /// `ptr` is an object the code keeps alive (a constant, an immortal).
+    konst: bool,
+}
+
+impl Virt {
+    fn ptr(p: Value, in_slot: bool) -> Virt {
+        Virt { ptr: Some(p), in_slot, num: Unboxed::None, ty: None, konst: false }
+    }
+}
+
+/// How an arithmetic operand looks: an unboxed number or an object.
+#[derive(Clone, Copy)]
+enum Operand {
+    F64(Value),
+    I64(Value),
+    Obj(Value),
 }
 
 struct Lower<'a> {
     b: FunctionBuilder<'a>,
+    u: &'a Unit<'a>,
     ir: &'a FuncIr,
     h: &'a Helpers,
-    objects: &'a Objects<'a>,
-    call_conv: cranelift_codegen::isa::CallConv,
-    ptr: types::Type,
-    sigs: &'a mut Sigs,
-    /// One block per instruction.
-    blocks: Vec<Block>,
+    l: &'a Layout,
+    ptr: Type,
+    call_conv: CallConv,
+    sigs: HashMap<(Vec<Type>, Option<Type>), SigRef>,
+    /// A block per instruction that can be reached other than by falling
+    /// through (a jump target, an entry, a handler).
+    labels: Vec<Option<Block>>,
     /// Per handler: stores the exception and jumps to the handler.
     catch_blocks: Vec<Block>,
-    /// Leaves with `*pc` = its parameter and status `EXIT`.
+    /// Leave with `*pc` = the parameter and status `EXIT`, `ERROR`, `BAIL`.
     exit: Block,
-    /// Leaves with `*pc` = its parameter and status `ERROR`.
     fail: Block,
+    bail: Block,
     ctx: Value,
     regs: Value,
     pcp: Value,
+    /// The thread's id (free-threaded reference counting).
+    tid: Value,
     fuel: Variable,
+    /// The variable of each `I64` and `Bool` register.
+    vars: Vec<Option<Variable>>,
+    vals: HashMap<Reg, Virt>,
+    live: Vec<Vec<u64>>,
+    /// Where direct calls build the callee's frame.
+    frame: Option<StackSlot>,
+    nparams: u32,
+    /// The current block has ended (a jump, a return).
+    done: bool,
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
 }
 
+const MF: MemFlagsData = MemFlagsData::trusted();
+
 impl<'a> Lower<'a> {
-    fn new(mut b: FunctionBuilder<'a>, ir: &'a FuncIr, h: &'a Helpers, objects: &'a Objects<'a>, ptr: types::Type, sigs: &'a mut Sigs, module: &JITModule) -> Lower<'a> {
+    fn new(mut b: FunctionBuilder<'a>, u: &'a Unit<'a>, h: &'a Helpers, l: &'a Layout, module: &JITModule) -> Lower<'a> {
+        let ir = u.ir;
+        let n = ir.code.len();
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let ps = b.block_params(entry).to_vec();
-        let mk = |b: &mut FunctionBuilder, params: &[types::Type], ret: bool| {
-            let mut s = Signature::new(module.isa().default_call_conv());
-            s.params.extend(params.iter().map(|t| AbiParam::new(*t)));
-            if ret {
-                s.returns.push(AbiParam::new(types::I32));
+        let ptr = module.target_config().pointer_type();
+
+        // Labels: jump targets, the instruction after any that can branch,
+        // handler targets, entries.
+        let mut is_label = vec![false; n];
+        if n > 0 {
+            is_label[0] = true;
+        }
+        for (pc, i) in ir.code.iter().enumerate() {
+            let succ = i.successors(pc as u32);
+            let jumps = matches!(i, Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. } | Instr::ForIter { .. });
+            if jumps || succ.len() > 1 || succ.first().is_some_and(|&t| t as usize != pc + 1) {
+                for t in succ {
+                    if (t as usize) < n {
+                        is_label[t as usize] = true;
+                    }
+                }
             }
-            b.import_signature(s)
-        };
-        sigs.step = Some(mk(&mut b, &[ptr, ptr, types::I32], true));
-        sigs.catch = Some(mk(&mut b, &[ptr, ptr, types::I32], false));
-        sigs.safepoint = Some(mk(&mut b, &[ptr], true));
-        let blocks = (0..ir.code.len()).map(|_| b.create_block()).collect();
+            if matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. }) && pc + 1 < n {
+                is_label[pc + 1] = true;
+            }
+        }
+        for h in &ir.handlers {
+            if (h.target as usize) < n {
+                is_label[h.target as usize] = true;
+            }
+        }
+        let labels = is_label.iter().map(|&x| x.then(|| b.create_block())).collect();
         let catch_blocks = (0..ir.handlers.len()).map(|_| b.create_block()).collect();
-        let exit = b.create_block();
-        b.append_block_param(exit, types::I32);
-        let fail = b.create_block();
-        b.append_block_param(fail, types::I32);
+        let mut leave = || {
+            let blk = b.create_block();
+            b.append_block_param(blk, types::I32);
+            blk
+        };
+        let (exit, fail, bail) = (leave(), leave(), leave());
         let fuel = b.declare_var(types::I64);
-        let frontend = module.target_config();
-        let call_conv = module.isa().default_call_conv();
-        let mut l = Lower { b, ir, h, objects, call_conv, ptr, sigs, blocks, catch_blocks, exit, fail, ctx: ps[0], regs: ps[1], pcp: ps[2], fuel, frontend };
-        l.entry(ps[3]);
-        l
+        let vars = ir.reprs.iter().map(|r| matches!(r, Repr::I64 | Repr::Bool).then(|| b.declare_var(types::I64))).collect();
+        let tid = match l.rc {
+            Rc::Ft { .. } => b.ins().load(ptr, MF, ps[0], CTX_TID),
+            _ => b.ins().iconst(ptr, 0),
+        };
+        let max_frame = u.specs.iter().filter_map(|s| if let Spec::Call(c) = s { Some(c.nregs) } else { None }).max();
+        let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
+        let mut lw = Lower {
+            b,
+            u,
+            ir,
+            h,
+            l,
+            ptr,
+            call_conv: module.isa().default_call_conv(),
+            sigs: HashMap::new(),
+            labels,
+            catch_blocks,
+            exit,
+            fail,
+            bail,
+            ctx: ps[0],
+            regs: ps[1],
+            pcp: ps[2],
+            tid,
+            fuel,
+            vars,
+            vals: HashMap::new(),
+            live: liveness(ir),
+            frame,
+            nparams: ir.params.len() as u32,
+            done: false,
+            frontend: module.target_config(),
+        };
+        lw.entry(ps[3]);
+        lw
     }
 
-    /// Dispatch on `*pc`: 0, after a `yield`, or (with an exception
-    /// pending) at the `yield`.
+    /// Define the scalar variables from their slots, then dispatch on `*pc`:
+    /// 0, a loop header, after a `yield`, or (with an exception pending) at
+    /// the `yield`.
     fn entry(&mut self, pending: Value) {
-        let f = FUEL;
-        let fuel0 = self.b.ins().iconst(types::I64, f);
+        for r in 0..self.vars.len() {
+            if let Some(v) = self.vars[r] {
+                let x = self.b.ins().load(types::I64, MF, self.regs, r as i32 * 8);
+                self.b.def_var(v, x);
+            }
+        }
+        let fuel0 = self.b.ins().iconst(types::I64, FUEL);
         self.b.def_var(self.fuel, fuel0);
-        let pc = self.b.ins().load(types::I32, MemFlagsData::trusted(), self.pcp, 0);
+        let pc = self.b.ins().load(types::I32, MF, self.pcp, 0);
         let resume = self.b.create_block();
         let throw = self.b.create_block();
         let bad = self.b.create_block();
         self.b.ins().brif(pending, throw, &[], resume, &[]);
 
-        let yields: Vec<usize> = self.ir.code.iter().enumerate().filter(|(_, i)| matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. })).map(|(p, _)| p).collect();
+        let ir = self.ir;
+        let yields: Vec<usize> = ir.code.iter().enumerate().filter(|(_, i)| matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. })).map(|(p, _)| p).collect();
         self.b.switch_to_block(resume);
-        let mut sw = Switch::new();
-        if !self.blocks.is_empty() {
-            sw.set_entry(0, self.blocks[0]);
+        // 0, loop headers (targets of backward jumps), after yields.
+        let mut at = std::collections::BTreeSet::new();
+        at.insert(0usize);
+        for (pc, i) in ir.code.iter().enumerate() {
+            for t in i.successors(pc as u32) {
+                if (t as usize) <= pc {
+                    at.insert(t as usize);
+                }
+            }
         }
-        for &p in &yields {
-            if p + 1 < self.blocks.len() {
-                sw.set_entry(p as u128 + 1, self.blocks[p + 1]);
+        at.extend(yields.iter().map(|p| p + 1));
+        let mut sw = Switch::new();
+        for p in at {
+            if let Some(Some(blk)) = self.labels.get(p) {
+                sw.set_entry(p as u128, *blk);
             }
         }
         sw.emit(&mut self.b, pc, bad);
@@ -265,24 +596,44 @@ impl<'a> Lower<'a> {
     }
 
     fn lower(mut self) {
-        for i in 0..self.ir.code.len() {
-            let blk = self.blocks[i];
-            self.b.switch_to_block(blk);
-            self.instr(i);
+        let n = self.ir.code.len();
+        self.done = true;
+        for pc in 0..n {
+            if let Some(blk) = self.labels[pc] {
+                if !self.done {
+                    self.goto(pc - 1, pc as u32);
+                }
+                self.b.switch_to_block(blk);
+                self.vals.clear();
+                self.done = false;
+            } else if self.done {
+                // Unreachable.
+                continue;
+            }
+            self.instr(pc);
         }
-        for (k, h) in self.ir.handlers.iter().enumerate() {
+        if !self.done {
+            self.b.ins().trap(TrapCode::unwrap_user(2));
+        }
+        for k in 0..self.ir.handlers.len() {
+            let h = &self.ir.handlers[k];
             let blk = self.catch_blocks[k];
             self.b.switch_to_block(blk);
             let exc = self.b.ins().iconst(types::I32, h.exc as i64);
-            let f = self.b.ins().iconst(self.ptr, self.h.catch as i64);
-            let sig = self.sigs.catch.unwrap();
-            self.b.ins().call_indirect(sig, f, &[self.ctx, self.regs, exc]);
-            self.b.ins().jump(self.blocks[h.target as usize], &[]);
+            self.call(self.h.catch, &[self.ctx, self.regs, exc], None);
+            match self.labels.get(h.target as usize).copied().flatten() {
+                Some(t) => {
+                    self.b.ins().jump(t, &[]);
+                }
+                None => {
+                    self.b.ins().trap(TrapCode::unwrap_user(3));
+                }
+            }
         }
-        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR)] {
+        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL)] {
             self.b.switch_to_block(blk);
             let pc = self.b.block_params(blk)[0];
-            self.b.ins().store(MemFlagsData::trusted(), pc, self.pcp, 0);
+            self.b.ins().store(MF, pc, self.pcp, 0);
             let s = self.b.ins().iconst(types::I32, status as i64);
             self.b.ins().return_(&[s]);
         }
@@ -291,8 +642,340 @@ impl<'a> Lower<'a> {
         self.b.finalize(config);
     }
 
-    /// An exception was raised by instruction `p`: its innermost handler,
-    /// else leave the function.
+    // ---- Calls, slots, reference counts ----
+
+    fn call(&mut self, f: usize, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let tys: Vec<Type> = args.iter().map(|a| self.b.func.dfg.value_type(*a)).collect();
+        let key = (tys, ret);
+        let sig = match self.sigs.get(&key) {
+            Some(s) => *s,
+            None => {
+                let mut s = Signature::new(self.call_conv);
+                s.params.extend(key.0.iter().map(|t| AbiParam::new(*t)));
+                if let Some(r) = ret {
+                    s.returns.push(AbiParam::new(r));
+                }
+                let r = self.b.import_signature(s);
+                self.sigs.insert(key, r);
+                r
+            }
+        };
+        let fp = self.b.ins().iconst(self.ptr, f as i64);
+        let call = self.b.ins().call_indirect(sig, fp, args);
+        ret.map(|_| self.b.inst_results(call)[0])
+    }
+
+    fn i32c(&mut self, v: u32) -> Value {
+        self.b.ins().iconst(types::I32, v as i64)
+    }
+
+    fn pc_val(&mut self, pc: usize) -> Value {
+        self.i32c(pc as u32)
+    }
+
+    fn slot_load(&mut self, r: Reg) -> Value {
+        self.b.ins().load(types::I64, MF, self.regs, r as i32 * 8)
+    }
+
+    fn slot_store(&mut self, v: Value, r: Reg) {
+        self.b.ins().store(MF, v, self.regs, r as i32 * 8);
+    }
+
+    fn repr(&self, r: Reg) -> Repr {
+        self.ir.reprs[r as usize]
+    }
+
+    fn is_param(&self, r: Reg) -> bool {
+        r < self.nparams && self.u.borrow_params
+    }
+
+    fn live_at(&self, pc: usize, r: Reg) -> bool {
+        self.live.get(pc).is_some_and(|l| l[r as usize / 64] & (1 << (r % 64)) != 0)
+    }
+
+    /// Continue in a new block (returned after switching to it).
+    fn cont(&mut self) -> Block {
+        let blk = self.b.create_block();
+        self.b.switch_to_block(blk);
+        blk
+    }
+
+    fn incref(&mut self, p: Value) {
+        match self.l.rc {
+            Rc::Calls => {
+                self.call(self.h.incref, &[p], None);
+            }
+            Rc::Gil => {
+                let c = self.b.ins().load(types::I32, MF, p, 0);
+                let done = self.b.create_block();
+                let inc = self.b.create_block();
+                let imm = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, c, 0);
+                self.b.ins().brif(imm, done, &[], inc, &[]);
+                self.b.switch_to_block(inc);
+                let c1 = self.b.ins().iadd_imm_s(c, 1);
+                self.b.ins().store(MF, c1, p, 0);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
+            }
+            Rc::Ft { tid, local, shared } => {
+                let c = self.b.ins().load(types::I32, MF, p, local);
+                let c1 = self.b.ins().iadd_imm_s(c, 1);
+                let (done, mortal, mine, other) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().brif(c1, mortal, &[], done, &[]);
+                self.b.switch_to_block(mortal);
+                let owner = self.b.ins().load(self.ptr, MF, p, tid);
+                let own = self.b.ins().icmp(IntCC::Equal, owner, self.tid);
+                self.b.ins().brif(own, mine, &[], other, &[]);
+                self.b.switch_to_block(mine);
+                self.b.ins().store(MF, c1, p, local);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(other);
+                let four = self.b.ins().iconst(types::I64, 4);
+                let addr = self.b.ins().iadd_imm_s(p, shared as i64);
+                self.b.ins().atomic_rmw(types::I64, MemFlagsData::trusted(), AtomicRmwOp::Add, addr, four);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
+            }
+        }
+    }
+
+    fn decref(&mut self, p: Value) {
+        match self.l.rc {
+            Rc::Calls => {
+                self.call(self.h.decref, &[p], None);
+            }
+            Rc::Gil => {
+                let c = self.b.ins().load(types::I32, MF, p, 0);
+                let (done, dec, free) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                let imm = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, c, 0);
+                self.b.ins().brif(imm, done, &[], dec, &[]);
+                self.b.switch_to_block(dec);
+                let c1 = self.b.ins().iadd_imm_s(c, -1);
+                self.b.ins().store(MF, c1, p, 0);
+                self.b.ins().brif(c1, done, &[], free, &[]);
+                self.b.switch_to_block(free);
+                self.call(self.h.dealloc, &[p], None);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
+            }
+            Rc::Ft { tid, local, .. } => {
+                let c = self.b.ins().load(types::I32, MF, p, local);
+                let (done, mortal, mine, other, merge) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+                let imm = self.b.ins().icmp_imm_s(IntCC::Equal, c, -1);
+                self.b.ins().brif(imm, done, &[], mortal, &[]);
+                self.b.switch_to_block(mortal);
+                let owner = self.b.ins().load(self.ptr, MF, p, tid);
+                let own = self.b.ins().icmp(IntCC::Equal, owner, self.tid);
+                self.b.ins().brif(own, mine, &[], other, &[]);
+                self.b.switch_to_block(mine);
+                let c1 = self.b.ins().iadd_imm_s(c, -1);
+                self.b.ins().store(MF, c1, p, local);
+                self.b.ins().brif(c1, done, &[], merge, &[]);
+                self.b.switch_to_block(merge);
+                self.call(self.h.merge_zero, &[p], None);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(other);
+                self.call(self.h.dec_shared, &[p], None);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
+            }
+        }
+    }
+
+    fn xdecref(&mut self, p: Value) {
+        let (dec, done) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(p, dec, &[], done, &[]);
+        self.b.switch_to_block(dec);
+        self.decref(p);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
+    /// Store reference `p` in slot `r`, releasing the old one.
+    fn put(&mut self, r: Reg, p: Value) {
+        let old = self.slot_load(r);
+        self.slot_store(p, r);
+        self.xdecref(old);
+    }
+
+    fn ob_type(&mut self, p: Value) -> Value {
+        self.b.ins().load(self.ptr, MF, p, self.l.ob_type)
+    }
+
+    /// Continue at `ok` when `cond`, else at `slow`.
+    fn guard(&mut self, cond: Value, slow: Block) {
+        let ok = self.b.create_block();
+        self.b.ins().brif(cond, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    fn guard_eq(&mut self, x: Value, y: i64, slow: Block) {
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, x, y);
+        self.guard(c, slow);
+    }
+
+    /// The type of `p` is `tp` at `version`.
+    fn guard_type(&mut self, p: Value, tp: usize, version: u32, slow: Block) {
+        let t = self.ob_type(p);
+        self.guard_eq(t, tp as i64, slow);
+        let v = self.b.ins().load(types::I32, MF, t, self.l.tp_version);
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, v, version as i32 as i64);
+        self.guard(c, slow);
+    }
+
+    // ---- Virtual registers ----
+
+    /// Give register `r` its object in its slot. Allocation failure
+    /// raises at `pc`. Storing releases the slot's stale reference, which
+    /// may be what keeps a borrowed pointer's object alive: those registers
+    /// get their references first.
+    fn materialize(&mut self, r: Reg, pc: usize) {
+        let mut regs = self.borrowed();
+        regs.push(r);
+        self.materialize_many(regs, pc);
+    }
+
+    /// The registers holding borrowed pointers.
+    fn borrowed(&self) -> Vec<Reg> {
+        let mut regs: Vec<Reg> = self.vals.iter().filter(|(_, v)| !v.in_slot && !v.konst && v.ptr.is_some()).map(|(r, _)| *r).collect();
+        regs.sort_unstable();
+        regs
+    }
+
+    /// Materialize `regs`: all references taken before any slot's old
+    /// reference is released.
+    fn materialize_many(&mut self, mut regs: Vec<Reg>, pc: usize) {
+        regs.sort_unstable();
+        regs.dedup();
+        let mut owned = Vec::new();
+        for r in regs {
+            let Some(v) = self.vals.get(&r).copied() else { continue };
+            if v.in_slot {
+                continue;
+            }
+            let p = match (v.ptr, v.num) {
+                (Some(p), _) => {
+                    self.incref(p);
+                    p
+                }
+                (None, Unboxed::F64(x)) => self.boxed(self.h.float_new, x, pc),
+                (None, Unboxed::I64(x)) => self.boxed(self.h.long_new, x, pc),
+                (None, Unboxed::None) => unreachable!("a virtual register without a value"),
+            };
+            owned.push((r, p, v));
+        }
+        for (r, p, v) in owned {
+            self.put(r, p);
+            self.vals.insert(r, Virt { ptr: Some(p), in_slot: true, konst: false, ..v });
+        }
+    }
+
+    /// `new(x)` (a new reference); null raises at `pc`.
+    fn boxed(&mut self, new: usize, x: Value, pc: usize) -> Value {
+        let p = self.call(new, &[x], Some(self.ptr)).unwrap();
+        let failed = self.b.create_block();
+        let ok = self.b.create_block();
+        self.b.ins().brif(p, ok, &[], failed, &[]);
+        self.b.switch_to_block(failed);
+        self.raise(pc);
+        self.b.switch_to_block(ok);
+        p
+    }
+
+    /// Materialize the virtual registers live before `pc` (what a helper
+    /// executing it, a handler or the interpreter will read) and forget the
+    /// others.
+    fn flush(&mut self, pc: usize) {
+        let mut regs: Vec<Reg> = self.vals.keys().copied().collect();
+        regs.sort_unstable();
+        let mut live = Vec::new();
+        for r in regs {
+            if self.vals[&r].in_slot {
+                continue;
+            }
+            if self.live_at(pc, r) {
+                live.push(r);
+            } else {
+                self.vals.remove(&r);
+            }
+        }
+        self.materialize_many(live, pc);
+    }
+
+    /// Before code that may release objects borrowed pointers point into
+    /// (a store, a call): the registers live after it (at `live_pc`) or in
+    /// `keep` get their references; the others are forgotten.
+    fn secure_borrowed(&mut self, live_pc: usize, pc: usize, keep: &[Reg]) {
+        let mut list = Vec::new();
+        for r in self.borrowed() {
+            let v = self.vals[&r];
+            if keep.contains(&r) {
+                list.push(r);
+            } else if !self.live_at(live_pc, r) {
+                self.vals.remove(&r);
+            } else if !matches!(v.num, Unboxed::None) {
+                // The value is known: drop the pointer instead.
+                self.vals.insert(r, Virt { ptr: None, ..v });
+            } else {
+                list.push(r);
+            }
+        }
+        self.materialize_many(list, pc);
+    }
+
+    /// The object in register `r` (not null); unbound continues at `slow`.
+    fn obj(&mut self, r: Reg, pc: usize, slow: Block) -> Value {
+        if let Some(v) = self.vals.get(&r).copied() {
+            if let Some(p) = v.ptr {
+                return p;
+            }
+            self.materialize(r, pc);
+            return self.vals[&r].ptr.unwrap();
+        }
+        let p = self.slot_load(r);
+        let ok = self.b.create_block();
+        self.b.ins().brif(p, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
+        self.vals.insert(r, Virt::ptr(p, true));
+        p
+    }
+
+    /// Register `r` as an arithmetic operand.
+    fn operand(&mut self, r: Reg, pc: usize, slow: Block) -> Operand {
+        match self.vals.get(&r).map(|v| v.num) {
+            Some(Unboxed::F64(x)) => Operand::F64(x),
+            Some(Unboxed::I64(x)) => Operand::I64(x),
+            _ => Operand::Obj(self.obj(r, pc, slow)),
+        }
+    }
+
+    /// Forget what is known about the registers instruction `pc` writes (a
+    /// helper wrote them), and reload the scalar ones.
+    fn wrote(&mut self, pc: usize) {
+        for r in self.ir.code[pc].writes() {
+            self.vals.remove(&r);
+            if let Some(v) = self.vars[r as usize] {
+                let x = self.slot_load(r);
+                self.b.def_var(v, x);
+            }
+        }
+    }
+
+    fn set_var(&mut self, r: Reg, x: Value) {
+        let v = self.vars[r as usize].expect("a scalar register");
+        self.b.def_var(v, x);
+        self.slot_store(x, r);
+    }
+
+    fn get_var(&mut self, r: Reg) -> Value {
+        let v = self.vars[r as usize].expect("a scalar register");
+        self.b.use_var(v)
+    }
+
+    // ---- Control flow ----
+
+    /// An exception was raised by instruction `p` (the registers are
+    /// materialized): its innermost handler, else leave the function.
     fn raise(&mut self, p: usize) {
         let at = p as u32;
         match self.ir.handlers.iter().rposition(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
@@ -300,266 +983,1176 @@ impl<'a> Lower<'a> {
                 self.b.ins().jump(self.catch_blocks[k], &[]);
             }
             None => {
-                let pc = self.b.ins().iconst(types::I32, p as i64);
-                self.b.ins().jump(self.fail, &[pc.into()]);
+                let pc = self.pc_val(p);
+                self.b.ins().jump(self.fail, &[BlockArg::Value(pc)]);
             }
         }
     }
 
-    fn slot(&self, r: u32) -> i32 {
-        (r as i32) * 8
+    /// Stop here: the interpreter continues at `pc`.
+    fn bail_to(&mut self, pc: usize) {
+        self.flush(pc);
+        let v = self.pc_val(pc);
+        self.b.ins().jump(self.bail, &[BlockArg::Value(v)]);
     }
 
-    fn load(&mut self, ty: types::Type, r: u32) -> Value {
-        let off = self.slot(r);
-        self.b.ins().load(ty, MemFlagsData::trusted(), self.regs, off)
-    }
-
-    fn store(&mut self, v: Value, r: u32) {
-        let off = self.slot(r);
-        self.b.ins().store(MemFlagsData::trusted(), v, self.regs, off);
-    }
-
-    fn repr(&self, r: u32) -> Repr {
-        self.ir.reprs[r as usize]
-    }
-
-    /// Continue at `target` from instruction `from`; a backward jump
-    /// spends fuel and runs a safepoint when it is gone.
+    /// Continue at `target` from instruction `from` (the registers live
+    /// there materialized); a backward jump spends fuel and runs a
+    /// safepoint when it is gone.
     fn goto(&mut self, from: usize, target: u32) {
         let t = target as usize;
+        self.flush(t);
+        self.vals.clear();
+        let blk = self.labels[t].expect("a jump to a label");
         if t > from {
-            self.b.ins().jump(self.blocks[t], &[]);
+            self.b.ins().jump(blk, &[]);
             return;
         }
         let fuel = self.b.use_var(self.fuel);
         let fuel = self.b.ins().iadd_imm_s(fuel, -1);
         self.b.def_var(self.fuel, fuel);
         let check = self.b.create_block();
-        self.b.ins().brif(fuel, self.blocks[t], &[], check, &[]);
+        self.b.ins().brif(fuel, blk, &[], check, &[]);
         self.b.switch_to_block(check);
-        let f = self.b.ins().iconst(self.ptr, self.h.safepoint as i64);
-        let sig = self.sigs.safepoint.unwrap();
-        let call = self.b.ins().call_indirect(sig, f, &[self.ctx]);
-        let status = self.b.inst_results(call)[0];
+        let call = self.call(self.h.safepoint, &[self.ctx], Some(types::I32)).unwrap();
         let refuel = self.b.ins().iconst(types::I64, FUEL);
         self.b.def_var(self.fuel, refuel);
         let failed = self.b.create_block();
-        self.b.ins().brif(status, failed, &[], self.blocks[t], &[]);
+        self.b.ins().brif(call, failed, &[], blk, &[]);
         self.b.switch_to_block(failed);
         self.raise(from);
     }
 
-    /// A branch from instruction `from`: to `target` when `cond` is true.
-    fn branch(&mut self, from: usize, cond: Value, target: u32, otherwise: u32) {
-        let (yes, no) = (self.b.create_block(), self.b.create_block());
-        self.b.ins().brif(cond, yes, &[], no, &[]);
-        self.b.switch_to_block(yes);
-        self.goto(from, target);
-        self.b.switch_to_block(no);
-        self.goto(from, otherwise);
-    }
-
-    fn next(&mut self, i: usize) {
-        if i + 1 < self.blocks.len() {
-            self.goto(i, i as u32 + 1);
-        } else {
-            self.b.ins().trap(TrapCode::unwrap_user(2));
+    /// A branch from instruction `from`: to `yes` when `cond`, else `no`.
+    fn branch(&mut self, from: usize, cond: Value, yes: u32, no: u32) {
+        // Both targets' registers, then no more virtual ones.
+        let mut regs: Vec<Reg> = self.vals.keys().copied().collect();
+        regs.sort_unstable();
+        for r in regs {
+            if !self.vals[&r].in_slot && (self.live_at(yes as usize, r) || self.live_at(no as usize, r)) {
+                self.materialize(r, from);
+            }
         }
+        self.vals.clear();
+        let (y, n) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(cond, y, &[], n, &[]);
+        self.b.switch_to_block(y);
+        self.goto(from, yes);
+        self.b.switch_to_block(n);
+        self.goto(from, no);
+        self.done = true;
     }
 
-    fn instr(&mut self, i: usize) {
+    /// Continue with the next instruction.
+    fn next(&mut self, pc: usize) {
+        if pc + 1 >= self.ir.code.len() {
+            self.b.ins().trap(TrapCode::unwrap_user(2));
+            self.done = true;
+        }
+        // A label is entered by `lower`.
+    }
+
+    /// Check a helper's status: anything but `NEXT` raises at `pc`.
+    fn check_status(&mut self, st: Value, pc: usize) {
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(st, bad, &[], ok, &[]);
+        self.b.switch_to_block(bad);
+        self.raise(pc);
+        self.b.switch_to_block(ok);
+    }
+
+    /// Run instruction `pc` with a helper `f(args)` returning a status
+    /// (`after_status` decides), the registers materialized first.
+    fn generic(&mut self, pc: usize) {
+        self.flush(pc);
         let ir = self.ir;
-        match &ir.code[i] {
-            Instr::Jump { target } => self.goto(i, *target),
-            Instr::JumpIfFalse { cond, target } => {
-                let c = self.load(types::I64, *cond);
-                self.branch(i, c, i as u32 + 1, *target);
-            }
-            Instr::JumpIfTrue { cond, target } => {
-                let c = self.load(types::I64, *cond);
-                self.branch(i, c, *target, i as u32 + 1);
-            }
-            Instr::I64Const { dst, value } => {
-                let v = self.b.ins().iconst(types::I64, *value);
-                self.store(v, *dst);
-                self.next(i);
-            }
-            Instr::I64Lt { dst, a, b } => {
-                let (x, y) = (self.load(types::I64, *a), self.load(types::I64, *b));
-                let c = self.b.ins().icmp(IntCC::SignedLessThan, x, y);
-                let c = self.b.ins().uextend(types::I64, c);
-                self.store(c, *dst);
-                self.next(i);
-            }
-            Instr::I64Add { dst, a, b } => {
-                let (x, y) = (self.load(types::I64, *a), self.load(types::I64, *b));
-                let v = self.b.ins().iadd(x, y);
-                self.store(v, *dst);
-                self.next(i);
-            }
-            Instr::Not { dst, src } => {
-                let v = self.load(types::I64, *src);
-                let v = self.b.ins().bxor_imm_u(v, 1);
-                self.store(v, *dst);
-                self.next(i);
-            }
-            Instr::F32Bin { dst, op, a, b } if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
-                let (x, y) = (self.load(types::F32, *a), self.load(types::F32, *b));
-                let v = match op {
-                    BinOp::Add => self.b.ins().fadd(x, y),
-                    BinOp::Sub => self.b.ins().fsub(x, y),
-                    BinOp::Mul => self.b.ins().fmul(x, y),
-                    _ => self.b.ins().fdiv(x, y),
-                };
-                self.store(v, *dst);
-                self.next(i);
-            }
-            Instr::Move { dst, src } if self.repr(*src) != Repr::Obj && self.repr(*dst) == self.repr(*src) => {
-                let v = self.load(types::I64, *src);
-                self.store(v, *dst);
-                self.next(i);
-            }
-            Instr::Unbind { reg } if self.repr(*reg) != Repr::Obj => self.next(i),
-            Instr::Const { dst, idx } => {
-                let obj = self.objects.consts[*idx as usize];
-                self.helper(i, self.h.konst, false, &[*dst], &[obj], After::Nothing);
-            }
-            Instr::Move { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.helper(i, self.h.mov, false, &[*dst, *src], &[], After::Next),
+        let i = &ir.code[pc];
+        if matches!(self.u.specs[pc], Spec::None) && matches!(i, Instr::LoadAttr { .. } | Instr::StoreAttr { .. } | Instr::LoadGlobal { .. } | Instr::Call { .. } | Instr::CallMethod { .. }) {
+            self.count_miss();
+        }
+        let regs = self.regs;
+        let ctx = self.ctx;
+        let ops = |s: &mut Self, xs: &[u32]| -> Vec<Value> { xs.iter().map(|x| s.i32c(*x)).collect() };
+        let h = *self.h;
+        match i {
             Instr::LoadAttr { dst, obj, name } => {
-                let ptrs = [self.objects.names[*name as usize], self.objects.ics[i]];
-                self.helper(i, self.h.load_attr, false, &[*dst, *obj], &ptrs, After::Next);
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*dst, *obj]));
+                a.push(self.b.ins().iconst(self.ptr, self.u.names[*name as usize] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.u.ics[pc] as i64));
+                let st = self.call(h.load_attr, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
             Instr::StoreAttr { obj, name, val } => {
-                let ptrs = [self.objects.names[*name as usize], self.objects.ics[i]];
-                self.helper(i, self.h.store_attr, false, &[*obj, *val], &ptrs, After::Next);
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*obj, *val]));
+                a.push(self.b.ins().iconst(self.ptr, self.u.names[*name as usize] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.u.ics[pc] as i64));
+                let st = self.call(h.store_attr, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
-            Instr::Return { src } => self.helper(i, self.h.ret, true, &[*src], &[], After::Exit),
-            Instr::Call { .. } | Instr::CallMethod { .. } => self.helper(i, self.h.call, true, &[i as u32], &[], After::Next),
-            Instr::ForIter { dst, iter, target } => self.helper(i, self.h.for_iter, true, &[*dst, *iter, i as u32], &[], After::Branch(*target)),
-            Instr::Check { reg, check } => self.helper(i, self.h.check, true, &[*reg, *check, i as u32], &[], After::Next),
-            Instr::Box { dst, src } if self.repr(*src) == Repr::I64 => self.helper(i, self.h.box_i64, false, &[*dst, *src], &[], After::Next),
-            Instr::Truthy { dst, src } => self.helper(i, self.h.truthy, false, &[*dst, *src], &[], After::Next),
-            Instr::BinOp { dst, op, a, b, inplace } => {
-                let code = *op as u32 + if *inplace { 16 } else { 0 };
-                self.helper(i, self.h.binop, false, &[*dst, *a, *b, code], &[], After::Next);
+            Instr::Truthy { dst, src } => {
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*dst, *src]));
+                let st = self.call(h.truthy, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
-            Instr::Compare { dst, op, a, b } if rich_code(*op).is_some() => {
-                self.helper(i, self.h.compare, false, &[*dst, *a, *b, rich_code(*op).unwrap()], &[], After::Next);
+            Instr::BinOp { dst, op, a: x, b: y, inplace } => {
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*dst, *x, *y, *op as u32 + if *inplace { 16 } else { 0 }]));
+                let st = self.call(h.binop, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
-            Instr::CompareBool { dst, op, a, b } if rich_code(*op).is_some() => {
-                self.helper(i, self.h.compare_bool, false, &[*dst, *a, *b, rich_code(*op).unwrap()], &[], After::Next);
+            Instr::Compare { dst, op, a: x, b: y } if rich_code(*op).is_some() => {
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*dst, *x, *y, rich_code(*op).unwrap()]));
+                let st = self.call(h.compare, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
-            Instr::Take { dst, src } if self.repr(*src) == Repr::Obj => self.helper(i, self.h.take, false, &[*dst, *src], &[], After::Next),
-            Instr::Take { dst, src } => {
-                let v = self.load(types::I64, *src);
-                self.store(v, *dst);
-                self.next(i);
+            Instr::CompareBool { dst, op, a: x, b: y } if rich_code(*op).is_some() => {
+                let mut a = vec![regs];
+                a.extend(ops(self, &[*dst, *x, *y, rich_code(*op).unwrap()]));
+                let st = self.call(h.compare_bool, &a, Some(types::I32)).unwrap();
+                self.check_status(st, pc);
             }
-            instr => self.call_step(i, instr),
+            Instr::Call { .. } | Instr::CallMethod { .. } => {
+                let p = self.pc_val(pc);
+                let st = self.call(h.call, &[ctx, regs, p], Some(types::I32)).unwrap();
+                self.check_status(st, pc);
+            }
+            Instr::LoadGlobal { dst, .. } => {
+                let (d, p) = (self.i32c(*dst), self.pc_val(pc));
+                let st = self.call(h.load_global, &[ctx, regs, d, p], Some(types::I32)).unwrap();
+                self.check_status(st, pc);
+            }
+            Instr::Check { reg, check } => {
+                let (r, c, p) = (self.i32c(*reg), self.i32c(*check), self.pc_val(pc));
+                let st = self.call(h.check, &[ctx, regs, r, c, p], Some(types::I32)).unwrap();
+                self.check_status(st, pc);
+            }
+            Instr::ForIter { dst, iter, target } => {
+                let (d, it, p) = (self.i32c(*dst), self.i32c(*iter), self.pc_val(pc));
+                let st = self.call(h.for_iter, &[ctx, regs, d, it, p], Some(types::I32)).unwrap();
+                self.wrote(pc);
+                // NEXT continues, TAKEN jumps, ERROR raises.
+                let (next, other, taken, raised) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().brif(st, other, &[], next, &[]);
+                self.b.switch_to_block(other);
+                let is_taken = self.b.ins().icmp_imm_u(IntCC::Equal, st, TAKEN as i64);
+                self.b.ins().brif(is_taken, taken, &[], raised, &[]);
+                self.b.switch_to_block(raised);
+                self.raise(pc);
+                self.b.switch_to_block(taken);
+                self.goto(pc, *target);
+                self.b.switch_to_block(next);
+                self.goto(pc, pc as u32 + 1);
+                self.done = true;
+                return;
+            }
+            _ => {
+                self.step(pc);
+                return;
+            }
         }
+        self.wrote(pc);
     }
 
-    /// Call a raw helper `f(regs, ops..., ptrs...)` for instruction `i`,
-    /// then continue (or raise, when it returns a status).
-    fn helper(&mut self, i: usize, f: usize, ctx: bool, ops: &[u32], ptrs: &[usize], after: After) {
-        let status = !matches!(after, After::Nothing);
-        let key = (ctx, ops.len(), ptrs.len(), status);
-        let sig = match self.sigs.by_shape.get(&key) {
-            Some(s) => *s,
-            None => {
-                let mut s = Signature::new(self.call_conv);
-                if ctx {
-                    s.params.push(AbiParam::new(self.ptr));
-                }
-                s.params.push(AbiParam::new(self.ptr));
-                s.params.extend(ops.iter().map(|_| AbiParam::new(types::I32)));
-                s.params.extend(ptrs.iter().map(|_| AbiParam::new(self.ptr)));
-                if status {
-                    s.returns.push(AbiParam::new(types::I32));
-                }
-                let r = self.b.import_signature(s);
-                self.sigs.by_shape.insert(key, r);
-                r
-            }
-        };
-        let mut args: Vec<Value> = Vec::new();
-        if ctx {
-            args.push(self.ctx);
-        }
-        args.push(self.regs);
-        for o in ops {
-            args.push(self.b.ins().iconst(types::I32, *o as i64));
-        }
-        for p in ptrs {
-            args.push(self.b.ins().iconst(self.ptr, *p as i64));
-        }
-        let fp = self.b.ins().iconst(self.ptr, f as i64);
-        let call = self.b.ins().call_indirect(sig, fp, &args);
-        if !status {
-            self.next(i);
-            return;
-        }
-        let st = self.b.inst_results(call)[0];
-        let (other, ok) = (self.b.create_block(), self.b.create_block());
-        self.b.ins().brif(st, other, &[], ok, &[]);
-        self.b.switch_to_block(ok);
-        match after {
-            After::Exit => {
-                let pc = self.b.ins().iconst(types::I32, i as i64);
-                self.b.ins().jump(self.exit, &[pc.into()]);
-            }
-            _ => self.next(i),
-        }
-        self.b.switch_to_block(other);
-        if let After::Branch(target) = after {
-            let (taken, raised) = (self.b.create_block(), self.b.create_block());
-            let is_taken = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAKEN as i64);
-            self.b.ins().brif(is_taken, taken, &[], raised, &[]);
-            self.b.switch_to_block(taken);
-            self.goto(i, target);
-            self.b.switch_to_block(raised);
-        }
-        self.raise(i);
+    /// Count a generic execution compiled without a spec; the `MISSES`th
+    /// tells the runtime.
+    fn count_miss(&mut self) {
+        let addr = self.b.ins().iconst(self.ptr, self.u.misses as i64);
+        let n = self.b.ins().load(types::I32, MF, addr, 0);
+        let n = self.b.ins().iadd_imm_s(n, 1);
+        self.b.ins().store(MF, n, addr, 0);
+        let hit = self.b.ins().icmp_imm_s(IntCC::Equal, n, MISSES as i64);
+        let (tell, done) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(hit, tell, &[], done, &[]);
+        self.b.switch_to_block(tell);
+        self.call(self.h.missed, &[self.ctx], None);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
-    /// Execute instruction `i` with the `step` helper and continue as it
-    /// says.
-    fn call_step(&mut self, i: usize, instr: &Instr) {
-        let pc = self.b.ins().iconst(types::I32, i as i64);
-        let f = self.b.ins().iconst(self.ptr, self.h.step as i64);
-        let sig = self.sigs.step.unwrap();
-        let call = self.b.ins().call_indirect(sig, f, &[self.ctx, self.regs, pc]);
-        let status = self.b.inst_results(call)[0];
+    /// Execute instruction `pc` with the `step` helper (registers
+    /// materialized) and continue as it says.
+    fn step(&mut self, pc: usize) {
+        self.flush(pc);
+        let p = self.pc_val(pc);
+        let st = self.call(self.h.step, &[self.ctx, self.regs, p], Some(types::I32)).unwrap();
+        let ir = self.ir;
+        let i = &ir.code[pc];
         let other = self.b.create_block();
         let next = self.b.create_block();
-        self.b.ins().brif(status, other, &[], next, &[]);
-        self.b.switch_to_block(next);
-        self.next(i);
-
+        self.b.ins().brif(st, other, &[], next, &[]);
         self.b.switch_to_block(other);
         let raised = self.b.create_block();
-        match instr {
+        match i {
             Instr::ForIter { target, .. } => {
                 let taken = self.b.create_block();
-                let is_taken = self.b.ins().icmp_imm_u(IntCC::Equal, status, TAKEN as i64);
+                let is_taken = self.b.ins().icmp_imm_u(IntCC::Equal, st, TAKEN as i64);
                 self.b.ins().brif(is_taken, taken, &[], raised, &[]);
                 self.b.switch_to_block(taken);
-                self.goto(i, *target);
+                self.wrote(pc);
+                self.goto(pc, *target);
             }
             Instr::Return { .. } | Instr::Yield { .. } | Instr::YieldFrom { .. } => {
                 let exited = self.b.create_block();
-                let is_exit = self.b.ins().icmp_imm_u(IntCC::Equal, status, EXIT as i64);
+                let is_exit = self.b.ins().icmp_imm_u(IntCC::Equal, st, EXIT as i64);
                 self.b.ins().brif(is_exit, exited, &[], raised, &[]);
                 self.b.switch_to_block(exited);
-                let pc = self.b.ins().iconst(types::I32, i as i64);
-                self.b.ins().jump(self.exit, &[pc.into()]);
+                let pcv = self.pc_val(pc);
+                self.b.ins().jump(self.exit, &[BlockArg::Value(pcv)]);
             }
             _ => {
                 self.b.ins().jump(raised, &[]);
             }
         }
         self.b.switch_to_block(raised);
-        self.raise(i);
+        self.raise(pc);
+        self.b.switch_to_block(next);
+        self.wrote(pc);
+        let succ = i.successors(pc as u32);
+        if succ.is_empty() {
+            self.b.ins().trap(TrapCode::unwrap_user(4));
+            self.done = true;
+        } else if succ.len() > 1 || succ[0] as usize != pc + 1 {
+            self.goto(pc, pc as u32 + 1);
+            self.done = true;
+        } else {
+            self.next(pc);
+        }
+    }
+
+    /// Emit an instruction's slow path: from the state at the start of the
+    /// instruction (`start`), the generic execution; then `then` for what
+    /// follows it (a jump to the join with the fast path). What is known
+    /// after the join is what was known at the start (values the fast path
+    /// made do not dominate the join; what it materialized stays correct
+    /// as not materialized), but for the instruction's writes, which the
+    /// caller describes.
+    fn slow_path(&mut self, slow: Block, start: HashMap<Reg, Virt>, pc: usize, then: impl FnOnce(&mut Self)) {
+        self.vals = start.clone();
+        let done = self.done;
+        self.b.switch_to_block(slow);
+        self.generic(pc);
+        then(self);
+        self.vals = start;
+        for r in self.ir.code[pc].writes() {
+            self.vals.remove(&r);
+        }
+        self.done = done;
+    }
+
+    // ---- Instructions ----
+
+    fn instr(&mut self, pc: usize) {
+        let ir = self.ir;
+        let i = &ir.code[pc];
+        match i {
+            Instr::Jump { target } => {
+                self.goto(pc, *target);
+                self.done = true;
+            }
+            Instr::JumpIfFalse { cond, target } if self.vars[*cond as usize].is_some() => {
+                let c = self.get_var(*cond);
+                self.branch(pc, c, pc as u32 + 1, *target);
+            }
+            Instr::JumpIfTrue { cond, target } if self.vars[*cond as usize].is_some() => {
+                let c = self.get_var(*cond);
+                self.branch(pc, c, *target, pc as u32 + 1);
+            }
+            Instr::I64Const { dst, value } => {
+                let v = self.b.ins().iconst(types::I64, *value);
+                self.set_var(*dst, v);
+                self.next(pc);
+            }
+            Instr::I64Lt { dst, a, b } => {
+                let (x, y) = (self.get_var(*a), self.get_var(*b));
+                let c = self.b.ins().icmp(IntCC::SignedLessThan, x, y);
+                let c = self.b.ins().uextend(types::I64, c);
+                self.set_var(*dst, c);
+                self.next(pc);
+            }
+            Instr::I64Add { dst, a, b } => {
+                let (x, y) = (self.get_var(*a), self.get_var(*b));
+                let v = self.b.ins().iadd(x, y);
+                self.set_var(*dst, v);
+                self.next(pc);
+            }
+            Instr::Not { dst, src } if self.vars[*src as usize].is_some() && self.vars[*dst as usize].is_some() => {
+                let v = self.get_var(*src);
+                let v = self.b.ins().bxor_imm_u(v, 1);
+                self.set_var(*dst, v);
+                self.next(pc);
+            }
+            Instr::F32Bin { dst, op, a, b } if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
+                let x = self.b.ins().load(types::F32, MF, self.regs, *a as i32 * 8);
+                let y = self.b.ins().load(types::F32, MF, self.regs, *b as i32 * 8);
+                let v = match op {
+                    BinOp::Add => self.b.ins().fadd(x, y),
+                    BinOp::Sub => self.b.ins().fsub(x, y),
+                    BinOp::Mul => self.b.ins().fmul(x, y),
+                    _ => self.b.ins().fdiv(x, y),
+                };
+                self.b.ins().store(MF, v, self.regs, *dst as i32 * 8);
+                self.next(pc);
+            }
+            Instr::Move { dst, src } | Instr::Take { dst, src } if self.vars[*src as usize].is_some() && self.vars[*dst as usize].is_some() => {
+                let v = self.get_var(*src);
+                self.set_var(*dst, v);
+                self.next(pc);
+            }
+            Instr::Move { dst, src } | Instr::Take { dst, src } if self.repr(*src) == Repr::F32 && self.repr(*dst) == Repr::F32 => {
+                let v = self.slot_load(*src);
+                self.slot_store(v, *dst);
+                self.next(pc);
+            }
+            Instr::Unbind { reg } if self.repr(*reg) != Repr::Obj => self.next(pc),
+            Instr::Unbind { reg } => {
+                self.vals.remove(reg);
+                if !self.is_param(*reg) {
+                    self.secure_borrowed(pc + 1, pc, &[]);
+                    let old = self.slot_load(*reg);
+                    let z = self.b.ins().iconst(types::I64, 0);
+                    self.slot_store(z, *reg);
+                    self.xdecref(old);
+                }
+                self.next(pc);
+            }
+            Instr::Const { dst, idx } => {
+                let p = self.b.ins().iconst(self.ptr, self.u.consts[*idx as usize] as i64);
+                let (num, ty) = match self.u.nums[*idx as usize] {
+                    Num::F64(x) => (Unboxed::F64(self.b.ins().f64const(x)), Some(self.l.float_type)),
+                    Num::I64(x) => (Unboxed::I64(self.b.ins().iconst(types::I64, x)), Some(self.l.long_type)),
+                    Num::Other => (Unboxed::None, None),
+                };
+                self.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num, ty, konst: true });
+                self.next(pc);
+            }
+            Instr::Box { dst, src } if self.repr(*src) == Repr::I64 && self.l.numbers => {
+                let v = self.get_var(*src);
+                self.vals.insert(*dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false });
+                self.next(pc);
+            }
+            Instr::Box { dst, src } if self.repr(*src) == Repr::Bool => {
+                let v = self.get_var(*src);
+                let (t, f) = (self.b.ins().iconst(self.ptr, self.l.true_ as i64), self.b.ins().iconst(self.ptr, self.l.false_ as i64));
+                let p = self.b.ins().select(v, t, f);
+                self.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num: Unboxed::None, ty: None, konst: true });
+                self.next(pc);
+            }
+            Instr::Move { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.move_obj(pc, *dst, *src, false),
+            Instr::Take { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.move_obj(pc, *dst, *src, true),
+            Instr::LoadAttr { dst, obj, .. } => self.load_attr(pc, *dst, *obj),
+            Instr::StoreAttr { obj, val, .. } => self.store_attr(pc, *obj, *val),
+            Instr::LoadGlobal { dst, .. } => self.load_global(pc, *dst),
+            Instr::Check { reg, .. } => self.check(pc, *reg),
+            Instr::BinOp { dst, op, a, b, .. } => {
+                let hint = ir.hints.get(pc).copied().unwrap_or(0);
+                if hint == HINT_FLOAT && self.l.numbers && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                    self.float_binop(pc, *dst, *op, *a, *b);
+                } else if hint == HINT_INT && self.l.numbers && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                    self.int_binop(pc, *dst, *op, *a, *b);
+                } else {
+                    self.generic(pc);
+                    self.next(pc);
+                }
+            }
+            Instr::CompareBool { dst, op, a, b } if self.vars[*dst as usize].is_some() && rich_code(*op).is_some() && self.l.numbers => self.compare_bool(pc, *dst, *op, *a, *b),
+            Instr::CompareBool { dst, op: op @ (CmpOp::Is | CmpOp::IsNot), a, b } if self.vars[*dst as usize].is_some() => self.compare_is(pc, *dst, *op, *a, *b),
+            Instr::Truthy { dst, src } if self.vars[*dst as usize].is_some() => self.truthy(pc, *dst, *src),
+            Instr::Return { src } if self.repr(*src) == Repr::Obj => self.ret(pc, *src),
+            Instr::Call { dst, func, args, kwnames, .. } if kwnames.is_empty() && matches!(self.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, Some(*func), None, args),
+            Instr::CallMethod { dst, obj, args, kwnames, .. } if kwnames.is_empty() && matches!(self.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, None, Some(*obj), args),
+            Instr::Truthy { .. } | Instr::Compare { .. } | Instr::CompareBool { .. } | Instr::Call { .. } | Instr::CallMethod { .. } => {
+                self.generic(pc);
+                self.next(pc);
+            }
+            Instr::ForIter { .. } => self.generic(pc),
+            _ => self.step(pc),
+        }
+    }
+
+    /// `Move` (`take`: `Take`) of an object.
+    fn move_obj(&mut self, pc: usize, dst: Reg, src: Reg, take: bool) {
+        let take = take && !self.is_param(src);
+        if let Some(v) = self.vals.get(&src).copied().filter(|v| !v.in_slot) {
+            // A value not in its slot moves as it is (a `Take` leaves the
+            // source's stale slot to the next store).
+            if take {
+                self.vals.remove(&src);
+            }
+            self.vals.insert(dst, v);
+            return self.next(pc);
+        }
+        // Storing releases `dst`'s old reference.
+        self.secure_borrowed(pc + 1, pc, &[]);
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(src, pc, slow);
+        let v = self.vals[&src];
+        if take {
+            let z = self.b.ins().iconst(types::I64, 0);
+            self.slot_store(z, src);
+            self.vals.remove(&src);
+        } else {
+            self.incref(p);
+        }
+        self.put(dst, p);
+        self.vals.insert(dst, Virt { in_slot: true, ..v });
+        let join = self.b.create_block();
+        self.b.ins().jump(join, &[]);
+        // Unbound: `step` raises.
+        self.slow_path(slow, start, pc, |s| {
+            s.b.ins().jump(join, &[]);
+        });
+        self.b.switch_to_block(join);
+        self.next(pc);
+    }
+
+    fn load_attr(&mut self, pc: usize, dst: Reg, obj: Reg) {
+        let (tp, version, off, valid) = match self.u.specs[pc] {
+            Spec::Inline { tp, version, off, values, .. } => (tp, version, off, Some(values + 3)),
+            Spec::Member { tp, version, off } => (tp, version, off, None),
+            _ => {
+                self.generic(pc);
+                return self.next(pc);
+            }
+        };
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(obj, pc, slow);
+        if self.vals[&obj].ty != Some(tp) {
+            self.guard_type(p, tp, version, slow);
+        }
+        if let Some(valid) = valid {
+            let v = self.b.ins().load(types::I8, MF, p, valid);
+            self.guard(v, slow);
+        }
+        let v = self.b.ins().load(self.ptr, MF, p, off);
+        let join = self.b.create_block();
+        let x = self.b.append_block_param(join, self.ptr);
+        let ok = self.b.create_block();
+        self.b.ins().brif(v, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.slow_path(slow, start, pc, |s| {
+            let v = s.slot_load(dst);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+        });
+        self.b.switch_to_block(join);
+        self.vals.insert(dst, Virt::ptr(x, false));
+        self.next(pc);
+    }
+
+    fn store_attr(&mut self, pc: usize, obj: Reg, val: Reg) {
+        let (tp, version, off, values, dict) = match self.u.specs[pc] {
+            Spec::Inline { tp, version, off, values, dict } => (tp, version, off, Some(values), dict),
+            Spec::Member { tp, version, off } => (tp, version, off, None, 0),
+            _ => {
+                self.generic(pc);
+                return self.next(pc);
+            }
+        };
+        // The store may release what borrowed pointers point to.
+        self.secure_borrowed(pc + 1, pc, &[obj, val]);
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(obj, pc, slow);
+        if self.vals[&obj].ty != Some(tp) {
+            self.guard_type(p, tp, version, slow);
+        }
+        if let Some(values) = values {
+            let v = self.b.ins().load(types::I8, MF, p, values + 3);
+            self.guard(v, slow);
+            let d = self.b.ins().load(self.ptr, MF, p, dict);
+            self.guard_eq(d, 0, slow);
+        }
+        let old = self.b.ins().load(self.ptr, MF, p, off);
+        // A first assignment of an inline value also appends its index to
+        // the values' insertion order (`order[size++] = ix`), if there is
+        // room (else: generic).
+        let first = values.map(|values| {
+            let ix = ((off - values - 8) / 8) as i64;
+            let is_first = self.b.ins().icmp_imm_s(IntCC::Equal, old, 0);
+            let (check, go) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(is_first, check, &[], go, &[]);
+            self.b.switch_to_block(check);
+            let cap = self.b.ins().load(types::I8, MF, p, values);
+            let size = self.b.ins().load(types::I8, MF, p, values + 1);
+            let c1 = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, cap, ix);
+            self.guard(c1, slow);
+            let c2 = self.b.ins().icmp(IntCC::UnsignedLessThan, size, cap);
+            self.guard(c2, slow);
+            self.b.ins().jump(go, &[]);
+            self.b.switch_to_block(go);
+            (is_first, values, ix)
+        });
+        let v = self.vals.get(&val).copied();
+        let done = self.b.create_block();
+        // The new reference to store, unless a float is updated in place:
+        // one only the old value's slot referenced.
+        let new = match v {
+            Some(Virt { num: Unboxed::F64(x), in_slot: false, ptr: None, .. }) => {
+                let (reuse, fresh, check) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().brif(old, check, &[], fresh, &[]);
+                self.b.switch_to_block(check);
+                self.unique_float(old, reuse, fresh);
+                self.b.switch_to_block(reuse);
+                self.b.ins().store(MF, x, old, self.l.fval);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(fresh);
+                // A new float, its reference handed to the attribute.
+                let f = self.call(self.h.float_new, &[x], Some(self.ptr)).unwrap();
+                self.guard(f, slow);
+                f
+            }
+            Some(Virt { ptr: None, in_slot: false, num, .. }) => {
+                let (new, x) = match num {
+                    Unboxed::F64(x) => (self.h.float_new, x),
+                    Unboxed::I64(x) => (self.h.long_new, x),
+                    Unboxed::None => unreachable!(),
+                };
+                let f = self.call(new, &[x], Some(self.ptr)).unwrap();
+                self.guard(f, slow);
+                f
+            }
+            _ => {
+                let x = self.obj(val, pc, slow);
+                self.incref(x);
+                x
+            }
+        };
+        self.b.ins().store(MF, new, p, off);
+        match first {
+            Some((is_first, values, ix)) => {
+                let (record, release) = (self.b.create_block(), self.b.create_block());
+                self.b.ins().brif(is_first, record, &[], release, &[]);
+                self.b.switch_to_block(record);
+                let cap = self.b.ins().load(types::I8, MF, p, values);
+                let size = self.b.ins().load(types::I8, MF, p, values + 1);
+                let cap64 = self.b.ins().uextend(types::I64, cap);
+                let size64 = self.b.ins().uextend(types::I64, size);
+                let at = self.b.ins().ishl_imm_u(cap64, 3);
+                let at = self.b.ins().iadd(at, size64);
+                let at = self.b.ins().iadd(at, p);
+                let ixv = self.b.ins().iconst(types::I8, ix);
+                self.b.ins().store(MF, ixv, at, values + 8);
+                let size1 = self.b.ins().iadd_imm_s(size, 1);
+                self.b.ins().store(MF, size1, p, values + 1);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(release);
+                self.decref(old);
+            }
+            // A `__slots__` member may be unset.
+            None => self.xdecref(old),
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        let join = self.b.create_block();
+        self.b.ins().jump(join, &[]);
+        self.slow_path(slow, start, pc, |s| {
+            s.b.ins().jump(join, &[]);
+        });
+        self.b.switch_to_block(join);
+        self.next(pc);
+    }
+
+    /// Continue at `yes` when `p` is an exact float only the current
+    /// thread references once, else at `no`.
+    fn unique_float(&mut self, p: Value, yes: Block, no: Block) {
+        let t = self.ob_type(p);
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, t, self.l.float_type as i64);
+        let next = self.b.create_block();
+        self.b.ins().brif(c, next, &[], no, &[]);
+        self.b.switch_to_block(next);
+        match self.l.rc {
+            Rc::Calls => {
+                self.b.ins().jump(no, &[]);
+            }
+            Rc::Gil => {
+                let c = self.b.ins().load(types::I32, MF, p, 0);
+                let one = self.b.ins().icmp_imm_s(IntCC::Equal, c, 1);
+                self.b.ins().brif(one, yes, &[], no, &[]);
+            }
+            Rc::Ft { tid, local, shared } => {
+                let owner = self.b.ins().load(self.ptr, MF, p, tid);
+                let own = self.b.ins().icmp(IntCC::Equal, owner, self.tid);
+                let c = self.b.ins().load(types::I32, MF, p, local);
+                let one = self.b.ins().icmp_imm_s(IntCC::Equal, c, 1);
+                let s = self.b.ins().load(types::I64, MF, p, shared);
+                let none = self.b.ins().icmp_imm_s(IntCC::Equal, s, 0);
+                let a = self.b.ins().band(own, one);
+                let a = self.b.ins().band(a, none);
+                self.b.ins().brif(a, yes, &[], no, &[]);
+            }
+        }
+    }
+
+    fn load_global(&mut self, pc: usize, dst: Reg) {
+        let Spec::Global { epoch, value } = self.u.specs[pc] else {
+            self.generic(pc);
+            return self.next(pc);
+        };
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let addr = self.b.ins().iconst(self.ptr, self.l.epoch as i64);
+        let e = self.b.ins().load(types::I64, MF, addr, 0);
+        self.guard_eq(e, epoch as i64, slow);
+        let join = self.b.create_block();
+        let x = self.b.append_block_param(join, self.ptr);
+        let v = self.b.ins().iconst(self.ptr, value as i64);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.slow_path(slow, start, pc, |s| {
+            let v = s.slot_load(dst);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+        });
+        self.b.switch_to_block(join);
+        self.vals.insert(dst, Virt::ptr(x, false));
+        self.next(pc);
+    }
+
+    /// Whether `q` passes for a value known to be `v`.
+    fn known_pass(&self, v: Option<Virt>, q: Quick) -> bool {
+        let Some(v) = v else { return false };
+        let ty = match v.num {
+            Unboxed::F64(_) => Some(self.l.float_type),
+            Unboxed::I64(_) => Some(self.l.long_type),
+            Unboxed::None => v.ty,
+        };
+        match (q, ty) {
+            (Quick::Any, _) => true,
+            (Quick::Type(t), Some(u)) => t == u,
+            (Quick::FloatOrInt, Some(u)) => u == self.l.float_type || u == self.l.long_type,
+            _ => false,
+        }
+    }
+
+    /// Emit `q` on `p`: continue when it passes, else at `slow`.
+    fn quick(&mut self, p: Value, q: Quick, slow: Block) {
+        match q {
+            Quick::Any => {}
+            Quick::Slow => {
+                self.b.ins().jump(slow, &[]);
+                self.cont();
+            }
+            Quick::Type(t) => {
+                let ty = self.ob_type(p);
+                self.guard_eq(ty, t as i64, slow);
+            }
+            Quick::Is(o) => self.guard_eq(p, o as i64, slow),
+            Quick::Bool => {
+                let t = self.b.ins().icmp_imm_s(IntCC::Equal, p, self.l.true_ as i64);
+                let f = self.b.ins().icmp_imm_s(IntCC::Equal, p, self.l.false_ as i64);
+                let c = self.b.ins().bor(t, f);
+                self.guard(c, slow);
+            }
+            Quick::FloatOrInt => {
+                let ty = self.ob_type(p);
+                let f = self.b.ins().icmp_imm_s(IntCC::Equal, ty, self.l.float_type as i64);
+                let i = self.b.ins().icmp_imm_s(IntCC::Equal, ty, self.l.long_type as i64);
+                let c = self.b.ins().bor(f, i);
+                self.guard(c, slow);
+            }
+        }
+    }
+
+    fn check(&mut self, pc: usize, reg: Reg) {
+        let q = match self.u.specs[pc] {
+            Spec::Check(q) => q,
+            _ => Quick::Slow,
+        };
+        if self.repr(reg) != Repr::Obj {
+            return self.step(pc);
+        }
+        if self.known_pass(self.vals.get(&reg).copied(), q) {
+            return self.next(pc);
+        }
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(reg, pc, slow);
+        self.quick(p, q, slow);
+        let join = self.b.create_block();
+        self.b.ins().jump(join, &[]);
+        self.slow_path(slow, start, pc, |s| {
+            s.b.ins().jump(join, &[]);
+        });
+        self.b.switch_to_block(join);
+        self.next(pc);
+    }
+
+    /// An object operand as a double and whether it was a float (else a
+    /// compact int); anything else continues at `slow`.
+    fn as_f64(&mut self, p: Value, slow: Block) -> (Value, Value) {
+        let t = self.ob_type(p);
+        let (fl, notf, int, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let x = self.b.append_block_param(join, types::F64);
+        let isf = self.b.append_block_param(join, types::I8);
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, t, self.l.float_type as i64);
+        self.b.ins().brif(c, fl, &[], notf, &[]);
+        self.b.switch_to_block(fl);
+        let v = self.b.ins().load(types::F64, MF, p, self.l.fval);
+        let one = self.b.ins().iconst(types::I8, 1);
+        self.b.ins().jump(join, &[BlockArg::Value(v), BlockArg::Value(one)]);
+        self.b.switch_to_block(notf);
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, t, self.l.long_type as i64);
+        self.b.ins().brif(c, int, &[], slow, &[]);
+        self.b.switch_to_block(int);
+        let i = self.compact_value(p, slow);
+        let v = self.b.ins().fcvt_from_sint(types::F64, i);
+        let zero = self.b.ins().iconst(types::I8, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(v), BlockArg::Value(zero)]);
+        self.b.switch_to_block(join);
+        (x, isf)
+    }
+
+    /// The value of an int (its type checked) when compact, else at `slow`.
+    fn compact_value(&mut self, p: Value, slow: Block) -> Value {
+        let tag = self.b.ins().load(types::I64, MF, p, self.l.long_tag);
+        let c = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, tag, 16);
+        self.guard(c, slow);
+        let d = self.b.ins().load(types::I32, MF, p, self.l.long_digit);
+        let d = self.b.ins().uextend(types::I64, d);
+        // (1 - (tag & 3)) * digit
+        let s = self.b.ins().band_imm_u(tag, 3);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let s = self.b.ins().isub(one, s);
+        self.b.ins().imul(s, d)
+    }
+
+    /// The value of an exact int that fits in an `i64`, else at `slow`.
+    fn as_i64(&mut self, p: Value, slow: Block) -> Value {
+        let t = self.ob_type(p);
+        self.guard_eq(t, self.l.long_type as i64, slow);
+        let tag = self.b.ins().load(types::I64, MF, p, self.l.long_tag);
+        let (compact, big, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let x = self.b.append_block_param(join, types::I64);
+        let c = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, tag, 16);
+        self.b.ins().brif(c, compact, &[], big, &[]);
+        self.b.switch_to_block(compact);
+        let v = self.compact_value(p, slow);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(big);
+        let ss = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let out = self.b.ins().stack_addr(self.ptr, ss, 0);
+        let ok = self.call(self.h.long_value, &[p, out], Some(types::I32)).unwrap();
+        self.guard(ok, slow);
+        let v = self.b.ins().stack_load(self.ptr, types::I64, ss, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(join);
+        x
+    }
+
+    /// `a op b` for float operands (statically): a float result, kept
+    /// unboxed. Two ints, or anything else, take the generic path; if its
+    /// result is not a float, the interpreter continues.
+    fn float_binop(&mut self, pc: usize, dst: Reg, op: BinOp, a: Reg, b: Reg) {
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let f = |s: &mut Self, r: Reg| -> (Value, Value) {
+            match s.operand(r, pc, slow) {
+                Operand::F64(x) => (x, s.b.ins().iconst(types::I8, 1)),
+                Operand::I64(x) => (s.b.ins().fcvt_from_sint(types::F64, x), s.b.ins().iconst(types::I8, 0)),
+                Operand::Obj(p) => s.as_f64(p, slow),
+            }
+        };
+        let (x, fx) = f(self, a);
+        let (y, fy) = f(self, b);
+        let either = self.b.ins().bor(fx, fy);
+        self.guard(either, slow);
+        let v = match op {
+            BinOp::Add => self.b.ins().fadd(x, y),
+            BinOp::Sub => self.b.ins().fsub(x, y),
+            BinOp::Mul => self.b.ins().fmul(x, y),
+            _ => {
+                let zero = self.b.ins().f64const(0.0);
+                let nz = self.b.ins().fcmp(FloatCC::NotEqual, y, zero);
+                self.guard(nz, slow);
+                self.b.ins().fdiv(x, y)
+            }
+        };
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, types::F64);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.slow_path(slow, start, pc, |s| {
+            // A float result joins; anything else: the interpreter goes on.
+            let p = s.slot_load(dst);
+            let t = s.ob_type(p);
+            let (fl, other) = (s.b.create_block(), s.b.create_block());
+            let c = s.b.ins().icmp_imm_s(IntCC::Equal, t, s.l.float_type as i64);
+            s.b.ins().brif(c, fl, &[], other, &[]);
+            s.b.switch_to_block(fl);
+            let v = s.b.ins().load(types::F64, MF, p, s.l.fval);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+            s.b.switch_to_block(other);
+            s.bail_to(pc + 1);
+        });
+        self.b.switch_to_block(join);
+        self.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(r), ty: Some(self.l.float_type), konst: false });
+        self.next(pc);
+    }
+
+    /// `a op b` for int operands (statically): an int result in an `i64`,
+    /// kept unboxed; overflow and other cases take the generic path, and the
+    /// interpreter continues if its result does not fit.
+    fn int_binop(&mut self, pc: usize, dst: Reg, op: BinOp, a: Reg, b: Reg) {
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let f = |s: &mut Self, r: Reg| -> Value {
+            match s.operand(r, pc, slow) {
+                Operand::I64(x) => x,
+                Operand::F64(_) => {
+                    s.b.ins().jump(slow, &[]);
+                    s.cont();
+                    s.b.ins().iconst(types::I64, 0)
+                }
+                Operand::Obj(p) => s.as_i64(p, slow),
+            }
+        };
+        let x = f(self, a);
+        let y = f(self, b);
+        let v = match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let (v, of) = match op {
+                    BinOp::Add => self.b.ins().sadd_overflow(x, y),
+                    BinOp::Sub => self.b.ins().ssub_overflow(x, y),
+                    _ => self.b.ins().smul_overflow(x, y),
+                };
+                let ok = self.b.create_block();
+                self.b.ins().brif(of, slow, &[], ok, &[]);
+                self.b.switch_to_block(ok);
+                v
+            }
+            BinOp::BitAnd => self.b.ins().band(x, y),
+            BinOp::BitOr => self.b.ins().bor(x, y),
+            BinOp::BitXor => self.b.ins().bxor(x, y),
+            _ => {
+                // Floor division and modulo with Python's signs; division by
+                // zero and MIN // -1 are generic.
+                let nz = self.b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
+                self.guard(nz, slow);
+                let m1 = self.b.ins().icmp_imm_s(IntCC::Equal, y, -1);
+                let min = self.b.ins().icmp_imm_s(IntCC::Equal, x, i64::MIN);
+                let bad = self.b.ins().band(m1, min);
+                let ok = self.b.create_block();
+                self.b.ins().brif(bad, slow, &[], ok, &[]);
+                self.b.switch_to_block(ok);
+                let q = self.b.ins().sdiv(x, y);
+                let r = self.b.ins().srem(x, y);
+                // r != 0 and sign(r) != sign(y): q - 1, r + y.
+                let rnz = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+                let xr = self.b.ins().bxor(r, y);
+                let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, xr, 0);
+                let adj = self.b.ins().band(rnz, neg);
+                let adj = self.b.ins().uextend(types::I64, adj);
+                if op == BinOp::FloorDiv {
+                    self.b.ins().isub(q, adj)
+                } else {
+                    let ya = self.b.ins().imul(y, adj);
+                    self.b.ins().iadd(r, ya)
+                }
+            }
+        };
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, types::I64);
+        self.b.ins().jump(join, &[BlockArg::Value(v)]);
+        self.slow_path(slow, start, pc, |s| {
+            let p = s.slot_load(dst);
+            let other = s.b.create_block();
+            let v = s.as_i64(p, other);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+            s.b.switch_to_block(other);
+            s.bail_to(pc + 1);
+        });
+        self.b.switch_to_block(join);
+        self.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(r), ty: Some(self.l.long_type), konst: false });
+        self.next(pc);
+    }
+
+    /// `dst: Bool = a op b`: inline for two ints or two floats, else
+    /// generic.
+    fn compare_bool(&mut self, pc: usize, dst: Reg, op: CmpOp, a: Reg, b: Reg) {
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let x = self.operand(a, pc, slow);
+        let y = self.operand(b, pc, slow);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::I8);
+        let icmp = |s: &mut Self, x: Value, y: Value| {
+            let c = s.b.ins().icmp(int_cc(op), x, y);
+            s.b.ins().jump(join, &[BlockArg::Value(c)]);
+        };
+        let fcmp = |s: &mut Self, x: Value, y: Value| {
+            let c = s.b.ins().fcmp(float_cc(op), x, y);
+            s.b.ins().jump(join, &[BlockArg::Value(c)]);
+        };
+        match (x, y) {
+            (Operand::I64(x), Operand::I64(y)) => icmp(self, x, y),
+            (Operand::F64(x), Operand::F64(y)) => fcmp(self, x, y),
+            (Operand::I64(x), Operand::Obj(p)) => {
+                let y = self.as_i64(p, slow);
+                icmp(self, x, y)
+            }
+            (Operand::Obj(p), Operand::I64(y)) => {
+                let x = self.as_i64(p, slow);
+                icmp(self, x, y)
+            }
+            (Operand::F64(x), Operand::Obj(p)) => {
+                let t = self.ob_type(p);
+                self.guard_eq(t, self.l.float_type as i64, slow);
+                let y = self.b.ins().load(types::F64, MF, p, self.l.fval);
+                fcmp(self, x, y)
+            }
+            (Operand::Obj(p), Operand::F64(y)) => {
+                let t = self.ob_type(p);
+                self.guard_eq(t, self.l.float_type as i64, slow);
+                let x = self.b.ins().load(types::F64, MF, p, self.l.fval);
+                fcmp(self, x, y)
+            }
+            (Operand::Obj(p), Operand::Obj(q)) => {
+                let (tp, tq) = (self.ob_type(p), self.ob_type(q));
+                let same = self.b.ins().icmp(IntCC::Equal, tp, tq);
+                self.guard(same, slow);
+                let (ints, notint, floats) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                let c = self.b.ins().icmp_imm_s(IntCC::Equal, tp, self.l.long_type as i64);
+                self.b.ins().brif(c, ints, &[], notint, &[]);
+                self.b.switch_to_block(ints);
+                let x = self.compact_value(p, slow);
+                let y = self.compact_value(q, slow);
+                icmp(self, x, y);
+                self.b.switch_to_block(notint);
+                let c = self.b.ins().icmp_imm_s(IntCC::Equal, tp, self.l.float_type as i64);
+                self.b.ins().brif(c, floats, &[], slow, &[]);
+                self.b.switch_to_block(floats);
+                let x = self.b.ins().load(types::F64, MF, p, self.l.fval);
+                let y = self.b.ins().load(types::F64, MF, q, self.l.fval);
+                fcmp(self, x, y);
+            }
+            _ => {
+                self.b.ins().jump(slow, &[]);
+            }
+        }
+        self.slow_path(slow, start, pc, |s| {
+            let v = s.slot_load(dst);
+            let v = s.b.ins().ireduce(types::I8, v);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+        });
+        self.b.switch_to_block(join);
+        let r = self.b.ins().uextend(types::I64, res);
+        self.set_var(dst, r);
+        self.next(pc);
+    }
+
+    /// `dst: Bool = a is b` (or `is not`).
+    fn compare_is(&mut self, pc: usize, dst: Reg, op: CmpOp, a: Reg, b: Reg) {
+        let has = |s: &Self, r: Reg| s.vals.get(&r).is_none_or(|v| v.ptr.is_some());
+        if !has(self, a) || !has(self, b) {
+            return self.step(pc);
+        }
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let x = self.obj(a, pc, slow);
+        let y = self.obj(b, pc, slow);
+        let cc = if op == CmpOp::Is { IntCC::Equal } else { IntCC::NotEqual };
+        let c = self.b.ins().icmp(cc, x, y);
+        let c = self.b.ins().uextend(types::I64, c);
+        self.set_var(dst, c);
+        let join = self.b.create_block();
+        self.b.ins().jump(join, &[]);
+        // Unbound: `step` raises.
+        self.slow_path(slow, start, pc, |s| {
+            s.b.ins().jump(join, &[]);
+        });
+        self.b.switch_to_block(join);
+        self.next(pc);
+    }
+
+    fn truthy(&mut self, pc: usize, dst: Reg, src: Reg) {
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::I64);
+        let p = self.obj(src, pc, slow);
+        let (not_true, not_false, is_none) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let one = self.b.ins().iconst(types::I64, 1);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let t = self.b.ins().icmp_imm_s(IntCC::Equal, p, self.l.true_ as i64);
+        self.b.ins().brif(t, join, &[BlockArg::Value(one)], not_true, &[]);
+        self.b.switch_to_block(not_true);
+        let f = self.b.ins().icmp_imm_s(IntCC::Equal, p, self.l.false_ as i64);
+        self.b.ins().brif(f, join, &[BlockArg::Value(zero)], not_false, &[]);
+        self.b.switch_to_block(not_false);
+        let n = self.b.ins().icmp_imm_s(IntCC::Equal, p, self.l.none as i64);
+        self.b.ins().brif(n, is_none, &[], slow, &[]);
+        self.b.switch_to_block(is_none);
+        self.b.ins().jump(join, &[BlockArg::Value(zero)]);
+        self.slow_path(slow, start, pc, |s| {
+            let v = s.slot_load(dst);
+            s.b.ins().jump(join, &[BlockArg::Value(v)]);
+        });
+        self.b.switch_to_block(join);
+        self.set_var(dst, res);
+        self.next(pc);
+    }
+
+    /// `return src`: a new reference for the runtime.
+    fn ret(&mut self, pc: usize, src: Reg) {
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let v = self.vals.get(&src).copied();
+        let p = match v {
+            Some(Virt { ptr: None, in_slot: false, num: Unboxed::F64(x), .. }) => {
+                let p = self.call(self.h.float_new, &[x], Some(self.ptr)).unwrap();
+                self.guard(p, slow);
+                p
+            }
+            Some(Virt { ptr: None, in_slot: false, num: Unboxed::I64(x), .. }) => {
+                let p = self.call(self.h.long_new, &[x], Some(self.ptr)).unwrap();
+                self.guard(p, slow);
+                p
+            }
+            Some(Virt { ptr: Some(p), in_slot: true, .. }) if !self.is_param(src) => {
+                // The slot's reference moves out.
+                let z = self.b.ins().iconst(types::I64, 0);
+                self.slot_store(z, src);
+                p
+            }
+            _ => {
+                let p = self.obj(src, pc, slow);
+                self.incref(p);
+                p
+            }
+        };
+        self.b.ins().store(MF, p, self.ctx, CTX_RET);
+        let pcv = self.pc_val(pc);
+        self.b.ins().jump(self.exit, &[BlockArg::Value(pcv)]);
+        self.vals = start;
+        self.b.switch_to_block(slow);
+        self.step(pc);
+        self.done = true;
+    }
+
+    /// A call of a Lizzard function compiled code enters directly, with the
+    /// arguments borrowed from the caller's registers.
+    fn call_direct(&mut self, pc: usize, dst: Reg, func: Option<Reg>, obj: Option<Reg>, args: &[Reg]) {
+        let Spec::Call(spec) = &self.u.specs[pc] else { unreachable!() };
+        let spec = spec.clone();
+        let covered = self.ir.handlers.iter().any(|h| h.ranges.iter().any(|(s, e)| (*s as usize) <= pc && pc < *e as usize));
+        let reads = self.ir.code[pc].reads();
+        if covered {
+            self.flush(pc);
+        } else {
+            self.secure_borrowed(pc + 1, pc, &reads);
+        }
+        // The arguments must stay alive during the call: in their slots or
+        // kept by the code.
+        let mut all: Vec<Reg> = obj.into_iter().collect();
+        all.extend(args);
+        for &r in &all {
+            if let Some(v) = self.vals.get(&r).copied() {
+                if !v.in_slot && !v.konst {
+                    self.materialize(r, pc);
+                }
+            }
+        }
+        let start = self.vals.clone();
+        let slow = self.b.create_block();
+        let mut ctor = None;
+        match (&spec.guard, func, obj) {
+            (CallGuard::Func(f), Some(fr), _) => {
+                let p = self.obj(fr, pc, slow);
+                self.guard_eq(p, *f as i64, slow);
+            }
+            (CallGuard::Ctor { tp, version, alloc }, Some(fr), _) => {
+                let p = self.obj(fr, pc, slow);
+                self.guard_eq(p, *tp as i64, slow);
+                let v = self.b.ins().load(types::I32, MF, p, self.l.tp_version);
+                let c = self.b.ins().icmp_imm_s(IntCC::Equal, v, *version as i32 as i64);
+                self.guard(c, slow);
+                ctor = Some((*tp, *alloc));
+            }
+            (CallGuard::Method { tp, version, keys, nentries, valid }, _, Some(o)) => {
+                let p = self.obj(o, pc, slow);
+                if self.vals[&o].ty != Some(*tp) {
+                    self.guard_type(p, *tp, *version, slow);
+                }
+                if *keys != 0 {
+                    let v = self.b.ins().load(types::I8, MF, p, *valid);
+                    self.guard(v, slow);
+                    let k = self.b.ins().iconst(self.ptr, *keys as i64);
+                    let n = self.b.ins().load(types::I64, MF, k, 0);
+                    self.guard_eq(n, *nentries, slow);
+                }
+            }
+            _ => unreachable!("a call spec for another instruction"),
+        }
+        let mut ptrs = Vec::new();
+        // A constructor's `__init__` has the instance first.
+        let skip = ctor.is_some() as usize;
+        for (i, &r) in all.iter().enumerate() {
+            let p = self.obj(r, pc, slow);
+            let q = spec.checks.get(i + skip).copied().unwrap_or(Quick::Slow);
+            if !self.known_pass(self.vals.get(&r).copied(), q) {
+                self.quick(p, q, slow);
+            }
+            ptrs.push(p);
+        }
+        let inst = ctor.map(|(tp, alloc)| {
+            let tp = self.b.ins().iconst(self.ptr, tp as i64);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            let o = self.call(alloc, &[tp, zero], Some(self.ptr)).unwrap();
+            let (ok, failed) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(o, ok, &[], failed, &[]);
+            self.b.switch_to_block(failed);
+            self.raise(pc);
+            self.b.switch_to_block(ok);
+            o
+        });
+        if let Some(o) = inst {
+            ptrs.insert(0, o);
+        }
+        let frame = self.frame.expect("a frame for direct calls");
+        for (i, p) in ptrs.iter().enumerate() {
+            self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
+        }
+        let z = self.b.ins().iconst(types::I64, 0);
+        for i in ptrs.len()..spec.nregs as usize {
+            self.b.ins().stack_store(self.ptr, z, frame, i as i32 * 8);
+        }
+        let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
+        let desc = self.b.ins().iconst(self.ptr, spec.desc as i64);
+        let r = self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap();
+        let (ok, failed) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(r, ok, &[], failed, &[]);
+        self.b.switch_to_block(failed);
+        if let Some(o) = inst {
+            self.decref(o);
+        }
+        // Materialized above if a handler covers it.
+        self.raise(pc);
+        self.b.switch_to_block(ok);
+        let r = match inst {
+            Some(o) => {
+                // `__init__` returns None (immortal), else TypeError.
+                let (none, other) = (self.b.create_block(), self.b.create_block());
+                let c = self.b.ins().icmp_imm_s(IntCC::Equal, r, self.l.none as i64);
+                self.b.ins().brif(c, none, &[], other, &[]);
+                self.b.switch_to_block(other);
+                self.call(self.h.init_returned, &[r], None);
+                self.decref(o);
+                self.raise(pc);
+                self.b.switch_to_block(none);
+                o
+            }
+            None => r,
+        };
+        self.put(dst, r);
+        let join = self.b.create_block();
+        self.b.ins().jump(join, &[]);
+        self.slow_path(slow, start, pc, |s| {
+            s.b.ins().jump(join, &[]);
+        });
+        self.b.switch_to_block(join);
+        self.next(pc);
     }
 }

@@ -90,6 +90,8 @@ struct Lower<'a> {
     fname: String,
     code: Vec<Instr>,
     lines: Vec<u32>,
+    /// `FuncIr::hints`, by pc.
+    hints: Vec<(usize, u8)>,
     reprs: Vec<Repr>,
     locals: HashMap<String, Local>,
     consts: Vec<Const>,
@@ -198,6 +200,7 @@ impl<'a> Lower<'a> {
             fname,
             code: Vec::new(),
             lines: Vec::new(),
+            hints: Vec::new(),
             reprs: Vec::new(),
             locals: HashMap::new(),
             consts: Vec::new(),
@@ -903,6 +906,12 @@ impl<'a> Lower<'a> {
                 l.emit(Instr::Return { src: r });
             }
         }
+        let mut hints = vec![0u8; l.code.len()];
+        for (pc, h) in l.hints {
+            if matches!(l.code.get(pc), Some(Instr::BinOp { .. })) {
+                hints[pc] = h;
+            }
+        }
         let mut ir = FuncIr {
             name: l.fname,
             file: path,
@@ -918,6 +927,7 @@ impl<'a> Lower<'a> {
             key: spec.key,
             free: spec.free.into_iter().map(|(n, _)| n).collect(),
             generator,
+            hints,
         };
         ir.moves_to_takes();
         let nested = l.nested;
@@ -3802,7 +3812,12 @@ impl<'a> Lower<'a> {
         }
         let (a, bb) = (self.obj(&l), self.obj(&r));
         let dst = self.reg(Repr::Obj);
-        self.emit(Instr::BinOp { dst, op: bop, a, b: bb, inplace });
+        let pc = self.emit(Instr::BinOp { dst, op: bop, a, b: bb, inplace });
+        match (&lt, &rt) {
+            (Ty::Float, Ty::Float) => self.hints.push((pc, crate::ir::HINT_FLOAT)),
+            (Ty::Int, Ty::Int) => self.hints.push((pc, crate::ir::HINT_INT)),
+            _ => {}
+        }
         let v = Val { reg: dst, ty, repr: Repr::Obj };
         self.check(&v, what, origin);
         self.unbox_f32(v)
