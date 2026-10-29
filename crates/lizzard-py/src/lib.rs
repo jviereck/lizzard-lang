@@ -4,8 +4,10 @@
 mod array;
 mod frame;
 mod generator;
+mod globals;
 mod interp;
 mod jit;
+mod ops;
 mod rt;
 
 use std::path::PathBuf;
@@ -70,6 +72,14 @@ fn compile_module<'py>(py: Python<'py>, source: &str, path: &str, name: &str, en
     if !compiled.diagnostics.is_empty() {
         return Ok((None, diags, warnings));
     }
+    if std::env::var_os("LIZZARD_DUMP_IR").is_some() {
+        for f in &compiled.module.functions {
+            eprintln!("== {} ({} registers: {:?})", f.name, f.reprs.len(), f.reprs);
+            for (pc, i) in f.code.iter().enumerate() {
+                eprintln!("{pc:4}  {i:?}");
+            }
+        }
+    }
     let table: Table = Arc::default();
     let mut funcs = Vec::new();
     for f in compiled.module.functions {
@@ -95,6 +105,7 @@ fn _lizzard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LizzardFunction>()?;
     m.add_class::<generator::LizzardGenerator>()?;
     generator::init_type(m.py());
+    ops::init_fast_paths();
     m.add_function(wrap_pyfunction!(compile_module, m)?)?;
     m.add_function(wrap_pyfunction!(_stats, m)?)?;
     Ok(())

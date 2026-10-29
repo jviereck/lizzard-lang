@@ -468,6 +468,12 @@ impl<'a> Lower<'a> {
         if v.repr == to {
             return v.reg;
         }
+        // Boxed just before (`i * i`): the same object will do.
+        if let (Repr::Obj, Some(Instr::Box { dst, src })) = (to, self.code.last()) {
+            if *src == v.reg {
+                return *dst;
+            }
+        }
         let dst = self.reg(to);
         match (v.repr, to) {
             (_, Repr::Obj) => self.emit(Instr::Box { dst, src: v.reg }),
@@ -480,6 +486,29 @@ impl<'a> Lower<'a> {
             }
         };
         dst
+    }
+
+    /// A branch condition as a `Bool` register. A comparison just computed
+    /// for it becomes one `CompareBool`: only its truth matters, so its
+    /// result object (and the check of its type) is not needed.
+    fn cond_bool(&mut self, c: &Val) -> Reg {
+        let n = self.code.len();
+        if c.repr == Repr::Obj && !self.locals.values().any(|l| l.reg == c.reg) {
+            let compare_at = match self.code.last() {
+                Some(Instr::Check { reg, .. }) if *reg == c.reg && n >= 2 => n - 2,
+                _ => n.wrapping_sub(1),
+            };
+            if let Some(&Instr::Compare { dst, op, a, b }) = self.code.get(compare_at) {
+                if dst == c.reg {
+                    self.code.truncate(compare_at);
+                    self.lines.truncate(compare_at);
+                    let r = self.reg(Repr::Bool);
+                    self.emit(Instr::CompareBool { dst: r, op, a, b });
+                    return r;
+                }
+            }
+        }
+        self.convert(c, Repr::Bool)
     }
 
     fn obj(&mut self, v: &Val) -> Reg {
@@ -1292,7 +1321,7 @@ impl<'a> Lower<'a> {
             Stmt::Assert(a) => {
                 let (yes, _) = self.cond_narrow(&a.test);
                 let c = self.expr(&a.test);
-                let b = self.convert(&c, Repr::Bool);
+                let b = self.cond_bool(&c);
                 let ok = self.emit(Instr::JumpIfTrue { cond: b, target: 0 });
                 let func = self.load_global("AssertionError", Ty::Any);
                 let args = match &a.msg {
@@ -1959,6 +1988,14 @@ impl<'a> Lower<'a> {
     /// the local holds the only reference (`del x` frees it at once).
     fn release_temp(&mut self, v: &Val) {
         if v.repr == Repr::Obj && !self.locals.values().any(|l| l.reg == v.reg) && !self.handlers.iter().any(|h| h.exc == v.reg) {
+            // Just moved into a variable: move the reference instead.
+            if let Some(Instr::Move { dst, src }) = self.code.last() {
+                if *src == v.reg {
+                    let dst = *dst;
+                    *self.code.last_mut().unwrap() = Instr::Take { dst, src: v.reg };
+                    return;
+                }
+            }
             self.emit(Instr::Unbind { reg: v.reg });
         }
     }
@@ -2138,7 +2175,7 @@ impl<'a> Lower<'a> {
     fn if_stmt(&mut self, test: &Expr, body: &[Stmt], rest: &[ast::ElifElseClause]) {
         let (yes, no) = self.cond_narrow(test);
         let c = self.expr(test);
-        let b = self.convert(&c, Repr::Bool);
+        let b = self.cond_bool(&c);
         let skip = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
         let before = self.narrow.clone();
         self.apply_narrow(yes);
@@ -2199,7 +2236,7 @@ impl<'a> Lower<'a> {
         let (yes, no) = self.cond_narrow(&w.test);
         let top = self.here();
         let c = self.expr(&w.test);
-        let b = self.convert(&c, Repr::Bool);
+        let b = self.cond_bool(&c);
         let exit = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
         self.apply_narrow(yes);
         let l = self.loop_body(&w.body);
@@ -2416,7 +2453,7 @@ impl<'a> Lower<'a> {
             Expr::If(i) => {
                 let (yes, no) = self.cond_narrow(&i.test);
                 let c = self.expr(&i.test);
-                let b = self.convert(&c, Repr::Bool);
+                let b = self.cond_bool(&c);
                 let skip = self.emit(Instr::JumpIfFalse { cond: b, target: 0 });
                 let dst = self.reg(Repr::Obj);
                 let before = self.narrow.clone();
@@ -4104,7 +4141,7 @@ impl<'a> Lower<'a> {
         for cond in &g.ifs {
             let (yes, _) = self.cond_narrow(cond);
             let c = self.expr(cond);
-            let b = self.convert(&c, Repr::Bool);
+            let b = self.cond_bool(&c);
             self.emit(Instr::JumpIfFalse { cond: b, target: top });
             self.apply_narrow(yes);
         }

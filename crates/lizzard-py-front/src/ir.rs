@@ -109,6 +109,9 @@ pub enum Instr {
     /// closing over the cells in `closure`.
     MakeFunction { dst: Reg, key: u32, closure: Vec<Reg>, defaults: Vec<Reg> },
     Move { dst: Reg, src: Reg },
+    /// `dst = src`, and `src` becomes unbound: the reference moves, with no
+    /// reference counting (assigning a temporary to a variable).
+    Take { dst: Reg, src: Reg },
     LoadAttr { dst: Reg, obj: Reg, name: u32 },
     StoreAttr { obj: Reg, name: u32, val: Reg },
     DelAttr { obj: Reg, name: u32 },
@@ -136,6 +139,8 @@ pub enum Instr {
     /// `+src`
     Pos { dst: Reg, src: Reg },
     Compare { dst: Reg, op: CmpOp, a: Reg, b: Reg },
+    /// `dst: Bool = bool(a op b)`, for a branch condition.
+    CompareBool { dst: Reg, op: CmpOp, a: Reg, b: Reg },
     GetItem { dst: Reg, obj: Reg, key: Reg },
     SetItem { obj: Reg, key: Reg, val: Reg },
     DelItem { obj: Reg, key: Reg },

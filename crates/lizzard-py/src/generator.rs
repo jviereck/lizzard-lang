@@ -87,7 +87,7 @@ pub struct LizzardGenerator {
 impl LizzardGenerator {
     /// A generator over a new frame with the (checked) arguments.
     pub fn new(rt: Arc<FuncRt>, globals: Py<PyDict>, closure: Vec<Py<PyAny>>, args: Vec<Bound<'_, PyAny>>) -> LizzardGenerator {
-        let mut regs = Regs::new(rt.objs.clone());
+        let mut regs = Regs::new(&rt.objs);
         for (i, a) in args.into_iter().enumerate() {
             regs.set_obj(i as u32, a);
         }

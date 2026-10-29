@@ -23,3 +23,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.regalloc2]
 opt-level = 3
+# The interpreter recurses on the C stack once per Lizzard call; unoptimized,
+# its frames are larger than the margin CPython's stack check leaves, so deep
+# recursion would overflow before RecursionError.
+[profile.dev.package.lizzard-py]
+opt-level = 1

@@ -14,7 +14,9 @@ use lizzard_py_front::ir::{BinOp, CmpOp, Const, FuncIr, Instr, ParamKind, Repr};
 
 use crate::array;
 use crate::frame::{unbound, Regs};
+use crate::globals;
 use crate::jit;
+use crate::ops;
 use crate::generator::{self, LizzardGenerator, Sent};
 use crate::rt;
 
@@ -25,6 +27,8 @@ pub struct FuncRt {
     pub ir: FuncIr,
     /// Which registers hold objects.
     pub objs: Arc<[bool]>,
+    /// All its parameters are plain positional ones.
+    pub positional: bool,
     /// Its compiled code, once it has run (None if it cannot be compiled).
     pub jit: OnceLock<Option<lizzard_jit::Entry>>,
     pub(crate) consts: Vec<Py<PyAny>>,
@@ -36,7 +40,9 @@ pub struct FuncRt {
     cks: Vec<PyOnceLock<rt::Ck>>,
     /// An inline cache per instruction (used by attribute loads and stores
     /// in compiled code).
-    pub(crate) ics: Vec<jit::AttrIc>,
+    pub(crate) ics: Vec<ops::AttrIc>,
+    /// A global-lookup cache per instruction (used by `LoadGlobal`).
+    pub(crate) gics: Vec<globals::GlobalIc>,
     table: Table,
 }
 
@@ -90,8 +96,10 @@ impl FuncRt {
         }
         let objs = ir.reprs.iter().map(|r| *r == Repr::Obj).collect();
         let cks = ir.checks.iter().map(|_| PyOnceLock::new()).collect();
-        let ics = ir.code.iter().map(|_| jit::AttrIc::default()).collect();
-        Ok(FuncRt { ir, objs, jit: OnceLock::new(), consts, names, kwnames, cks, ics, table })
+        let ics = ir.code.iter().map(|_| ops::AttrIc::default()).collect();
+        let gics = ir.code.iter().map(|_| globals::GlobalIc::default()).collect();
+        let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
+        Ok(FuncRt { ir, objs, positional, jit: OnceLock::new(), consts, names, kwnames, cks, ics, gics, table })
     }
 }
 
@@ -129,6 +137,7 @@ impl LizzardFunction {
             let offset = (field - obj.as_ptr() as usize) as ffi::Py_ssize_t;
             let tp = py.get_type::<LizzardFunction>();
             let tp = tp.as_type_ptr();
+            FUNCTION_TYPE.store(tp, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: the type object is ours; no instance has been called
             // yet. `offset` is where every instance keeps its pointer.
             unsafe {
@@ -165,9 +174,26 @@ impl LizzardFunction {
         // SAFETY: CPython passes valid borrowed references.
         let arg = |p: *mut ffi::PyObject| unsafe { Bound::from_borrowed_ptr(py, p) };
         let nkw = if kwnames.is_null() { 0 } else { unsafe { ffi::PyTuple_GET_SIZE(kwnames) as usize } };
-        // The common case: exactly the positional parameters.
-        if nkw == 0 && args.len() == ir.params.len() && ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw)) {
-            return self.invoke(py, args.iter().map(|p| arg(*p)).collect());
+        // The common case: exactly the positional parameters. They go
+        // straight into the new frame, checked by type pointers first.
+        if nkw == 0 && args.len() == ir.params.len() && self.rt.positional && !ir.generator {
+            let rt = &self.rt;
+            for (p, &a) in ir.params.iter().zip(args) {
+                // SAFETY: a valid object.
+                if !unsafe { rt::quick(a, rt.ck(py, p.check)) } {
+                    if let Err(got) = rt.check(py, p.check, &arg(a))? {
+                        let c = &ir.checks[p.check as usize];
+                        return Err(PyTypeError::new_err(format!("{}() argument '{}': expected {}, got {got}", ir.name, p.name, c.expected)));
+                    }
+                }
+            }
+            let mut regs = Regs::new(&rt.objs);
+            for (i, &a) in args.iter().enumerate() {
+                // SAFETY: a new reference for the frame.
+                unsafe { ffi::Py_IncRef(a) };
+                regs.init_obj(i as u32, a);
+            }
+            return run_frame(py, rt, self.globals.bind(py), &self.closure, &mut regs);
         }
         let npos = args.len() - nkw;
         let pos = PyTuple::new(py, args[..npos].iter().map(|p| arg(*p)))?;
@@ -184,6 +210,13 @@ impl LizzardFunction {
         let bound = bind_args(ir, &self.rt.consts, &self.defaults, &pos, kwargs.as_ref())?;
         self.invoke(py, bound)
     }
+}
+
+static FUNCTION_TYPE: std::sync::atomic::AtomicPtr<ffi::PyTypeObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// `LizzardFunction`'s type object, once a function exists (null before).
+fn lizzard_function_type() -> *mut ffi::PyTypeObject {
+    FUNCTION_TYPE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// CPython's entry into a Lizzard function (vectorcall protocol).
@@ -405,12 +438,26 @@ pub(crate) enum Exit<'py> {
 }
 
 fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>, closure: &[Py<PyAny>]) -> PyResult<Py<PyAny>> {
-    let mut regs = Regs::new(f.objs.clone());
+    let mut regs = Regs::new(&f.objs);
     for (i, a) in args.into_iter().enumerate() {
-        regs.set_obj(i as u32, a);
+        regs.init_obj(i as u32, a.into_ptr());
+    }
+    run_frame(py, f, globals, closure, &mut regs)
+}
+
+/// Run a new frame (its arguments in place) to its return.
+fn run_frame<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs) -> PyResult<Py<PyAny>> {
+    // Calls between Lizzard functions recurse on the C stack: CPython's
+    // recursion limit keeps that bounded (RecursionError, not a crash).
+    // SAFETY: attached; the message is a C string.
+    if unsafe { ffi::Py_EnterRecursiveCall(c" while calling a Lizzard function".as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
     }
     let mut pc = 0usize;
-    match exec(py, f, globals, closure, &mut regs, &mut pc, None)? {
+    let r = exec(py, f, globals, closure, regs, &mut pc, None);
+    unsafe { ffi::Py_LeaveRecursiveCall() };
+    regs.release(py);
+    match r? {
         Exit::Return(v) => Ok(v.unbind()),
         Exit::Yield { .. } | Exit::YieldFrom { .. } => unreachable!("yield in a function that is not a generator"),
     }
@@ -425,36 +472,192 @@ pub(crate) fn exec<'py>(
     closure: &[Py<PyAny>],
     regs: &mut Regs,
     pc: &mut usize,
-    mut pending: Option<PyErr>,
+    pending: Option<PyErr>,
 ) -> PyResult<Exit<'py>> {
     if jit::enabled() {
         if let Some(entry) = jit::code(f) {
             return jit::exec(py, entry, f, globals, closure, regs, pc, pending);
         }
     }
+    run_interp(py, f, globals, closure, regs, pc, pending)
+}
+
+/// The interpreter. The common instructions run here on the raw slots,
+/// with the same helpers compiled code calls (`ops`); the rest go to `step`.
+/// The loop keeps its state in locals and handles exceptions only when one
+/// is raised, so an instruction costs a dispatch and its own work.
+fn run_interp<'py>(
+    py: Python<'py>,
+    f: &FuncRt,
+    globals: &Bound<'py, PyDict>,
+    closure: &[Py<PyAny>],
+    regs: &mut Regs,
+    pc: &mut usize,
+    pending: Option<PyErr>,
+) -> PyResult<Exit<'py>> {
+    use lizzard_jit::{NEXT, TAKEN};
     let ir = &f.ir;
+    let code = &ir.code[..];
+    let slots = regs.as_mut_ptr();
+    // SAFETY (for the raw slot accesses below): the front end emits register
+    // numbers below `ir.reprs.len()`, the number of slots, and `step` never
+    // reallocates them.
+    let get = |r: u32| unsafe { *slots.add(r as usize) };
+    let set = |r: u32, v: u64| unsafe { *slots.add(r as usize) = v };
+    let mut p = *pc;
+    let mut err = pending;
     loop {
-        let r = match pending.take() {
-            Some(e) => Err(e),
-            None => step(py, f, globals, closure, regs, pc),
-        };
-        match r {
-            Ok(Some(exit)) => return Ok(exit),
-            Ok(None) => {}
-            Err(e) => {
-                let pc = &mut *pc;
-                // The innermost handler covering the instruction: regions
-                // nest, and an inner handler is created after its outer one.
-                let at = *pc as u32;
-                let handler = ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e));
-                if let Some(h) = handler {
+        if let Some(e) = err.take() {
+            // The innermost handler covering the instruction: regions nest,
+            // and an inner handler is created after its outer one.
+            let at = p as u32;
+            match ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
+                Some(h) => {
                     regs.set_obj(h.exc, e.into_value(py).into_bound(py).into_any());
-                    *pc = h.target as usize;
+                    p = h.target as usize;
+                }
+                None => {
+                    *pc = p;
+                    let line = ir.lines.get(p).copied().unwrap_or(ir.line);
+                    let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
+                    return Err(e);
+                }
+            }
+        }
+        loop {
+            let instr = &code[p];
+            // `Some(status)` when handled here, None for `step`.
+            let fast = match instr {
+                Instr::Jump { target } => {
+                    p = *target as usize;
                     continue;
                 }
-                let line = ir.lines.get(*pc).copied().unwrap_or(ir.line);
-                let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
-                return Err(e);
+                Instr::JumpIfFalse { cond, target } => {
+                    p = if get(*cond) == 0 { *target as usize } else { p + 1 };
+                    continue;
+                }
+                Instr::JumpIfTrue { cond, target } => {
+                    p = if get(*cond) != 0 { *target as usize } else { p + 1 };
+                    continue;
+                }
+                Instr::I64Const { dst, value } => {
+                    set(*dst, *value as u64);
+                    Some(NEXT)
+                }
+                Instr::I64Lt { dst, a, b } => {
+                    set(*dst, ((get(*a) as i64) < (get(*b) as i64)) as u64);
+                    Some(NEXT)
+                }
+                Instr::I64Add { dst, a, b } => {
+                    set(*dst, (get(*a) as i64).wrapping_add(get(*b) as i64) as u64);
+                    Some(NEXT)
+                }
+                Instr::Not { dst, src } => {
+                    set(*dst, get(*src) ^ 1);
+                    Some(NEXT)
+                }
+                Instr::Const { dst, idx } => {
+                    ops::lz_const(slots, *dst, f.consts[*idx as usize].as_ptr());
+                    Some(NEXT)
+                }
+                Instr::Move { dst, src } if f.objs[*src as usize] => Some(ops::lz_move(slots, *dst, *src)),
+                Instr::Move { dst, src } => {
+                    set(*dst, get(*src));
+                    Some(NEXT)
+                }
+                Instr::Take { dst, src } if f.objs[*src as usize] => Some(ops::lz_take(slots, *dst, *src)),
+                Instr::Unbind { reg } => {
+                    regs.clear(*reg);
+                    Some(NEXT)
+                }
+                Instr::CompareBool { dst, op, a, b } if ops::rich_code(*op).is_some() => Some(ops::lz_compare_bool(slots, *dst, *a, *b, ops::rich_code(*op).unwrap())),
+                Instr::LoadGlobal { dst, name } => Some(match builtins_dict(py).and_then(|b| globals::load(py, &f.gics[p], globals, b, f.names[*name as usize].bind(py))) {
+                    Ok(v) => {
+                        regs.set_obj(*dst, v);
+                        NEXT
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }),
+                Instr::LoadAttr { dst, obj, name } => Some(ops::lz_load_attr(slots, *dst, *obj, f.names[*name as usize].as_ptr(), &f.ics[p])),
+                Instr::StoreAttr { obj, name, val } => Some(ops::lz_store_attr(slots, *obj, *val, f.names[*name as usize].as_ptr(), &f.ics[p])),
+                Instr::BinOp { dst, op, a, b, inplace } => Some(ops::lz_binop(slots, *dst, *a, *b, *op as u32 + if *inplace { 16 } else { 0 })),
+                Instr::Compare { dst, op, a, b } if ops::rich_code(*op).is_some() => Some(ops::lz_compare(slots, *dst, *a, *b, ops::rich_code(*op).unwrap())),
+                Instr::Truthy { dst, src } => Some(ops::lz_truthy(slots, *dst, *src)),
+                Instr::Box { dst, src } if ir.reprs[*src as usize] == Repr::I64 => Some(ops::lz_box_i64(slots, *dst, *src)),
+                Instr::Check { reg, check } => {
+                    let o = get(*reg) as *mut ffi::PyObject;
+                    // SAFETY: a non-null object slot holds a valid object.
+                    (!o.is_null() && unsafe { rt::quick(o, f.ck(py, *check)) }).then_some(NEXT)
+                }
+                // The frame ends: its reference is the return value.
+                Instr::Return { src } if f.objs[*src as usize] && get(*src) != 0 => {
+                    *pc = p;
+                    let v = regs.take_obj(*src);
+                    // SAFETY: an owned reference out of the frame.
+                    return Ok(Exit::Return(unsafe { Bound::from_owned_ptr(py, v) }));
+                }
+                Instr::Call { dst, func, args, .. } => Some(match regs.obj(py, *func).map(|o| o.as_ptr()).and_then(|c| vector_call(py, regs, None, c, args, f.kwnames(p))) {
+                    Ok(v) => {
+                        regs.set_obj(*dst, v);
+                        NEXT
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }),
+                Instr::CallMethod { dst, obj, name, args, .. } => {
+                    Some(match regs.obj(py, *obj).map(|o| o.as_ptr()).and_then(|o| vector_call(py, regs, Some(o), f.names[*name as usize].as_ptr(), args, f.kwnames(p))) {
+                        Ok(v) => {
+                            regs.set_obj(*dst, v);
+                            NEXT
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    })
+                }
+                Instr::ForIter { dst, iter, target } => {
+                    let it = get(*iter) as *mut ffi::PyObject;
+                    // SAFETY: a type pointer comparison on a valid object.
+                    if it.is_null() || unsafe { ffi::Py_TYPE(it) } == generator::type_ptr() {
+                        None
+                    } else {
+                        match ops::lz_for_iter_py(slots, *dst, it) {
+                            TAKEN => {
+                                p = *target as usize;
+                                continue;
+                            }
+                            st => Some(st),
+                        }
+                    }
+                }
+                _ => None,
+            };
+            match fast {
+                Some(NEXT) => p += 1,
+                Some(_) => {
+                    err = Some(PyErr::fetch(py));
+                    break;
+                }
+                None => {
+                    let mut q = p;
+                    match step(py, f, globals, closure, regs, &mut q) {
+                        Ok(None) => p = q,
+                        Ok(Some(exit)) => {
+                            *pc = q;
+                            return Ok(exit);
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -471,6 +674,12 @@ macro_rules! obj {
 fn builtins(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     static BUILTINS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     Ok(BUILTINS.get_or_try_init(py, || py.import("builtins").map(|m| m.into_any().unbind()))?.bind(py))
+}
+
+/// The builtins module's namespace.
+fn builtins_dict(py: Python<'_>) -> PyResult<&Bound<'_, PyDict>> {
+    static DICT: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+    Ok(DICT.get_or_try_init(py, || builtins(py)?.getattr("__dict__")?.cast_into::<PyDict>().map(|d| d.unbind()).map_err(PyErr::from))?.bind(py))
 }
 
 fn cell_get<'py>(py: Python<'py>, cell: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -519,6 +728,14 @@ pub(crate) fn vector_call<'py>(py: Python<'py>, regs: &Regs, slf: Option<*mut ff
     let kw = kwnames.map_or(std::ptr::null_mut(), |t| t.as_ptr());
     let nkw = kwnames.map_or(0, |t| t.bind(py).len());
     let nargs = n - nkw;
+    // A Lizzard function: call it directly, without CPython's vectorcall
+    // dispatch (and its panic guard).
+    // SAFETY: a type pointer comparison on a valid object.
+    if slf.is_none() && unsafe { ffi::Py_TYPE(callee) } == lizzard_function_type() {
+        // SAFETY: the type says what it is.
+        let lf = unsafe { Bound::from_borrowed_ptr(py, callee).cast_into_unchecked::<LizzardFunction>() };
+        return lf.get().call_vector(py, argv, kw).map(|v| v.into_bound(py));
+    }
     // SAFETY: `argv` holds borrowed references the frame keeps alive for the
     // call; `kw` is a tuple of the keyword names or NULL. A new reference or
     // NULL comes back.
@@ -548,11 +765,7 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
     match instr {
         Instr::Const { dst, idx } => regs.set_obj(*dst, f.consts[*idx as usize].bind(py).clone()),
         Instr::LoadGlobal { dst, name } => {
-            let n = f.names[*name as usize].bind(py);
-            let v = match globals.get_item(n)? {
-                Some(v) => v,
-                None => builtins(py)?.getattr(n).map_err(|_| PyNameError::new_err(format!("name '{n}' is not defined")))?,
-            };
+            let v = globals::load(py, &f.gics[*pc], globals, builtins_dict(py)?, f.names[*name as usize].bind(py))?;
             regs.set_obj(*dst, v);
         }
         Instr::StoreGlobal { name, val } => globals.set_item(f.names[*name as usize].bind(py), obj!(py, regs, *val))?,
@@ -598,6 +811,34 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
                 return Err(unbound());
             }
             regs.copy(py, *dst, *src)?;
+        }
+        Instr::Take { dst, src } => {
+            if !regs.is_bound(*src) {
+                return Err(unbound());
+            }
+            regs.copy(py, *dst, *src)?;
+            regs.clear(*src);
+        }
+        Instr::CompareBool { dst, op, a, b } => {
+            let (x, y) = (obj!(py, regs, *a), obj!(py, regs, *b));
+            let t = match op {
+                CmpOp::Is => x.is(y),
+                CmpOp::IsNot => !x.is(y),
+                CmpOp::In => y.contains(x)?,
+                CmpOp::NotIn => !y.contains(x)?,
+                op => {
+                    let o = match op {
+                        CmpOp::Eq => CompareOp::Eq,
+                        CmpOp::Ne => CompareOp::Ne,
+                        CmpOp::Lt => CompareOp::Lt,
+                        CmpOp::Le => CompareOp::Le,
+                        CmpOp::Gt => CompareOp::Gt,
+                        _ => CompareOp::Ge,
+                    };
+                    x.rich_compare(y, o)?.is_truthy()?
+                }
+            };
+            regs.set_bool(*dst, t);
         }
         Instr::LoadAttr { dst, obj, name } => {
             let v = obj!(py, regs, *obj).getattr(f.names[*name as usize].bind(py))?;

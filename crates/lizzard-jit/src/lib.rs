@@ -70,6 +70,10 @@ pub struct Helpers {
     pub binop: usize,
     /// `compare(regs, dst, a, b, op)` with CPython's `Py_LT`... codes.
     pub compare: usize,
+    /// `compare_bool(regs, dst, a, b, op)`: the same, as a `Bool`.
+    pub compare_bool: usize,
+    /// `take(regs, dst, src)`: move an object reference.
+    pub take: usize,
     /// `ret(ctx, regs, src)`: hand `src` to the runtime as the return value
     /// (`NEXT`, then the code exits) or `ERROR`.
     pub ret: usize,
@@ -80,6 +84,19 @@ pub struct Helpers {
     pub for_iter: usize,
     /// `check(ctx, regs, reg, check, pc)`
     pub check: usize,
+}
+
+/// CPython's `Py_LT`, `Py_LE`, `Py_EQ`, `Py_NE`, `Py_GT`, `Py_GE`.
+fn rich_code(op: CmpOp) -> Option<u32> {
+    Some(match op {
+        CmpOp::Lt => 0,
+        CmpOp::Le => 1,
+        CmpOp::Eq => 2,
+        CmpOp::Ne => 3,
+        CmpOp::Gt => 4,
+        CmpOp::Ge => 5,
+        _ => return None,
+    })
 }
 
 /// What follows a helper call's status.
@@ -427,17 +444,17 @@ impl<'a> Lower<'a> {
                 let code = *op as u32 + if *inplace { 16 } else { 0 };
                 self.helper(i, self.h.binop, false, &[*dst, *a, *b, code], &[], After::Next);
             }
-            Instr::Compare { dst, op, a, b } if matches!(op, CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) => {
-                // CPython's Py_LT, Py_LE, Py_EQ, Py_NE, Py_GT, Py_GE.
-                let code = match op {
-                    CmpOp::Lt => 0,
-                    CmpOp::Le => 1,
-                    CmpOp::Eq => 2,
-                    CmpOp::Ne => 3,
-                    CmpOp::Gt => 4,
-                    _ => 5,
-                };
-                self.helper(i, self.h.compare, false, &[*dst, *a, *b, code], &[], After::Next);
+            Instr::Compare { dst, op, a, b } if rich_code(*op).is_some() => {
+                self.helper(i, self.h.compare, false, &[*dst, *a, *b, rich_code(*op).unwrap()], &[], After::Next);
+            }
+            Instr::CompareBool { dst, op, a, b } if rich_code(*op).is_some() => {
+                self.helper(i, self.h.compare_bool, false, &[*dst, *a, *b, rich_code(*op).unwrap()], &[], After::Next);
+            }
+            Instr::Take { dst, src } if self.repr(*src) == Repr::Obj => self.helper(i, self.h.take, false, &[*dst, *src], &[], After::Next),
+            Instr::Take { dst, src } => {
+                let v = self.load(types::I64, *src);
+                self.store(v, *dst);
+                self.next(i);
             }
             instr => self.call_step(i, instr),
         }

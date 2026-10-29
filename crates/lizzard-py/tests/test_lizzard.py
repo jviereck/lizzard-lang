@@ -33,6 +33,8 @@ THREADS = HERE / "programs" / "threads.py"
 PROTOCOLS = HERE / "programs" / "protocols.py"
 LITERALS = HERE / "programs" / "literals.py"
 SLOTS = HERE / "programs" / "slots.py"
+REBINDING = HERE / "programs" / "rebinding.py"
+NUMBERS = HERE / "programs" / "arith_edges.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -172,7 +174,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])
@@ -181,6 +183,25 @@ class Programs(unittest.TestCase):
                     lizzard = run("-m", "lizzard", str(prog), env={"LIZZARD_JIT": jit})
                     self.assertEqual(lizzard[0], 0, lizzard[2])
                     self.assertEqual(lizzard[1], plain[1], f"LIZZARD_JIT={jit}")
+
+    def test_deep_recursion_raises(self):
+        # Lizzard calls recurse on the C stack: CPython's stack check turns
+        # runaway recursion into RecursionError, in both engines.
+        with Scratch() as s:
+            p = s.write("m.py", """\
+                # lizzard: module
+                def down(n: int) -> int:
+                    return down(n + 1)
+
+                if __name__ == "__main__":
+                    try:
+                        down(0)
+                    except RecursionError:
+                        print("RecursionError")
+                """)
+            for jit in ("1", "0"):
+                code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": jit})
+                self.assertEqual((code, out), (0, "RecursionError\n"), err)
 
     def test_methods_are_compiled(self):
         code, out, err = run("-c", textwrap.dedent("""\

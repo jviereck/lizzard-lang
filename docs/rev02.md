@@ -266,15 +266,27 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 
   | | CPython | interpreter | JIT |
   |---|---|---|---|
-  | int loop (2M) | 0.103 s | 0.354 s | 0.202 s |
-  | `fib(25)` | 0.009 s | 0.081 s | 0.064 s |
-  | vector objects (500k `a.add(d)`) | 0.080 s | 0.486 s | 0.428 s |
-  | same, `__slots__` | 0.075 s | 0.483 s | 0.360 s |
-  | method calls updating attributes (500k) | 0.036 s | 0.236 s | 0.187 s |
-  | same, `__slots__` | 0.034 s | 0.239 s | 0.157 s |
-  | list build and scan (1M) | 0.101 s | 0.333 s | 0.174 s |
+  | int loop (2M) | 0.105 s | 0.162 s | 0.136 s |
+  | `fib(25)` | 0.008 s | 0.030 s | 0.039 s |
+  | vector objects (500k `a.add(d)`) | 0.083 s | 0.271 s | 0.333 s |
+  | same, `__slots__` | 0.077 s | 0.204 s | 0.278 s |
+  | method calls updating attributes (500k) | 0.036 s | 0.117 s | 0.127 s |
+  | same, `__slots__` | 0.035 s | 0.096 s | 0.101 s |
+  | list build and scan (1M) | 0.099 s | 0.150 s | 0.137 s |
 
-  The JIT is 1.1-2x faster than the interpreter, but still 2-7x slower than CPython 3.14's specializing interpreter: every value is still a boxed Python object, each call checks its arguments and sets up a frame, and each instruction calls a helper. What closes the gap: unboxed `int`/`float` registers (no allocation in arithmetic), direct calls between compiled functions that skip the checks the types already prove, and inline machine code for refcounting and attribute slots instead of helper calls.
+**Interpreter performance.** `crates/lizzard-py/bench/count.sh` counts machine instructions per unit of work with Valgrind (deterministic, unlike timings). At first the interpreter needed 3.9x CPython's instructions per loop iteration, 5.0x per method call and 6.8x per `fib` call. The causes, measured, and what was done:
+- **Dispatch was half the time.** Each instruction went through `step`, one large function returning `PyResult<Option<Exit>>`: about 45 machine instructions of overhead each. The interpreter loop now runs the common instructions itself on the raw slots, with the helpers compiled code uses (`ops.rs`), and handles exceptions only when one is raised; the rest still go through `step`.
+- **The IR was twice as long as needed.** An assignment from a temporary was `Move` (incref) plus `Unbind` (decref): it is now `Take`, which moves the reference. A branch on a comparison was compare, check of the result's type, truthiness and branch: it is now `CompareBool` (only the truth matters, so neither the bool object nor its check is needed). `i * i` boxed `i` twice: the box is reused.
+- **Globals and builtins were looked up in dicts every time** (a builtin missed the globals first). `LoadGlobal` sites now cache the value (`globals.rs`): a dict watcher on the module's globals and the builtins bumps an epoch on any change; readers take no lock (a sequence counter guards the entry) and take the value with `PyUnstable_TryIncRef`, CPython 3.14's API for reading an object another thread may release.
+- **Calls were expensive:** CPython's vectorcall dispatch, a panic guard, a `Vec` of arguments, argument checks through PyO3, a frame from a thread-local pool, two scans to release it. A call between Lizzard functions is now direct (a type-pointer test), the arguments go straight into a frame on the Rust stack, checks are decided by type pointers when they can be, and `return` hands over its register's reference.
+- **Int and float operations went through CPython's generic paths** (`PyObject_RichCompare` alone was about 160 instructions for `n < 2`). As in CPython's specializing interpreter, `+ - *` and comparisons of exact compact ints, and `+ - * /` and comparisons of exact floats, are computed in place (the layout read is checked against CPython's own results at start-up, else the fast paths stay off).
+- **Recursion:** calls between Lizzard functions recurse on the C stack, and nothing bounded that: deep recursion crashed. Frames now enter CPython's recursion check, which raises RecursionError before the stack runs out (the interpreter crate is built with `opt-level = 1` in debug builds so that its frames fit CPython's margin).
+
+  Now (instructions per unit, CPython / interpreter): loop iteration 577 / 1151 (2.0x), method call 936 / 2796 (3.0x), `fib(10)` 84k / 252k (3.0x). What remains:
+  - **Attribute access on instances with a `__dict__`.** CPython's specialized bytecodes read an instance's inline attribute storage directly (about 20 machine instructions); no public C API reaches it, so Lizzard goes through `PyObject_GenericGetAttr`/`SetAttr` (about 140 each). `__slots__` classes use the inline cache instead.
+  - **Dispatch** is about 29 machine instructions per IR instruction against CPython's ~10: the IR is a Rust enum with vectors inside, matched instruction by instruction. A dense encoding would bring it down.
+  - **Constructing instances** (`V(x, y)`) goes through `type.__call__`, `__new__` and a lookup of `__init__`; CPython specializes the whole sequence.
+  - **Result checks** after operations whose operands are not exact builtins (a `float` attribute read from an instance is checked when read).
 - Every test program runs compiled and interpreted, and both must match CPython.
 
 **Behaviour decisions:**
