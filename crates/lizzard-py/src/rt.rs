@@ -99,3 +99,93 @@ pub fn describe(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<String> {
     }
     Ok(obj.get_type().name()?.to_string())
 }
+
+/// A check with its classes looked up, for one check site: resolving a
+/// qualified name on every check would dominate calls.
+pub enum Ck {
+    Any,
+    Int,
+    Float,
+    Bool,
+    Str,
+    None,
+    Tuple,
+    Class(Py<PyAny>),
+    Callable,
+    Union(Vec<Ck>),
+    /// Checked by `check` (NumPy arrays).
+    Other(RtCheck),
+}
+
+pub fn prepare(py: Python<'_>, c: &RtCheck) -> Ck {
+    match c {
+        RtCheck::Any => Ck::Any,
+        RtCheck::Int => Ck::Int,
+        RtCheck::Float => Ck::Float,
+        RtCheck::Bool => Ck::Bool,
+        RtCheck::Str => Ck::Str,
+        RtCheck::None => Ck::None,
+        RtCheck::Tuple => Ck::Tuple,
+        RtCheck::Instance(q) => match resolve(py, q) {
+            Some(cls) => Ck::Class(cls.unbind()),
+            None => Ck::Any,
+        },
+        RtCheck::Callable => Ck::Callable,
+        RtCheck::Union(cs) => Ck::Union(cs.iter().map(|c| prepare(py, c)).collect()),
+        c @ RtCheck::NdArray { .. } => Ck::Other(c.clone()),
+    }
+}
+
+fn passes(py: Python<'_>, obj: &Bound<'_, PyAny>, ck: &Ck) -> PyResult<bool> {
+    Ok(match ck {
+        Ck::Any => true,
+        Ck::Int => obj.is_instance_of::<PyInt>(),
+        Ck::Float => obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyInt>(),
+        Ck::Bool => obj.is_instance_of::<PyBool>(),
+        Ck::Str => obj.is_instance_of::<PyString>(),
+        Ck::None => obj.is_none(),
+        Ck::Tuple => obj.is_instance_of::<PyTuple>(),
+        // The exact class first: a pointer comparison.
+        Ck::Class(cls) => obj.get_type().is(cls.bind(py)) || obj.is_instance(cls.bind(py))?,
+        Ck::Callable => obj.is_callable(),
+        Ck::Union(cs) => {
+            for c in cs {
+                if passes(py, obj, c)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        Ck::Other(c) => check(py, obj, c)?.is_ok(),
+    })
+}
+
+/// `check` for a prepared check.
+pub fn check_prepared(py: Python<'_>, obj: &Bound<'_, PyAny>, ck: &Ck) -> PyResult<Result<(), String>> {
+    if passes(py, obj, ck)? {
+        return Ok(Ok(()));
+    }
+    Ok(Err(describe(py, obj)?))
+}
+
+/// The part of a check that type pointers decide: true when `o` passes for
+/// sure; false when the full check must decide.
+///
+/// # Safety
+/// `o` is a valid object.
+pub unsafe fn quick(o: *mut pyo3::ffi::PyObject, ck: &Ck) -> bool {
+    use pyo3::ffi;
+    unsafe {
+        match ck {
+            Ck::Any => true,
+            Ck::Int => ffi::PyLong_CheckExact(o) != 0,
+            Ck::Float => ffi::PyFloat_CheckExact(o) != 0 || ffi::PyLong_CheckExact(o) != 0,
+            Ck::Bool => o == ffi::Py_True() || o == ffi::Py_False(),
+            Ck::Str => ffi::PyUnicode_CheckExact(o) != 0,
+            Ck::None => o == ffi::Py_None(),
+            Ck::Tuple => ffi::PyTuple_CheckExact(o) != 0,
+            Ck::Class(c) => ffi::Py_TYPE(o) as *mut ffi::PyObject == c.as_ptr(),
+            _ => false,
+        }
+    }
+}

@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 const _: () = assert!(std::mem::size_of::<*mut ffi::PyObject>() == std::mem::size_of::<u64>());
 
 pub struct Regs {
-    slots: Box<[u64]>,
+    slots: Vec<u64>,
     /// Which registers hold objects.
     objs: Arc<[bool]>,
 }
@@ -29,7 +29,9 @@ pub fn unbound() -> PyErr {
 
 impl Regs {
     pub fn new(objs: Arc<[bool]>) -> Regs {
-        Regs { slots: vec![0; objs.len()].into_boxed_slice(), objs }
+        let mut slots = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+        slots.resize(objs.len(), 0);
+        Regs { slots, objs }
     }
 
     /// The slots, for compiled code.
@@ -113,17 +115,30 @@ impl Regs {
     }
 }
 
+thread_local! {
+    /// Slot buffers of finished frames, reused so that a call allocates
+    /// nothing.
+    static POOL: std::cell::RefCell<Vec<Vec<u64>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Drop for Regs {
     fn drop(&mut self) {
-        if !self.slots.iter().zip(self.objs.iter()).any(|(s, o)| *o && *s != 0) {
-            return;
-        }
-        Python::attach(|_| {
-            for (s, o) in self.slots.iter().zip(self.objs.iter()) {
-                if *o && *s != 0 {
-                    // SAFETY: the frame owns these references; attached.
-                    unsafe { ffi::Py_DecRef(*s as *mut ffi::PyObject) };
+        if self.slots.iter().zip(self.objs.iter()).any(|(s, o)| *o && *s != 0) {
+            Python::attach(|_| {
+                for (s, o) in self.slots.iter_mut().zip(self.objs.iter()) {
+                    if *o && *s != 0 {
+                        // SAFETY: the frame owns these references; attached.
+                        unsafe { ffi::Py_DecRef(std::mem::take(s) as *mut ffi::PyObject) };
+                    }
                 }
+            });
+        }
+        let mut slots = std::mem::take(&mut self.slots);
+        slots.clear();
+        let _ = POOL.try_with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < 64 {
+                p.push(slots);
             }
         });
     }

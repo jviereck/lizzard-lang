@@ -27,7 +27,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Module};
-use lizzard_py_front::ir::{BinOp, FuncIr, Instr, Repr};
+use lizzard_py_front::ir::{BinOp, CmpOp, FuncIr, Instr, Repr};
 
 /// The helper executed the instruction; continue with the next one.
 pub const NEXT: u32 = 0;
@@ -51,6 +51,57 @@ pub struct Helpers {
     /// stop-the-world pause happen (`NEXT` or `ERROR`). Called every
     /// `FUEL` loop iterations.
     pub safepoint: usize,
+    /// The hot object instructions, with their operands as immediates
+    /// (`NEXT` or `ERROR`, except `konst`):
+    /// `load_attr(regs, dst, obj, name, ic)`
+    pub load_attr: usize,
+    /// `store_attr(regs, obj, val, name, ic)`
+    pub store_attr: usize,
+    /// `konst(regs, dst, obj)`: store a new reference to `obj`.
+    pub konst: usize,
+    /// `mov(regs, dst, src)` for objects.
+    pub mov: usize,
+    /// `box_i64(regs, dst, src)`
+    pub box_i64: usize,
+    /// `truthy(regs, dst, src)`
+    pub truthy: usize,
+    /// `binop(regs, dst, a, b, op)`: `op` is the `BinOp`'s index, plus 16
+    /// in place.
+    pub binop: usize,
+    /// `compare(regs, dst, a, b, op)` with CPython's `Py_LT`... codes.
+    pub compare: usize,
+    /// `ret(ctx, regs, src)`: hand `src` to the runtime as the return value
+    /// (`NEXT`, then the code exits) or `ERROR`.
+    pub ret: usize,
+    /// `call(ctx, regs, pc)` for `Call` and `CallMethod`.
+    pub call: usize,
+    /// `for_iter(ctx, regs, dst, iter, pc)`: `NEXT`, `TAKEN` at the end, or
+    /// `ERROR`.
+    pub for_iter: usize,
+    /// `check(ctx, regs, reg, check, pc)`
+    pub check: usize,
+}
+
+/// What follows a helper call's status.
+#[derive(Clone, Copy)]
+enum After {
+    /// No status: continue.
+    Nothing,
+    /// `NEXT` continues, anything else raises.
+    Next,
+    /// `NEXT` leaves the function (it returned).
+    Exit,
+    /// `NEXT` continues, `TAKEN` jumps to the target, else it raises.
+    Branch(u32),
+}
+
+/// The objects compiled code refers to by address: the function's
+/// constants and interned names. They must outlive the code.
+pub struct Objects<'a> {
+    pub consts: &'a [usize],
+    pub names: &'a [usize],
+    /// Each instruction's inline cache.
+    pub ics: &'a [usize],
 }
 
 /// Loop iterations between safepoints.
@@ -59,7 +110,7 @@ const FUEL: i64 = 1024;
 pub type Entry = unsafe extern "C" fn(ctx: *mut c_void, regs: *mut u64, pc: *mut u32, pending: u32) -> u32;
 
 /// Compile `ir`. The code lives as long as the process.
-pub fn compile(ir: &FuncIr, helpers: &Helpers) -> Result<Entry, String> {
+pub fn compile(ir: &FuncIr, helpers: &Helpers, objects: &Objects) -> Result<Entry, String> {
     let jb = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).map_err(|e| e.to_string())?;
     let mut module = JITModule::new(jb);
     let ptr = module.target_config().pointer_type();
@@ -76,7 +127,7 @@ pub fn compile(ir: &FuncIr, helpers: &Helpers) -> Result<Entry, String> {
     {
         let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
         let mut sigs = Sigs::default();
-        Lower::new(b, ir, helpers, ptr, &mut sigs, &module).lower();
+        Lower::new(b, ir, helpers, objects, ptr, &mut sigs, &module).lower();
     }
     if std::env::var_os("LIZZARD_JIT_DUMP").is_some() {
         eprintln!("; {}\n{}", ir.name, ctx.func.display());
@@ -95,12 +146,17 @@ struct Sigs {
     step: Option<SigRef>,
     catch: Option<SigRef>,
     safepoint: Option<SigRef>,
+    /// Helpers taking the slots and N 32-bit operands (plus a pointer
+    /// operand for some), returning a status.
+    by_shape: std::collections::HashMap<(bool, usize, usize, bool), SigRef>,
 }
 
 struct Lower<'a> {
     b: FunctionBuilder<'a>,
     ir: &'a FuncIr,
     h: &'a Helpers,
+    objects: &'a Objects<'a>,
+    call_conv: cranelift_codegen::isa::CallConv,
     ptr: types::Type,
     sigs: &'a mut Sigs,
     /// One block per instruction.
@@ -119,7 +175,7 @@ struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(mut b: FunctionBuilder<'a>, ir: &'a FuncIr, h: &'a Helpers, ptr: types::Type, sigs: &'a mut Sigs, module: &JITModule) -> Lower<'a> {
+    fn new(mut b: FunctionBuilder<'a>, ir: &'a FuncIr, h: &'a Helpers, objects: &'a Objects<'a>, ptr: types::Type, sigs: &'a mut Sigs, module: &JITModule) -> Lower<'a> {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -143,7 +199,8 @@ impl<'a> Lower<'a> {
         b.append_block_param(fail, types::I32);
         let fuel = b.declare_var(types::I64);
         let frontend = module.target_config();
-        let mut l = Lower { b, ir, h, ptr, sigs, blocks, catch_blocks, exit, fail, ctx: ps[0], regs: ps[1], pcp: ps[2], fuel, frontend };
+        let call_conv = module.isa().default_call_conv();
+        let mut l = Lower { b, ir, h, objects, call_conv, ptr, sigs, blocks, catch_blocks, exit, fail, ctx: ps[0], regs: ps[1], pcp: ps[2], fuel, frontend };
         l.entry(ps[3]);
         l
     }
@@ -347,8 +404,106 @@ impl<'a> Lower<'a> {
                 self.next(i);
             }
             Instr::Unbind { reg } if self.repr(*reg) != Repr::Obj => self.next(i),
+            Instr::Const { dst, idx } => {
+                let obj = self.objects.consts[*idx as usize];
+                self.helper(i, self.h.konst, false, &[*dst], &[obj], After::Nothing);
+            }
+            Instr::Move { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.helper(i, self.h.mov, false, &[*dst, *src], &[], After::Next),
+            Instr::LoadAttr { dst, obj, name } => {
+                let ptrs = [self.objects.names[*name as usize], self.objects.ics[i]];
+                self.helper(i, self.h.load_attr, false, &[*dst, *obj], &ptrs, After::Next);
+            }
+            Instr::StoreAttr { obj, name, val } => {
+                let ptrs = [self.objects.names[*name as usize], self.objects.ics[i]];
+                self.helper(i, self.h.store_attr, false, &[*obj, *val], &ptrs, After::Next);
+            }
+            Instr::Return { src } => self.helper(i, self.h.ret, true, &[*src], &[], After::Exit),
+            Instr::Call { .. } | Instr::CallMethod { .. } => self.helper(i, self.h.call, true, &[i as u32], &[], After::Next),
+            Instr::ForIter { dst, iter, target } => self.helper(i, self.h.for_iter, true, &[*dst, *iter, i as u32], &[], After::Branch(*target)),
+            Instr::Check { reg, check } => self.helper(i, self.h.check, true, &[*reg, *check, i as u32], &[], After::Next),
+            Instr::Box { dst, src } if self.repr(*src) == Repr::I64 => self.helper(i, self.h.box_i64, false, &[*dst, *src], &[], After::Next),
+            Instr::Truthy { dst, src } => self.helper(i, self.h.truthy, false, &[*dst, *src], &[], After::Next),
+            Instr::BinOp { dst, op, a, b, inplace } => {
+                let code = *op as u32 + if *inplace { 16 } else { 0 };
+                self.helper(i, self.h.binop, false, &[*dst, *a, *b, code], &[], After::Next);
+            }
+            Instr::Compare { dst, op, a, b } if matches!(op, CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) => {
+                // CPython's Py_LT, Py_LE, Py_EQ, Py_NE, Py_GT, Py_GE.
+                let code = match op {
+                    CmpOp::Lt => 0,
+                    CmpOp::Le => 1,
+                    CmpOp::Eq => 2,
+                    CmpOp::Ne => 3,
+                    CmpOp::Gt => 4,
+                    _ => 5,
+                };
+                self.helper(i, self.h.compare, false, &[*dst, *a, *b, code], &[], After::Next);
+            }
             instr => self.call_step(i, instr),
         }
+    }
+
+    /// Call a raw helper `f(regs, ops..., ptrs...)` for instruction `i`,
+    /// then continue (or raise, when it returns a status).
+    fn helper(&mut self, i: usize, f: usize, ctx: bool, ops: &[u32], ptrs: &[usize], after: After) {
+        let status = !matches!(after, After::Nothing);
+        let key = (ctx, ops.len(), ptrs.len(), status);
+        let sig = match self.sigs.by_shape.get(&key) {
+            Some(s) => *s,
+            None => {
+                let mut s = Signature::new(self.call_conv);
+                if ctx {
+                    s.params.push(AbiParam::new(self.ptr));
+                }
+                s.params.push(AbiParam::new(self.ptr));
+                s.params.extend(ops.iter().map(|_| AbiParam::new(types::I32)));
+                s.params.extend(ptrs.iter().map(|_| AbiParam::new(self.ptr)));
+                if status {
+                    s.returns.push(AbiParam::new(types::I32));
+                }
+                let r = self.b.import_signature(s);
+                self.sigs.by_shape.insert(key, r);
+                r
+            }
+        };
+        let mut args: Vec<Value> = Vec::new();
+        if ctx {
+            args.push(self.ctx);
+        }
+        args.push(self.regs);
+        for o in ops {
+            args.push(self.b.ins().iconst(types::I32, *o as i64));
+        }
+        for p in ptrs {
+            args.push(self.b.ins().iconst(self.ptr, *p as i64));
+        }
+        let fp = self.b.ins().iconst(self.ptr, f as i64);
+        let call = self.b.ins().call_indirect(sig, fp, &args);
+        if !status {
+            self.next(i);
+            return;
+        }
+        let st = self.b.inst_results(call)[0];
+        let (other, ok) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(st, other, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        match after {
+            After::Exit => {
+                let pc = self.b.ins().iconst(types::I32, i as i64);
+                self.b.ins().jump(self.exit, &[pc.into()]);
+            }
+            _ => self.next(i),
+        }
+        self.b.switch_to_block(other);
+        if let After::Branch(target) = after {
+            let (taken, raised) = (self.b.create_block(), self.b.create_block());
+            let is_taken = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAKEN as i64);
+            self.b.ins().brif(is_taken, taken, &[], raised, &[]);
+            self.b.switch_to_block(taken);
+            self.goto(i, target);
+            self.b.switch_to_block(raised);
+        }
+        self.raise(i);
     }
 
     /// Execute instruction `i` with the `step` helper and continue as it

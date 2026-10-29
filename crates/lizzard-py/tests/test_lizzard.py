@@ -32,6 +32,7 @@ PROPERTIES = HERE / "programs" / "properties.py"
 THREADS = HERE / "programs" / "threads.py"
 PROTOCOLS = HERE / "programs" / "protocols.py"
 LITERALS = HERE / "programs" / "literals.py"
+SLOTS = HERE / "programs" / "slots.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -171,7 +172,7 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])

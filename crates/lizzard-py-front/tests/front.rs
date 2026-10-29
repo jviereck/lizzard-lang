@@ -508,3 +508,11 @@ fn builtin_values_match_protocols() {
         ]
     );
 }
+
+#[test]
+fn slots_list_the_attributes() {
+    let d = check(
+        "class P:\n    __slots__ = (\"x\",)\n\n    def __init__(self, x: float) -> None:\n        self.x: float = x\n        self.y: float = x\n\nclass Q(P):\n    __slots__ = [\"z\"]\n\n    def __init__(self) -> None:\n        super().__init__(1.0)\n        self.z: int = 1\n        self.x = 2.0\n\nclass R:\n    __slots__ = (1,)\n",
+    );
+    assert_eq!(d, ["attribute `y` is not in `__slots__`", "`__slots__` must list string literals"]);
+}

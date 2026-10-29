@@ -28,8 +28,41 @@ pub struct FuncRt {
     /// Its compiled code, once it has run (None if it cannot be compiled).
     pub jit: OnceLock<Option<lizzard_jit::Entry>>,
     pub(crate) consts: Vec<Py<PyAny>>,
-    names: Vec<Py<PyString>>,
+    pub(crate) names: Vec<Py<PyString>>,
+    /// The keyword names of each call with keywords, by pc, as the tuple
+    /// vectorcall takes.
+    kwnames: HashMap<usize, Py<PyTuple>>,
+    /// `ir.checks`, prepared on first use.
+    cks: Vec<PyOnceLock<rt::Ck>>,
+    /// An inline cache per instruction (used by attribute loads and stores
+    /// in compiled code).
+    pub(crate) ics: Vec<jit::AttrIc>,
     table: Table,
+}
+
+impl FuncRt {
+    pub(crate) fn kwnames(&self, pc: usize) -> Option<&Py<PyTuple>> {
+        self.kwnames.get(&pc)
+    }
+
+    /// Check `obj` against check `idx`; on failure, what it is.
+    pub(crate) fn check(&self, py: Python<'_>, idx: u32, obj: &Bound<'_, PyAny>) -> PyResult<Result<(), String>> {
+        let ck = self.ck(py, idx);
+        // SAFETY: a valid object.
+        if unsafe { rt::quick(obj.as_ptr(), ck) } {
+            return Ok(Ok(()));
+        }
+        rt::check_prepared(py, obj, ck)
+    }
+
+    /// Check `idx`, prepared.
+    pub(crate) fn ck(&self, py: Python<'_>, idx: u32) -> &rt::Ck {
+        let cell = &self.cks[idx as usize];
+        match cell.get(py) {
+            Some(ck) => ck,
+            None => cell.get_or_init(py, || rt::prepare(py, &self.ir.checks[idx as usize].check)),
+        }
+    }
 }
 
 impl FuncRt {
@@ -46,15 +79,27 @@ impl FuncRt {
             };
             consts.push(o.unbind());
         }
-        let names = ir.names.iter().map(|n| PyString::intern(py, n).unbind()).collect();
+        let names: Vec<Py<PyString>> = ir.names.iter().map(|n| PyString::intern(py, n).unbind()).collect();
+        let mut kwnames = HashMap::new();
+        for (pc, instr) in ir.code.iter().enumerate() {
+            if let Instr::Call { kwnames: k, .. } | Instr::CallMethod { kwnames: k, .. } = instr {
+                if !k.is_empty() {
+                    kwnames.insert(pc, PyTuple::new(py, k.iter().map(|n| names[*n as usize].bind(py)))?.unbind());
+                }
+            }
+        }
         let objs = ir.reprs.iter().map(|r| *r == Repr::Obj).collect();
-        Ok(FuncRt { ir, objs, jit: OnceLock::new(), consts, names, table })
+        let cks = ir.checks.iter().map(|_| PyOnceLock::new()).collect();
+        let ics = ir.code.iter().map(|_| jit::AttrIc::default()).collect();
+        Ok(FuncRt { ir, objs, jit: OnceLock::new(), consts, names, kwnames, cks, ics, table })
     }
 }
 
 /// A checked Lizzard function, callable from Python.
 #[pyclass(frozen, module = "lizzard._lizzard")]
 pub struct LizzardFunction {
+    /// CPython calls it through this pointer (vectorcall; see `create`).
+    vectorcall: ffi::vectorcallfunc,
     rt: Arc<FuncRt>,
     globals: Py<PyDict>,
     module: String,
@@ -67,17 +112,44 @@ pub struct LizzardFunction {
 
 impl LizzardFunction {
     pub fn new(rt: Arc<FuncRt>, globals: Py<PyDict>, module: String, closure: Vec<Py<PyAny>>, defaults: Vec<Py<PyAny>>) -> LizzardFunction {
-        LizzardFunction { rt, globals, module, closure, defaults }
+        LizzardFunction { vectorcall: lz_vectorcall, rt, globals, module, closure, defaults }
     }
-}
 
-#[pymethods]
-impl LizzardFunction {
-    #[pyo3(signature = (*args, **kwargs))]
-    fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+    /// The function object. The first one also makes the type support
+    /// vectorcall (CPython calls `lz_vectorcall` with the arguments in an
+    /// array: no tuple, no dict) and marks it a method descriptor, so that
+    /// `obj.m(...)` calls it with `obj` first instead of creating a bound
+    /// method, as for Python functions. PyO3 has no option for either, so
+    /// the type is patched once, before any instance is used.
+    pub fn create(py: Python<'_>, f: LizzardFunction) -> PyResult<Py<LizzardFunction>> {
+        static PATCHED: OnceLock<()> = OnceLock::new();
+        let obj = Py::new(py, f)?;
+        PATCHED.get_or_init(|| {
+            let field = &obj.get().vectorcall as *const ffi::vectorcallfunc as usize;
+            let offset = (field - obj.as_ptr() as usize) as ffi::Py_ssize_t;
+            let tp = py.get_type::<LizzardFunction>();
+            let tp = tp.as_type_ptr();
+            // SAFETY: the type object is ours; no instance has been called
+            // yet. `offset` is where every instance keeps its pointer.
+            unsafe {
+                (*tp).tp_vectorcall_offset = offset;
+                let add = ffi::Py_TPFLAGS_HAVE_VECTORCALL | ffi::Py_TPFLAGS_METHOD_DESCRIPTOR;
+                #[cfg(Py_GIL_DISABLED)]
+                (*tp).tp_flags.fetch_or(add, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(Py_GIL_DISABLED))]
+                {
+                    (*tp).tp_flags |= add;
+                }
+                ffi::PyType_Modified(tp);
+            }
+        });
+        Ok(obj)
+    }
+
+    /// Call with checked arguments: run it, or create its generator.
+    fn invoke(&self, py: Python<'_>, bound: Vec<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let ir = &self.rt.ir;
-        let bound = bind_args(ir, &self.rt.consts, &self.defaults, args, kwargs)?;
-        check_args(py, ir, &bound)?;
+        check_args(py, &self.rt, &bound)?;
         if ir.generator {
             // A generator function returns a generator over a new frame.
             let g = LizzardGenerator::new(self.rt.clone(), self.globals.clone_ref(py), self.closure.iter().map(|c| c.clone_ref(py)).collect(), bound);
@@ -86,15 +158,80 @@ impl LizzardFunction {
         run(py, &self.rt, self.globals.bind(py), bound, &self.closure)
     }
 
+    /// A vectorcall: positional arguments then keyword values, with their
+    /// names in `kwnames` (a tuple, or null).
+    fn call_vector(&self, py: Python<'_>, args: &[*mut ffi::PyObject], kwnames: *mut ffi::PyObject) -> PyResult<Py<PyAny>> {
+        let ir = &self.rt.ir;
+        // SAFETY: CPython passes valid borrowed references.
+        let arg = |p: *mut ffi::PyObject| unsafe { Bound::from_borrowed_ptr(py, p) };
+        let nkw = if kwnames.is_null() { 0 } else { unsafe { ffi::PyTuple_GET_SIZE(kwnames) as usize } };
+        // The common case: exactly the positional parameters.
+        if nkw == 0 && args.len() == ir.params.len() && ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw)) {
+            return self.invoke(py, args.iter().map(|p| arg(*p)).collect());
+        }
+        let npos = args.len() - nkw;
+        let pos = PyTuple::new(py, args[..npos].iter().map(|p| arg(*p)))?;
+        let kwargs = if nkw == 0 {
+            None
+        } else {
+            let d = PyDict::new(py);
+            let names = unsafe { Bound::from_borrowed_ptr(py, kwnames) };
+            for (i, n) in names.try_iter()?.enumerate() {
+                d.set_item(n?, arg(args[npos + i]))?;
+            }
+            Some(d)
+        };
+        let bound = bind_args(ir, &self.rt.consts, &self.defaults, &pos, kwargs.as_ref())?;
+        self.invoke(py, bound)
+    }
+}
+
+/// CPython's entry into a Lizzard function (vectorcall protocol).
+unsafe extern "C" fn lz_vectorcall(callable: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargsf: usize, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: CPython calls this with the thread attached, `callable` a
+    // LizzardFunction (the vectorcall slot is only set on that type), and
+    // `nargs` arguments plus one per keyword name in `args`.
+    let py = unsafe { Python::assume_attached() };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let f = unsafe { Bound::from_borrowed_ptr(py, callable) };
+        let f = unsafe { f.cast_unchecked::<LizzardFunction>() };
+        let nargs = unsafe { ffi::PyVectorcall_NARGS(nargsf) } as usize;
+        let nkw = if kwnames.is_null() { 0 } else { unsafe { ffi::PyTuple_GET_SIZE(kwnames) as usize } };
+        let all = if nargs + nkw == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(args, nargs + nkw) } };
+        f.get().call_vector(py, all, kwnames)
+    }));
+    match r {
+        Ok(Ok(v)) => v.into_ptr(),
+        Ok(Err(e)) => {
+            e.restore(py);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            pyo3::panic::PanicException::new_err("panic in a Lizzard function").restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" {
+    /// A bound method (`types.MethodType(func, obj)`).
+    fn PyMethod_New(func: *mut ffi::PyObject, obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
+}
+
+#[pymethods]
+impl LizzardFunction {
+    #[pyo3(signature = (*args, **kwargs))]
+    fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let bound = bind_args(&self.rt.ir, &self.rt.consts, &self.defaults, args, kwargs)?;
+        self.invoke(py, bound)
+    }
+
     /// Bind as a method when stored in a class, like a Python function.
     fn __get__<'py>(slf: Bound<'py, Self>, instance: Option<Bound<'py, PyAny>>, _owner: Option<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         match instance {
-            Some(obj) if !obj.is_none() => {
-                static METHOD_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-                let mt = METHOD_TYPE.get_or_try_init(py, || py.import("types")?.getattr("MethodType").map(|m| m.unbind()))?;
-                mt.bind(py).call1((slf, obj))
-            }
+            // SAFETY: valid objects in; a new reference or NULL out.
+            Some(obj) if !obj.is_none() => unsafe { Bound::from_owned_ptr_or_err(py, PyMethod_New(slf.as_ptr(), obj.as_ptr())) },
             _ => Ok(slf.into_any()),
         }
     }
@@ -224,27 +361,28 @@ fn english_list(items: &[String]) -> String {
 
 /// Check bound arguments against the parameters' types (each item of
 /// `*args`, each value of `**kwargs`).
-fn check_args(py: Python<'_>, ir: &FuncIr, bound: &[Bound<'_, PyAny>]) -> PyResult<()> {
+fn check_args(py: Python<'_>, f: &FuncRt, bound: &[Bound<'_, PyAny>]) -> PyResult<()> {
+    let ir = &f.ir;
     for (p, v) in ir.params.iter().zip(bound) {
         let c = &ir.checks[p.check as usize];
         let fail = |what: String, got: String| Err(PyTypeError::new_err(format!("{}() argument {what}: expected {}, got {got}", ir.name, c.expected)));
         match p.kind {
             ParamKind::VarPos => {
                 for (i, item) in v.try_iter()?.enumerate() {
-                    if let Err(got) = rt::check(py, &item?, &c.check)? {
+                    if let Err(got) = f.check(py, p.check, &item?)? {
                         return fail(format!("'{}[{i}]'", p.name), got);
                     }
                 }
             }
             ParamKind::VarKw => {
                 for (k, item) in v.cast::<PyDict>().map_err(PyErr::from)?.iter() {
-                    if let Err(got) = rt::check(py, &item, &c.check)? {
+                    if let Err(got) = f.check(py, p.check, &item)? {
                         return fail(format!("'{}[{}]'", p.name, k.repr()?), got);
                     }
                 }
             }
             _ => {
-                if let Err(got) = rt::check(py, v, &c.check)? {
+                if let Err(got) = f.check(py, p.check, v)? {
                     return fail(format!("'{}'", p.name), got);
                 }
             }
@@ -356,6 +494,43 @@ fn cell_set(cell: &Bound<'_, PyAny>, val: &Bound<'_, PyAny>) -> PyResult<()> {
     Ok(())
 }
 
+/// Call `callee` with the objects in `args` (the last `kwnames.len()` are
+/// keyword values), by vectorcall; with `slf`, call method `callee` (a name)
+/// of `slf`.
+pub(crate) fn vector_call<'py>(py: Python<'py>, regs: &Regs, slf: Option<*mut ffi::PyObject>, callee: *mut ffi::PyObject, args: &[u32], kwnames: Option<&Py<PyTuple>>) -> PyResult<Bound<'py, PyAny>> {
+    let mut small = [std::ptr::null_mut(); 8];
+    let mut big = Vec::new();
+    let n = args.len() + slf.is_some() as usize;
+    let argv: &mut [*mut ffi::PyObject] = if n <= small.len() {
+        &mut small[..n]
+    } else {
+        big.resize(n, std::ptr::null_mut());
+        &mut big
+    };
+    let mut k = 0;
+    if let Some(s) = slf {
+        argv[0] = s;
+        k = 1;
+    }
+    for r in args {
+        argv[k] = regs.obj(py, *r)?.as_ptr();
+        k += 1;
+    }
+    let kw = kwnames.map_or(std::ptr::null_mut(), |t| t.as_ptr());
+    let nkw = kwnames.map_or(0, |t| t.bind(py).len());
+    let nargs = n - nkw;
+    // SAFETY: `argv` holds borrowed references the frame keeps alive for the
+    // call; `kw` is a tuple of the keyword names or NULL. A new reference or
+    // NULL comes back.
+    let r = unsafe {
+        match slf {
+            Some(_) => ffi::PyObject_VectorcallMethod(callee, argv.as_ptr(), nargs, kw),
+            None => ffi::PyObject_Vectorcall(callee, argv.as_ptr(), nargs, kw),
+        }
+    };
+    unsafe { Bound::from_owned_ptr_or_err(py, r) }
+}
+
 /// The exception `raise x` raises: `x`, or an instance of the class `x`.
 fn exception_instance<'py>(x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let e = if x.is_instance_of::<PyType>() { x.call0()? } else { x.clone() };
@@ -415,7 +590,7 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
             for r in defaults {
                 dv.push(obj!(py, regs, *r).clone().unbind());
             }
-            let func = Py::new(py, LizzardFunction::new(rt, globals.clone().unbind(), module, cl, dv))?;
+            let func = LizzardFunction::create(py, LizzardFunction::new(rt, globals.clone().unbind(), module, cl, dv))?;
             regs.set_obj(*dst, func.into_bound(py).into_any());
         }
         Instr::Move { dst, src } => {
@@ -428,22 +603,14 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
             let v = obj!(py, regs, *obj).getattr(f.names[*name as usize].bind(py))?;
             regs.set_obj(*dst, v);
         }
-        Instr::Call { dst, func, args, kwnames } => {
-            let npos = args.len() - kwnames.len();
-            let mut pos = Vec::with_capacity(npos);
-            for r in &args[..npos] {
-                pos.push(obj!(py, regs, *r).clone());
-            }
-            let kwargs = if kwnames.is_empty() {
-                None
-            } else {
-                let d = PyDict::new(py);
-                for (r, n) in args[npos..].iter().zip(kwnames) {
-                    d.set_item(f.names[*n as usize].bind(py), obj!(py, regs, *r))?;
-                }
-                Some(d)
-            };
-            let v = obj!(py, regs, *func).call(PyTuple::new(py, pos)?, kwargs.as_ref())?;
+        Instr::Call { dst, func, args, .. } => {
+            let callee = obj!(py, regs, *func).as_ptr();
+            let v = vector_call(py, regs, None, callee, args, f.kwnames.get(pc))?;
+            regs.set_obj(*dst, v);
+        }
+        Instr::CallMethod { dst, obj, name, args, .. } => {
+            let o = obj!(py, regs, *obj).as_ptr();
+            let v = vector_call(py, regs, Some(o), f.names[*name as usize].as_ptr(), args, f.kwnames.get(pc))?;
             regs.set_obj(*dst, v);
         }
         Instr::CallEx { dst, func, args, kwargs } => {
@@ -801,7 +968,7 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
         }
         Instr::Check { reg, check } => {
             let c = &ir.checks[*check as usize];
-            if let Err(got) = rt::check(py, obj!(py, regs, *reg), &c.check)? {
+            if let Err(got) = f.check(py, *check, obj!(py, regs, *reg))? {
                 let line = ir.lines[*pc];
                 let origin = c.origin.as_ref().map(|o| format!(" (declared at {o})")).unwrap_or_default();
                 return Err(PyTypeError::new_err(format!("{}:{line}: {} should be {}{origin}, got {got}", ir.file, c.what, c.expected)));

@@ -30,13 +30,13 @@ impl CompiledModule {
     }
 
     /// The function `name`, with `globals` as its module namespace.
-    fn make_function(&self, name: &str, globals: Bound<'_, PyDict>) -> PyResult<LizzardFunction> {
+    fn make_function(&self, py: Python<'_>, name: &str, globals: Bound<'_, PyDict>) -> PyResult<Py<LizzardFunction>> {
         let f = self.funcs.iter().find(|f| f.ir.key == name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_string()))?;
         let module = match globals.get_item("__name__")? {
             Some(n) => n.extract()?,
             None => String::new(),
         };
-        Ok(LizzardFunction::new(f.clone(), globals.unbind(), module, Vec::new(), Vec::new()))
+        LizzardFunction::create(py, LizzardFunction::new(f.clone(), globals.unbind(), module, Vec::new(), Vec::new()))
     }
 }
 
@@ -94,6 +94,7 @@ fn _lizzard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledModule>()?;
     m.add_class::<LizzardFunction>()?;
     m.add_class::<generator::LizzardGenerator>()?;
+    generator::init_type(m.py());
     m.add_function(wrap_pyfunction!(compile_module, m)?)?;
     m.add_function(wrap_pyfunction!(_stats, m)?)?;
     Ok(())

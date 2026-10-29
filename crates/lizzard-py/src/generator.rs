@@ -63,6 +63,17 @@ pub enum Sent<'py> {
     Return(Bound<'py, PyAny>),
 }
 
+static TYPE: std::sync::atomic::AtomicPtr<ffi::PyTypeObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// `LizzardGenerator`'s type object (set when the module initializes).
+pub fn type_ptr() -> *mut ffi::PyTypeObject {
+    TYPE.load(Ordering::Relaxed)
+}
+
+pub fn init_type(py: Python<'_>) {
+    TYPE.store(py.get_type::<LizzardGenerator>().as_type_ptr(), Ordering::Relaxed);
+}
+
 /// The generator a Lizzard generator function returns.
 #[pyclass(frozen, module = "lizzard._lizzard")]
 pub struct LizzardGenerator {

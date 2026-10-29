@@ -257,7 +257,24 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - **Compiled code** is `fn(ctx, regs, *pc, pending) -> status`. It does the control flow natively: jumps and branches, the unboxed `i64`/`f32`/bool instructions, exception handler dispatch (each instruction's innermost handler is known statically), the entries a generator resumes at (after a `yield`, or at it with an exception pending for `throw`), and the exits (return, yield, error, leaving `*pc` where the interpreter would).
 - **Every other instruction calls the `step` helper**, which runs that one instruction with the interpreter's code: the two engines cannot disagree, and instructions move inline one by one (next: unboxed ints with overflow to `PyLong`, floats, attribute caches).
 - **Safepoints:** every 1024 loop back-edges, compiled code runs signal handlers and detaches briefly, so Ctrl-C and the free-threaded stop-the-world GC work in tight loops.
+- **Hot instructions skip `step`:** constants, moves, attribute loads and stores, binary operators, comparisons, truthiness, boxing, checks, calls, `for` iteration and `return` call small helpers with their operands as immediates, straight into the C API.
+- **Calls use vectorcall.** `LizzardFunction` implements CPython's vectorcall protocol and is a method descriptor (PyO3 offers neither, so the type is patched once at startup): CPython and compiled code call it with the arguments in an array, and `obj.m(...)` passes `obj` first instead of creating a bound method. `obj.m(args)` compiles to `CallMethod` (`PyObject_VectorcallMethod`, which looks `m` up through CPython's type cache) when the arguments are names and literals, so that looking `m` up after them changes nothing. Keyword names are tuples built once per call site, and a frame's slots come from a per-thread pool.
+- **Attribute inline caches.** Each attribute site caches `(type, tp_version_tag) -> member` for `__slots__` attributes and reads or writes the slot with `PyMember_GetOne`/`SetOne`; any change to the class or a base gives it a new version tag, so a stale entry never hits. A site that sees more than 8 types stops caching. Instances with a `__dict__` keep their attributes in CPython's internal storage, which only `PyObject_GetAttr` reaches. The checker accepts `__slots__` and requires the attributes a class adds to be listed.
+- **Checks are prepared once per site** (the class of a check is resolved once, not by name on every call), and pass on an exact type-pointer comparison before trying `isinstance`.
 - Cranelift is built optimized even in debug builds (workspace `Cargo.toml`); compiling then costs about a millisecond per function.
+- **Benchmarks** (`crates/lizzard-py/bench/bench.py`, release build, best of 3, CPython 3.14t on x86-64; `/s` is the `__slots__` variant):
+
+  | | CPython | interpreter | JIT |
+  |---|---|---|---|
+  | int loop (2M) | 0.103 s | 0.354 s | 0.202 s |
+  | `fib(25)` | 0.009 s | 0.081 s | 0.064 s |
+  | vector objects (500k `a.add(d)`) | 0.080 s | 0.486 s | 0.428 s |
+  | same, `__slots__` | 0.075 s | 0.483 s | 0.360 s |
+  | method calls updating attributes (500k) | 0.036 s | 0.236 s | 0.187 s |
+  | same, `__slots__` | 0.034 s | 0.239 s | 0.157 s |
+  | list build and scan (1M) | 0.101 s | 0.333 s | 0.174 s |
+
+  The JIT is 1.1-2x faster than the interpreter, but still 2-7x slower than CPython 3.14's specializing interpreter: every value is still a boxed Python object, each call checks its arguments and sets up a frame, and each instruction calls a helper. What closes the gap: unboxed `int`/`float` registers (no allocation in arithmetic), direct calls between compiled functions that skip the checks the types already prove, and inline machine code for refcounting and attribute slots instead of helper calls.
 - Every test program runs compiled and interpreted, and both must match CPython.
 
 **Behaviour decisions:**
@@ -289,5 +306,5 @@ Top-level code is checked and then run by CPython. It is checked first, so that 
 - `gi_frame`, `gi_code` and `inspect.isgenerator()` for Lizzard generators;
 - decorators other than `@staticmethod`, `@classmethod`, `@property`/`.setter` and `@dataclass`, nested classes, classes inside functions, `__slots__`, metaclasses;
 - `__orig_class__` checks for generic instances at the boundary (a `Stack[int]` is only checked to be a `Stack`);
-- vectorcall entry points; inline fast paths in compiled code (unboxed `int`/`float`, attribute caches); entering compiled code mid-loop (OSR);
+- unboxed `int`/`float` in compiled code, direct compiled-to-compiled calls, inline refcounting; caches for `__dict__` attributes; entering compiled code mid-loop (OSR);
 - direct access for other dtypes and dimensions.

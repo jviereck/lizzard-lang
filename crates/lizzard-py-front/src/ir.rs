@@ -114,6 +114,11 @@ pub enum Instr {
     DelAttr { obj: Reg, name: u32 },
     /// `func(*args[..n - kwnames.len()], **{kwnames: args[rest]})`
     Call { dst: Reg, func: Reg, args: Vec<Reg>, kwnames: Vec<u32> },
+    /// `obj.name(*args[..n - kwnames.len()], **{kwnames: args[rest]})`,
+    /// without creating a bound method (CPython's `PyObject_VectorcallMethod`).
+    /// The method is looked up after the arguments are evaluated, so the
+    /// front end uses it only when they are side-effect free.
+    CallMethod { dst: Reg, obj: Reg, name: u32, args: Vec<Reg>, kwnames: Vec<u32> },
     /// `func(*args, **kwargs)` with a tuple and a dict (calls with `*`/`**`).
     CallEx { dst: Reg, func: Reg, args: Reg, kwargs: Option<Reg> },
     /// `list.extend(iter)`

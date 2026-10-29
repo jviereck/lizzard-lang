@@ -536,6 +536,7 @@ impl<'a> Lower<'a> {
         self.db.mro(c);
         let mut funcs = Vec::new();
         let mut init = None;
+        let mut slots: Option<Vec<String>> = None;
         for s in &cd.body {
             let soff = self.at(s);
             match s {
@@ -570,6 +571,10 @@ impl<'a> Lower<'a> {
                         self.err(soff, "this class attribute assignment is not supported by Lizzard yet");
                         continue;
                     };
+                    if n.id.as_str() == "__slots__" {
+                        slots = Some(self.slot_names(&a.value, soff));
+                        continue;
+                    }
                     match self.db.class_member(c, n.id.as_str()) {
                         Some(Member::Attr(Ty::Any)) | None => {
                             self.err(soff, format!("class attribute `{}` needs a type annotation", n.id.as_str()));
@@ -592,9 +597,38 @@ impl<'a> Lower<'a> {
             init_attr_names(&init.body, &mut names);
             for (n, aoff) in names {
                 self.check_override(c, &n, aoff);
+                // With `__slots__`, an attribute the class adds needs a slot
+                // (a base class's slots or `__dict__` may also hold it).
+                if let Some(sl) = &slots {
+                    let inherited = self.db.mro(c).into_iter().skip(1).any(|k| self.db.class_member(k, &n).is_some());
+                    if !sl.contains(&n) && !sl.iter().any(|x| x == "__dict__") && !inherited {
+                        self.err(aoff, format!("attribute `{n}` is not in `__slots__`"));
+                    }
+                }
             }
         }
         funcs
+    }
+
+    /// The names a `__slots__` assignment lists: a string, or a tuple or list
+    /// of strings.
+    fn slot_names(&mut self, e: &Expr, off: u32) -> Vec<String> {
+        let items: Vec<&Expr> = match e {
+            Expr::Tuple(t) => t.elts.iter().collect(),
+            Expr::List(l) => l.elts.iter().collect(),
+            e => vec![e],
+        };
+        let mut out = Vec::new();
+        for it in items {
+            match it {
+                Expr::StringLiteral(st) => out.push(st.value.to_str().to_string()),
+                _ => {
+                    self.err(off, "`__slots__` must list string literals");
+                    return out;
+                }
+            }
+        }
+        out
     }
 
     /// Check that `name` declared by class `c` is compatible with the member
@@ -2757,6 +2791,23 @@ impl<'a> Lower<'a> {
 
     /// `obj.name`; `path` is `x.name` when `obj` is the local `x`, for
     /// narrowing.
+    /// The type of `obj.attr` (with narrowing), reporting a missing one.
+    fn attr_ty_of(&mut self, obj: &Val, a: &ast::ExprAttribute) -> Ty {
+        let off: u32 = a.attr.range().start().into();
+        let mut origin = None;
+        let ty = match self.attr_type(&obj.ty, a.attr.as_str(), &mut origin) {
+            Ok(t) => t,
+            Err(m) => {
+                self.err(off, m);
+                Ty::Any
+            }
+        };
+        match attr_path(a).and_then(|p| self.narrow.get(&p)) {
+            Some(t) => t.clone(),
+            None => ty,
+        }
+    }
+
     fn attr_of(&mut self, obj: &Val, a: &ast::ExprAttribute, what: String) -> Val {
         let off: u32 = a.attr.range().start().into();
         let name = a.attr.as_str();
@@ -2990,7 +3041,30 @@ impl<'a> Lower<'a> {
             self.reveal(&v.ty, off);
             return v;
         }
-        let fv = self.expr(&c.func);
+        // `obj.m(x, 1)`: a method call without a bound method object, when
+        // looking `m` up after the arguments makes no difference (they are
+        // names and literals).
+        let simple = |e: &Expr| matches!(e, Expr::Name(_) | Expr::NoneLiteral(_)) || literal_value(e).is_some() || matches!(e, Expr::NumberLiteral(_));
+        let method = match &*c.func {
+            Expr::Attribute(a)
+                if !matches!(&*a.value, Expr::Call(sc) if is_builtin_call(sc, "super"))
+                    && c.arguments.args.iter().all(simple)
+                    && c.arguments.keywords.iter().all(|k| k.arg.is_some() && simple(&k.value)) =>
+            {
+                Some(a)
+            }
+            _ => None,
+        };
+        let (fv, method) = match method {
+            Some(a) => {
+                let obj = self.expr(&a.value);
+                let ty = self.attr_ty_of(&obj, a);
+                let o = self.obj(&obj);
+                let n = self.name(a.attr.as_str());
+                (Val { reg: o, ty, repr: Repr::Obj }, Some((o, n)))
+            }
+            None => (self.expr(&c.func), None),
+        };
         if c.arguments.args.iter().any(|a| matches!(a, Expr::Starred(_))) || c.arguments.keywords.iter().any(|k| k.arg.is_none()) {
             return self.star_call(c, fv, off);
         }
@@ -3041,7 +3115,6 @@ impl<'a> Lower<'a> {
             self.reveal(&pos[0].ty, off);
             ret = pos[0].ty.clone();
         }
-        let func = self.obj(&fv);
         let mut args: Vec<Reg> = pos.iter().map(|v| self.obj(v)).collect();
         let mut kwnames = Vec::new();
         for (n, v) in &kws {
@@ -3049,7 +3122,15 @@ impl<'a> Lower<'a> {
             kwnames.push(self.name(n));
         }
         let dst = self.reg(Repr::Obj);
-        self.emit(Instr::Call { dst, func, args, kwnames });
+        match method {
+            Some((obj, name)) => {
+                self.emit(Instr::CallMethod { dst, obj, name, args, kwnames });
+            }
+            None => {
+                let func = self.obj(&fv);
+                self.emit(Instr::Call { dst, func, args, kwnames });
+            }
+        }
         let v = Val { reg: dst, ty: ret, repr: Repr::Obj };
         if !builtin_ctor {
             let what = format!("{}(...)", self.src(&*c.func));
