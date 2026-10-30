@@ -6,16 +6,18 @@
 //! destination register and enters `exec` after the `yield`; `throw` enters
 //! at the `yield` with the exception raised there, so the function's own
 //! handlers see it. An atomic "running" flag stops a second thread (or a
-//! re-entrant call) from resuming it while it runs. A compiled function
-//! needs only the same entries and exits.
+//! re-entrant call) from resuming it while it runs: holding it is what
+//! gives access to the frame, which is resumed in place. A compiled
+//! function needs only the same entries and exits.
 //!
 //! The object implements CPython's generator protocol (`__next__`, `send`,
 //! `throw`, `close`) and is registered as a `collections.abc.Generator`, so
 //! Python code drives it like any generator, and `yield from` works in both
 //! directions.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
 
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
 use pyo3::ffi;
@@ -26,10 +28,21 @@ use crate::frame::Regs;
 use crate::interp::{exec, Exit, FuncRt};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Status {
     Created,
     Suspended,
     Done,
+}
+
+impl Status {
+    fn from(v: u8) -> Status {
+        match v {
+            0 => Status::Created,
+            1 => Status::Suspended,
+            _ => Status::Done,
+        }
+    }
 }
 
 struct Frame {
@@ -45,11 +58,6 @@ struct Frame {
     handled: Option<Py<PyAny>>,
 }
 
-struct GenState {
-    status: Status,
-    /// None once it is done.
-    frame: Option<Frame>,
-}
 
 /// How a generator is resumed.
 pub enum Op<'py> {
@@ -80,9 +88,15 @@ pub struct LizzardGenerator {
     rt: Arc<FuncRt>,
     globals: Py<PyDict>,
     closure: Vec<Py<PyAny>>,
-    state: Mutex<GenState>,
+    status: AtomicU8,
+    /// None once it is done. Only who set `running` touches it.
+    frame: UnsafeCell<Option<Frame>>,
     running: AtomicBool,
 }
+
+// SAFETY: `frame` is used only by the thread that set `running` (or by
+// `Drop`, which has the generator to itself).
+unsafe impl Sync for LizzardGenerator {}
 
 impl LizzardGenerator {
     /// A generator over a new frame with the (checked) arguments.
@@ -92,17 +106,22 @@ impl LizzardGenerator {
             regs.set_obj(i as u32, a);
         }
         let frame = Frame { regs, pc: 0, dst: 0, delegate: None, handled: None };
-        LizzardGenerator { rt, globals, closure, state: Mutex::new(GenState { status: Status::Created, frame: Some(frame) }), running: AtomicBool::new(false) }
+        LizzardGenerator { rt, globals, closure, status: AtomicU8::new(Status::Created as u8), frame: UnsafeCell::new(Some(frame)), running: AtomicBool::new(false) }
     }
 
     fn status(&self) -> Status {
-        self.state.lock().unwrap().status
+        Status::from(self.status.load(Ordering::Acquire))
     }
 
-    fn put(&self, status: Status, frame: Option<Frame>) {
-        let mut st = self.state.lock().unwrap();
-        st.status = status;
-        st.frame = frame;
+    fn set_status(&self, s: Status) {
+        self.status.store(s as u8, Ordering::Release);
+    }
+
+    /// Done: its frame released (which may run Python code; `running` is
+    /// still set).
+    fn finish(&self, slot: &mut Option<Frame>) {
+        self.set_status(Status::Done);
+        drop(slot.take());
     }
 
     /// Resume with a value or an exception; the next value it yields, or the
@@ -117,26 +136,22 @@ impl LizzardGenerator {
     }
 
     fn resume_inner<'py>(&self, py: Python<'py>, op: Op<'py>) -> PyResult<Sent<'py>> {
-        let (status, frame) = {
-            let mut st = self.state.lock().unwrap();
-            (st.status, st.frame.take())
-        };
-        let mut frame = match (status, frame) {
+        // SAFETY: this thread set `running`: the frame is its own.
+        let slot = unsafe { &mut *self.frame.get() };
+        let status = self.status();
+        let frame = match (status, slot.as_mut()) {
             (Status::Created, Some(f)) => match op {
                 // Never started: it is done without running.
                 Op::Throw(e) => {
-                    self.put(Status::Done, None);
+                    self.finish(slot);
                     return Err(e);
                 }
-                Op::Send(v) if !v.is_none() => {
-                    self.put(Status::Created, Some(f));
-                    return Err(PyTypeError::new_err("can't send non-None value to a just-started generator"));
-                }
+                Op::Send(v) if !v.is_none() => return Err(PyTypeError::new_err("can't send non-None value to a just-started generator")),
                 Op::Send(_) => f,
             },
             (Status::Suspended, Some(f)) => f,
             _ => {
-                self.put(Status::Done, None);
+                self.finish(slot);
                 return match op {
                     Op::Send(_) => Ok(Sent::Return(py.None().into_bound(py))),
                     Op::Throw(e) => Err(e),
@@ -156,7 +171,6 @@ impl LizzardGenerator {
                     match r {
                         Ok(Sent::Next(v)) => {
                             frame.delegate = Some(d.unbind());
-                            self.put(Status::Suspended, Some(frame));
                             return Ok(Sent::Next(v));
                         }
                         Ok(Sent::Return(v)) => {
@@ -176,39 +190,45 @@ impl LizzardGenerator {
             }
         }
         let mut pc = frame.pc;
+        self.set_status(Status::Suspended);
         // The generator's own handled exception while it runs, the caller's
-        // otherwise.
-        let outer = handled(py);
-        if let Some(h) = frame.handled.take() {
-            set_handled(&h.into_bound(py));
+        // otherwise (put back only if the generator changed it). Only its
+        // own `except` blocks can leave one when it yields: functions it
+        // calls restore theirs.
+        let r;
+        let own_handled;
+        if self.rt.sets_handled || frame.handled.is_some() {
+            let outer = handled(py);
+            let own = frame.handled.take();
+            if let Some(h) = &own {
+                set_handled(h.bind(py));
+            }
+            r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, pending);
+            let inner = handled(py);
+            if own.is_some() || !inner.is(&outer) {
+                set_handled(&outer);
+            }
+            own_handled = (!inner.is(&outer)).then(|| inner.unbind());
+        } else {
+            r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, pending);
+            own_handled = None;
         }
-        let r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, pending);
-        let inner = handled(py);
-        set_handled(&outer);
-        let mut suspend = |value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
+        let suspend = |value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
             frame.pc = pc;
             frame.dst = dst;
             frame.delegate = delegate.map(Bound::unbind);
-            frame.handled = (!inner.is(&outer)).then(|| inner.clone().unbind());
+            frame.handled = own_handled;
             Sent::Next(value)
         };
         match r {
-            Ok(Exit::Yield { value, dst }) => {
-                let s = suspend(value, dst, None);
-                self.put(Status::Suspended, Some(frame));
-                Ok(s)
-            }
-            Ok(Exit::YieldFrom { value, dst, iter }) => {
-                let s = suspend(value, dst, Some(iter));
-                self.put(Status::Suspended, Some(frame));
-                Ok(s)
-            }
+            Ok(Exit::Yield { value, dst }) => Ok(suspend(value, dst, None)),
+            Ok(Exit::YieldFrom { value, dst, iter }) => Ok(suspend(value, dst, Some(iter))),
             Ok(Exit::Return(v)) => {
-                self.put(Status::Done, None);
+                self.finish(slot);
                 Ok(Sent::Return(v))
             }
             Err(e) => {
-                self.put(Status::Done, None);
+                self.finish(slot);
                 // PEP 479: a StopIteration escaping the body would end the
                 // caller's loop silently.
                 if e.is_instance_of::<PyStopIteration>(py) {
@@ -223,8 +243,10 @@ impl LizzardGenerator {
 
     fn close_gen(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if self.status() != Status::Suspended {
-            if !self.running.load(Ordering::Acquire) {
-                self.put(Status::Done, None);
+            if !self.running.swap(true, Ordering::Acquire) {
+                // SAFETY: `running` was just set by this thread.
+                self.finish(unsafe { &mut *self.frame.get() });
+                self.running.store(false, Ordering::Release);
             }
             return Ok(py.None());
         }
@@ -233,6 +255,30 @@ impl LizzardGenerator {
             Ok(Sent::Return(v)) => Ok(v.unbind()),
             Err(e) if e.is_instance_of::<PyGeneratorExit>(py) || e.is_instance_of::<PyStopIteration>(py) => Ok(py.None()),
             Err(e) => Err(e),
+        }
+    }
+}
+
+/// `ForIter` over Lizzard generator `it` (as `ops::lz_for_iter_py` over
+/// other iterators): `NEXT` with the next item in `dst`, `TAKEN` at the end,
+/// `ERROR` with the exception set.
+///
+/// # Safety
+/// `it` is a LizzardGenerator; `slots` has register `dst`.
+pub(crate) unsafe fn for_iter(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi::PyObject) -> u32 {
+    use lizzard_jit::{ERROR, NEXT, TAKEN};
+    // SAFETY: as required.
+    let g = unsafe { Bound::from_borrowed_ptr(py, it).cast_into_unchecked::<LizzardGenerator>() };
+    match g.get().resume(py, Op::Send(py.None().into_bound(py))) {
+        Ok(Sent::Next(v)) => {
+            // SAFETY: a new reference for the slot.
+            unsafe { crate::ops::put(slots, dst, v.into_ptr()) };
+            NEXT
+        }
+        Ok(Sent::Return(_)) => TAKEN,
+        Err(e) => {
+            e.restore(py);
+            ERROR
         }
     }
 }
@@ -308,7 +354,7 @@ impl LizzardGenerator {
 /// blocks run, as CPython does.
 impl Drop for LizzardGenerator {
     fn drop(&mut self) {
-        let suspended = self.state.get_mut().map(|s| s.status == Status::Suspended).unwrap_or(false);
+        let suspended = self.status() == Status::Suspended;
         if !suspended {
             return;
         }

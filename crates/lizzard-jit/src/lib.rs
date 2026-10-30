@@ -64,6 +64,9 @@ pub const EXIT: u32 = 2;
 pub const ERROR: u32 = 3;
 /// Compiled code stopped: the interpreter continues the frame at `*pc`.
 pub const BAIL: u32 = 4;
+/// A generator yielded at `*pc` (a `Yield`): the value (a new reference)
+/// is the context's `CTX_RET`.
+pub const YIELD: u32 = 5;
 
 /// The context's thread id (free-threaded reference counting compares an
 /// object's owner with it), and where `Return` leaves its value (a new
@@ -264,6 +267,8 @@ pub enum Spec<'a> {
     /// `LoadGlobal`: `value` while the epoch is `epoch`.
     Global { epoch: u64, value: usize },
     Check(Quick),
+    /// `ForIter`: the iterators it met (`ITER_LIST`, ...; 0: none yet).
+    Iter(u8),
     /// `JumpIfNotSelf` of a function object (`func`) that runs this code:
     /// a self tail call loops when it is still that object.
     SelfFunc(usize),
@@ -593,9 +598,9 @@ fn label_blocks(b: &mut FunctionBuilder, is_label: &[bool], carry: &[Vec<(Reg, K
 
 /// The instructions that start a block: jump targets, the instruction
 /// after any that can branch, handler targets, entries.
-/// `list_iter`: `ForIter`s are compiled over lists, falling through to
-/// the next instruction (no label of its own unless jumped to).
-fn label_pcs(ir: &FuncIr, list_iter: bool) -> Vec<bool> {
+/// `list_iter`: which `ForIter`s are compiled over lists, falling through
+/// to the next instruction (no label of its own unless jumped to).
+fn label_pcs(ir: &FuncIr, list_iter: impl std::ops::Fn(usize) -> bool) -> Vec<bool> {
     let n = ir.code.len();
     let mut is_label = vec![false; n];
     if n > 0 {
@@ -603,7 +608,7 @@ fn label_pcs(ir: &FuncIr, list_iter: bool) -> Vec<bool> {
     }
     for (pc, i) in ir.code.iter().enumerate() {
         if let Instr::ForIter { dst, target, .. } = i {
-            if list_iter && ir.reprs[*dst as usize] == Repr::Obj {
+            if list_iter(pc) && ir.reprs[*dst as usize] == Repr::Obj {
                 if (*target as usize) < n {
                     is_label[*target as usize] = true;
                 }
@@ -629,6 +634,18 @@ fn label_pcs(ir: &FuncIr, list_iter: bool) -> Vec<bool> {
         }
     }
     is_label
+}
+
+/// What a `ForIter` has met (`Spec::Iter`): a list's iterator, a Lizzard
+/// generator, or another (or several kinds).
+pub const ITER_LIST: u8 = 1;
+pub const ITER_GEN: u8 = 2;
+pub const ITER_OTHER: u8 = 3;
+
+/// Whether `ForIter` at `pc` is compiled over lists: only lists met it,
+/// or nothing yet (a loop after the one compiled code was entered in).
+fn over_lists(u: &Unit, l: &Layout, pc: usize) -> bool {
+    l.list_iter.is_some() && matches!(u.specs[pc], Spec::Iter(0 | ITER_LIST))
 }
 
 /// Where the `dirty` flag is, in the fuel's stack slot (`Lower::fuel`).
@@ -890,6 +907,8 @@ struct Lower<'a> {
     exit: Block,
     fail: Block,
     bail: Block,
+    /// A `yield`: `YIELD` at its pc.
+    yielded: Block,
     /// `return`: its value (a new reference) and pc.
     ret_block: Block,
     ctx: Value,
@@ -919,7 +938,7 @@ impl<'a> Lower<'a> {
         let ps = b.block_params(entry).to_vec();
         let ptr = module.target_config().pointer_type();
 
-        let is_label = label_pcs(ir, u.speculate && l.list_iter.is_some());
+        let is_label = label_pcs(ir, |pc| u.speculate && over_lists(u, l, pc));
         let live = liveness(ir);
         let carry = carried(u, l.numbers, &is_label, &live, &[]);
         let labels = label_blocks(&mut b, &is_label, &carry);
@@ -929,7 +948,7 @@ impl<'a> Lower<'a> {
             b.append_block_param(blk, types::I32);
             blk
         };
-        let (exit, fail, bail) = (leave(), leave(), leave());
+        let (exit, fail, bail, yielded) = (leave(), leave(), leave(), leave());
         let ret_block = b.create_block();
         b.append_block_param(ret_block, ptr);
         b.append_block_param(ret_block, types::I32);
@@ -953,6 +972,7 @@ impl<'a> Lower<'a> {
             exit,
             fail,
             bail,
+            yielded,
             ret_block,
             ctx: ps[0],
             pcp: ps[2],
@@ -1082,7 +1102,7 @@ impl<'a> Lower<'a> {
         self.release_if_dirty(&cold, regs, true);
         self.b.ins().store(MF, p, self.ctx, CTX_RET);
         self.b.ins().jump(self.exit, &[BlockArg::Value(pc)]);
-        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL)] {
+        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL), (self.yielded, YIELD)] {
             self.b.switch_to_block(blk);
             let pc = self.b.block_params(blk)[0];
             self.b.ins().store(MF, pc, self.pcp, 0);
@@ -2206,11 +2226,13 @@ impl<'a> Lower<'a> {
                 self.generic(pc);
                 self.next(pc);
             }
+            Instr::Yield { src, .. } if self.f.inline.is_none() && self.repr(*src) == Repr::Obj => self.yield_value(pc, *src),
             Instr::JumpIfNotSelf { func, depth, target } => match self.f.u.specs[pc] {
                 Spec::SelfFunc(f) if self.f.inline.is_none() && self.f.vars[*depth as usize].is_some() => self.jump_if_not_self(pc, *func, *depth, *target, f),
                 _ => self.step(pc),
             },
-            Instr::ForIter { dst, iter, target } if self.l.list_iter.is_some() && self.repr(*dst) == Repr::Obj => self.for_iter_list(pc, *dst, *iter, *target),
+            Instr::ForIter { dst, iter, target } if over_lists(self.f.u, self.l, pc) && self.repr(*dst) == Repr::Obj => self.for_iter_list(pc, *dst, *iter, *target),
+            Instr::ForIter { dst, iter, target } if self.f.inline.is_none() && self.repr(*dst) == Repr::Obj => self.for_iter_call(pc, *dst, *iter, *target),
             Instr::ForIter { .. } => self.generic(pc),
             _ => self.step(pc),
         }
@@ -2976,6 +2998,28 @@ impl<'a> Lower<'a> {
         self.f.done = true;
     }
 
+    /// `yield src`: the frame (the generator's) keeps what the code after
+    /// the `yield` reads, and the value goes to the runtime (`YIELD`); the
+    /// generator resumes at the next instruction (a label). Unbound: `step`
+    /// raises.
+    fn yield_value(&mut self, pc: usize, src: Reg) {
+        let start = self.f.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(src, pc, slow);
+        self.incref(p);
+        self.flush(pc);
+        self.b.ins().store(MF, p, self.ctx, CTX_RET);
+        let pcv = self.pc_val(pc);
+        self.b.ins().jump(self.yielded, &[BlockArg::Value(pcv)]);
+        self.f.vals = start;
+        self.b.set_cold_block(slow);
+        self.b.switch_to_block(slow);
+        let was = std::mem::replace(&mut self.slow, true);
+        // (Resumed, it continues at the next instruction from here.)
+        self.step(pc);
+        self.slow = was;
+    }
+
     /// A self tail call's test: the function object that runs this code
     /// (`f`) loops, another one is called.
     fn jump_if_not_self(&mut self, pc: usize, func: Reg, depth: Reg, target: u32, f: usize) {
@@ -3005,6 +3049,47 @@ impl<'a> Lower<'a> {
         let was = std::mem::replace(&mut self.slow, true);
         self.step(pc);
         self.slow = was;
+        self.f.done = true;
+    }
+
+    /// `ForIter` over another iterator (a generator, ...): the helper takes
+    /// the next item (or the end) without the registers in their slots,
+    /// but where a handler would see them; the loop's unboxed values stay
+    /// in registers.
+    fn for_iter_call(&mut self, pc: usize, dst: Reg, iter: Reg, target: u32) {
+        let covered = self.f.ir.handlers.iter().any(|h| h.ranges.iter().any(|(s, e)| (*s as usize) <= pc && pc < *e as usize));
+        if covered {
+            self.flush(pc);
+        } else {
+            // The iterator runs Python code: what borrowed pointers point
+            // into may go.
+            self.secure_borrowed(pc + 1, pc, &[iter]);
+        }
+        if self.f.vals.get(&iter).is_some_and(|v| !v.in_slot) {
+            self.materialize(iter, pc);
+        }
+        self.clobber();
+        let (d, it, p) = (self.i32c(dst), self.i32c(iter), self.pc_val(pc));
+        let (ctx, regs) = (self.ctx, self.f.regs);
+        let st = self.call(self.h.for_iter, &[ctx, regs, d, it, p], Some(types::I32)).unwrap();
+        self.wrote(pc);
+        // NEXT continues, TAKEN jumps, ERROR raises (an unbound iterator
+        // too).
+        let (next, other, taken, raised) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(st, other, &[], next, &[]);
+        self.b.switch_to_block(other);
+        let is_taken = self.b.ins().icmp_imm_u(IntCC::Equal, st, TAKEN as i64);
+        self.b.ins().brif(is_taken, taken, &[], raised, &[]);
+        self.b.set_cold_block(raised);
+        self.b.switch_to_block(raised);
+        let saved = self.f.vals.clone();
+        self.raise(pc);
+        self.f.vals = saved.clone();
+        self.b.switch_to_block(taken);
+        self.goto(pc, target);
+        self.f.vals = saved;
+        self.b.switch_to_block(next);
+        self.goto(pc, pc as u32 + 1);
         self.f.done = true;
     }
 
@@ -3367,7 +3452,7 @@ impl<'a> Lower<'a> {
                 })
             })
             .collect();
-        let is_label = label_pcs(ir, self.f.u.speculate && self.l.list_iter.is_some());
+        let is_label = label_pcs(ir, |pc| callee.speculate && over_lists(callee, self.l, pc));
         let live = liveness(ir);
         // What the caller knows of the arguments: kinds for the analyses.
         let pk: Vec<Kind> = known

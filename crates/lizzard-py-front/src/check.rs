@@ -2396,6 +2396,11 @@ impl<'a> Lower<'a> {
         let o = self.obj(&it);
         let iter = self.reg(Repr::Obj);
         self.emit(Instr::GetIter { dst: iter, obj: o });
+        // A temporary iterable is the iterator's only holder from here (a
+        // generator is its own iterator).
+        if !self.locals.values().any(|l| l.reg == o) {
+            self.emit(Instr::Unbind { reg: o });
+        }
         let top = self.here();
         let x = self.reg(Repr::Obj);
         let exit = self.emit(Instr::ForIter { dst: x, iter, target: 0 });
@@ -2408,6 +2413,9 @@ impl<'a> Lower<'a> {
         let h = self.here();
         self.patch(exit, h);
         self.end_loop(l, top);
+        // The loop lets go of its iterator, as Python does (a generator left
+        // by `break` is finalized now, not when the function ends).
+        self.emit(Instr::Unbind { reg: iter });
         self.narrow = at_top;
     }
 

@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use lizzard_jit::{CallGuard, CallSpec, Entry, Helpers, Layout, Num, Quick, Spec, BAIL, ERROR, EXIT, NEXT, TAKEN};
+use lizzard_jit::{CallGuard, CallSpec, Entry, Helpers, Layout, Num, Quick, Spec, BAIL, ERROR, EXIT, NEXT, TAKEN, YIELD};
 use lizzard_py_front::ir::{Const, Instr, ParamKind};
 use pyo3::ffi;
 use pyo3::panic::PanicException;
@@ -386,6 +386,11 @@ extern "C" fn lz_missed(ctx_: *mut c_void) {
 
 /// The layout of list iterators, if CPython's agrees with what compiled
 /// code reads (checked once on a list being iterated).
+/// The list iterator's type, if compiled code reads list iterators.
+pub(crate) fn list_iter_type() -> Option<usize> {
+    list_iter().map(|l| l.tp)
+}
+
 fn list_iter() -> Option<lizzard_jit::ListIter> {
     static LAYOUT: OnceLock<Option<lizzard_jit::ListIter>> = OnceLock::new();
     *LAYOUT.get_or_init(|| {
@@ -514,6 +519,7 @@ fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth
                 None => Spec::None,
             },
             Instr::Check { check, .. } => Spec::Check(quick(py, f.ck(py, *check))),
+            Instr::ForIter { .. } => Spec::Iter(f.iters[pc].load(std::sync::atomic::Ordering::Relaxed)),
             // The global still this function: compiled code loops.
             Instr::JumpIfNotSelf { func, .. } => match global_of.get(func) {
                 // SAFETY: a valid object (the global's).
@@ -681,6 +687,11 @@ pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, 
         // SAFETY: compiled code stored a new reference.
         EXIT if !ctx.ret.is_null() => Ran::Exit(Exit::Return(unsafe { Bound::from_owned_ptr(py, ctx.ret) })),
         EXIT => Ran::Exit(*ctx.exit.take().expect("compiled code exits with a value")),
+        YIELD => {
+            let Instr::Yield { dst, .. } = f.ir.code[*pc] else { unreachable!("a yield's status at another instruction") };
+            // SAFETY: compiled code stored a new reference.
+            Ran::Exit(Exit::Yield { value: unsafe { Bound::from_owned_ptr(py, ctx.ret) }, dst })
+        }
         BAIL => {
             bailed(f);
             Ran::Bail
@@ -815,9 +826,11 @@ extern "C" fn lz_for_iter(ctx_: *mut c_void, slots: *mut u64, dst: u32, iter: u3
         if it.is_null() {
             return ERROR;
         }
-        // A Lizzard generator resumes directly (no StopIteration): `step`.
+        let t = ctx(ctx_).t();
+        crate::interp::note_iter(t.f, pc as usize, it);
+        // A Lizzard generator resumes directly (no StopIteration).
         if ffi::Py_TYPE(it) == crate::generator::type_ptr() {
-            return lz_step(ctx_, slots, pc);
+            return crate::generator::for_iter(t.py, slots, dst, it);
         }
         lz_for_iter_py(slots, dst, it)
     }

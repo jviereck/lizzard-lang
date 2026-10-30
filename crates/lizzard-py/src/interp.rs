@@ -34,6 +34,9 @@ pub struct FuncRt {
     pub jit: jit::JitCell,
     /// It never writes its parameters (see `lizzard_jit::Unit`).
     pub borrow_params: bool,
+    /// Its code sets the exception being handled (`SetHandled`: an `except`
+    /// block): a generator's own handled exception is saved when it yields.
+    pub(crate) sets_handled: bool,
     pub(crate) consts: Vec<Py<PyAny>>,
     pub(crate) names: Vec<Py<PyString>>,
     /// The keyword names of each call with keywords, by pc, as the tuple
@@ -54,6 +57,8 @@ pub struct FuncRt {
     pub(crate) cics: Vec<OnceLock<Arc<FuncRt>>>,
     /// A global-lookup cache per instruction (used by `LoadGlobal`).
     pub(crate) gics: Vec<globals::GlobalIc>,
+    /// Per `ForIter`: the iterators it has seen (`lizzard_jit::ITER_*`).
+    pub(crate) iters: Vec<std::sync::atomic::AtomicU8>,
     table: Table,
 }
 
@@ -109,6 +114,7 @@ impl FuncRt {
         let cks = ir.checks.iter().map(|_| PyOnceLock::new()).collect();
         let ics = ir.code.iter().map(|_| ops::AttrIc::default()).collect();
         let gics = ir.code.iter().map(|_| globals::GlobalIc::default()).collect();
+        let iters = ir.code.iter().map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
         let mics = ir.code.iter().map(|_| ops::MethodIc::default()).collect();
         let cics = ir.code.iter().map(|_| OnceLock::new()).collect();
         let ops = bytecode::lower(&ir);
@@ -116,7 +122,8 @@ impl FuncRt {
         let positional = ir.params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw));
         let nparams = ir.params.len() as u32;
         let borrow_params = !ir.generator && ir.code.iter().all(|i| matches!(i, Instr::Unbind { .. }) || i.writes().iter().all(|&r| r >= nparams) || matches!(i, Instr::Take { dst, .. } if *dst >= nparams));
-        Ok(FuncRt { ir, objs, positional, jit: jit::JitCell::default(), borrow_params, consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, table })
+        let sets_handled = ir.code.iter().any(|i| matches!(i, Instr::SetHandled { .. }));
+        Ok(FuncRt { ir, objs, positional, jit: jit::JitCell::default(), borrow_params, sets_handled, consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, iters, table })
     }
 }
 
@@ -936,8 +943,12 @@ pub(crate) fn run_interp<'py>(
                             break;
                         }
                     },
-                    Opc::ForIter if get(o.y) != 0 && unsafe { ffi::Py_TYPE(get(o.y) as *mut ffi::PyObject) } != generator::type_ptr() => {
-                        match ops::lz_for_iter_py(slots, o.x, get(o.y) as *mut ffi::PyObject) {
+                    Opc::ForIter if get(o.y) != 0 => {
+                        let it = get(o.y) as *mut ffi::PyObject;
+                        note_iter(f, p, it);
+                        // A Lizzard generator is resumed directly.
+                        let st = if unsafe { ffi::Py_TYPE(it) } == generator::type_ptr() { unsafe { generator::for_iter(py, slots, o.x, it) } } else { ops::lz_for_iter_py(slots, o.x, it) };
+                        match st {
                             TAKEN => {
                                 p = o.z as usize;
                                 continue;
@@ -1163,6 +1174,27 @@ pub(crate) fn tail_depth(d: i64) -> PyResult<()> {
         return Err(pyo3::exceptions::PyRecursionError::new_err("maximum recursion depth exceeded"));
     }
     Ok(())
+}
+
+/// Record the kind of iterator `ForIter` at `pc` meets (for compiled code
+/// to specialize on): a list's, a Lizzard generator, another, or several.
+#[inline]
+pub(crate) fn note_iter(f: &FuncRt, pc: usize, it: *mut ffi::PyObject) {
+    use lizzard_jit::{ITER_GEN, ITER_LIST, ITER_OTHER};
+    // SAFETY: a valid object.
+    let tp = unsafe { ffi::Py_TYPE(it) } as usize;
+    let k = if tp == generator::type_ptr() as usize {
+        ITER_GEN
+    } else if jit::list_iter_type() == Some(tp) {
+        ITER_LIST
+    } else {
+        ITER_OTHER
+    };
+    let c = &f.iters[pc];
+    let old = c.load(std::sync::atomic::Ordering::Relaxed);
+    if old != k && old != ITER_OTHER {
+        c.store(if old == 0 { k } else { ITER_OTHER }, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Whether `o` is a function running `f` with `globals` and `closure`:
@@ -1590,6 +1622,7 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
         }
         Instr::ForIter { dst, iter, target } => {
             let it = obj!(py, regs, *iter);
+            note_iter(f, *pc, it.as_ptr());
             // A Lizzard generator is resumed directly, without an exception
             // at the end.
             if let Ok(g) = it.cast::<LizzardGenerator>() {
