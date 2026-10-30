@@ -319,7 +319,7 @@ fn unit<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth:
         ics: f.ics.iter().map(|c| c as *const AttrIc as usize).collect(),
         borrow_params: f.borrow_params,
         misses: &f.jit.misses as *const AtomicU32 as usize,
-        carry: !f.jit.bail_recompiled.load(Ordering::Relaxed),
+        speculate: !f.jit.bail_recompiled.load(Ordering::Relaxed),
     }
 }
 

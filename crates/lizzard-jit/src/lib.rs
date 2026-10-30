@@ -282,10 +282,11 @@ pub struct Unit<'a> {
     /// The address of a `u32` counting the generic executions of attribute
     /// accesses, global loads and calls compiled without a spec.
     pub misses: usize,
-    /// Registers that hold floats or ints at a label stay unboxed across
-    /// jumps to it (`carried`). Off after bail-outs made the runtime
-    /// recompile.
-    pub carry: bool,
+    /// Compile speculatively: registers that hold floats or ints at a label
+    /// stay unboxed across jumps to it (`carried`), and a failed attribute
+    /// guard bails out, so that what it checked holds after it. Off after
+    /// bail-outs made the runtime recompile.
+    pub speculate: bool,
 }
 
 /// What a register holds at an instruction, as far as compiled code
@@ -320,7 +321,7 @@ fn carried(u: &Unit, numbers: bool, labels: &[bool], live: &[Vec<u64>]) -> Vec<V
     let n = ir.code.len();
     let nregs = ir.reprs.len();
     let mut out = vec![Vec::new(); n];
-    if !u.carry || !numbers || n == 0 {
+    if !u.speculate || !numbers || n == 0 {
         return out;
     }
     let obj = |r: Reg| ir.reprs[r as usize] == Repr::Obj;
@@ -540,7 +541,14 @@ pub fn compile(u: &Unit, h: &Helpers, l: &Layout) -> Result<Entry, String> {
     if std::env::var_os("LIZZARD_JIT_DUMP").is_some() {
         eprintln!("; {}\n{}", u.ir.name, ctx.func.display());
     }
+    let asm = std::env::var_os("LIZZARD_JIT_ASM").is_some();
+    ctx.set_disasm(asm);
     module.define_function(id, &mut ctx).map_err(|e| format!("{e:?}"))?;
+    if asm {
+        if let Some(v) = ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
+            eprintln!("; {} (machine code)\n{v}", u.ir.name);
+        }
+    }
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let code = module.get_finalized_function(id);
     // The module owns the code's memory; it stays mapped for the process.
@@ -651,11 +659,15 @@ struct Virt {
     ty: Option<usize>,
     /// `ptr` is an object the code keeps alive (a constant, an immortal).
     konst: bool,
+    /// `ty` is its type, and that type's version and the object's inline
+    /// values were verified since the last code that could change them
+    /// (anything that runs Python code: a helper, a call).
+    checked: bool,
 }
 
 impl Virt {
     fn ptr(p: Value, in_slot: bool) -> Virt {
-        Virt { ptr: Some(p), in_slot, num: Unboxed::None, ty: None, konst: false }
+        Virt { ptr: Some(p), in_slot, num: Unboxed::None, ty: None, konst: false, checked: false }
     }
 }
 
@@ -691,6 +703,9 @@ struct Fn<'a> {
     done: bool,
     /// Set when it is inlined.
     inline: Option<Inlined>,
+    /// What is known at its first instruction (an inlined function's
+    /// parameters).
+    seed: Vec<(Reg, Virt)>,
 }
 
 /// An inlined callee: its frame and where it continues.
@@ -764,7 +779,7 @@ impl<'a> Lower<'a> {
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed: Vec::new() },
             h,
             l,
             ptr,
@@ -902,10 +917,15 @@ impl<'a> Lower<'a> {
                 }
                 self.b.switch_to_block(blk);
                 self.f.vals.clear();
+                if pc == 0 {
+                    for (r, v) in self.f.seed.clone() {
+                        self.f.vals.insert(r, v);
+                    }
+                }
                 let params = self.b.block_params(blk).to_vec();
                 for (&(r, k), v) in self.f.carry[pc].iter().zip(params) {
                     let (num, ty) = if k == Kind::F { (Unboxed::F64(v), self.l.float_type) } else { (Unboxed::I64(v), self.l.long_type) };
-                    self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: Some(ty), konst: false });
+                    self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: Some(ty), konst: false, checked: false });
                 }
                 self.f.done = false;
             } else if self.f.done {
@@ -979,7 +999,23 @@ impl<'a> Lower<'a> {
         blk
     }
 
+    /// `p` is an `iconst` of None, True or False: immortal.
+    fn immortal(&self, p: Value) -> bool {
+        use cranelift_codegen::ir::{InstructionData, Opcode, ValueDef};
+        let ValueDef::Result(inst, _) = self.b.func.dfg.value_def(p) else { return false };
+        match self.b.func.dfg.insts[inst] {
+            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
+                let v = imm.bits() as usize;
+                v == self.l.none || v == self.l.true_ || v == self.l.false_
+            }
+            _ => false,
+        }
+    }
+
     fn incref(&mut self, p: Value) {
+        if self.immortal(p) {
+            return;
+        }
         match self.l.rc {
             Rc::Calls => {
                 self.call(self.h.incref, &[p], None);
@@ -1019,6 +1055,9 @@ impl<'a> Lower<'a> {
     }
 
     fn decref(&mut self, p: Value) {
+        if self.immortal(p) {
+            return;
+        }
         match self.l.rc {
             Rc::Calls => {
                 self.call(self.h.decref, &[p], None);
@@ -1228,6 +1267,14 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Python code may have run (a helper, a call): types' versions and
+    /// objects' inline values are to be verified again.
+    fn clobber(&mut self) {
+        for v in self.f.vals.values_mut() {
+            v.checked = false;
+        }
+    }
+
     /// Forget what is known about the registers instruction `pc` writes (a
     /// helper wrote them), and reload the scalar ones.
     fn wrote(&mut self, pc: usize) {
@@ -1348,7 +1395,7 @@ impl<'a> Lower<'a> {
             // The unboxed registers too, for a handler.
             for (r, k, v) in carried {
                 let num = if k == Kind::F { Unboxed::F64(v) } else { Unboxed::I64(v) };
-                self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: None, konst: false });
+                self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: None, konst: false, checked: false });
             }
             self.flush(from);
             self.f.vals.clear();
@@ -1397,6 +1444,7 @@ impl<'a> Lower<'a> {
         if self.f.inline.is_some() {
             return self.deopt(pc);
         }
+        self.clobber();
         self.flush(pc);
         let ir = self.f.ir;
         let i = &ir.code[pc];
@@ -1515,6 +1563,7 @@ impl<'a> Lower<'a> {
         if self.f.inline.is_some() {
             return self.deopt(pc);
         }
+        self.clobber();
         self.flush(pc);
         let p = self.pc_val(pc);
         let st = self.call(self.h.step, &[self.ctx, self.f.regs, p], Some(types::I32)).unwrap();
@@ -1577,6 +1626,35 @@ impl<'a> Lower<'a> {
         self.b.ins().brif(r, exit, &[BlockArg::Value(r)], raised, &[]);
         let _ = call_pc;
         self.cont();
+    }
+
+    /// Emit a speculative instruction's failure path: from the state at its
+    /// start, the interpreter executes it (in an inlined function: finishes
+    /// the call). The fast path's state stays: nothing joins it.
+    fn bail_path(&mut self, blk: Block, start: HashMap<Reg, Virt>, pc: usize) {
+        let fast = std::mem::replace(&mut self.f.vals, start);
+        let done = self.f.done;
+        self.b.switch_to_block(blk);
+        if self.f.inline.is_some() {
+            self.deopt(pc);
+        } else {
+            self.bail_to(pc);
+        }
+        self.f.vals = fast;
+        self.f.done = done;
+    }
+
+    /// Whether register `r` is known to be an instance of `tp` with the
+    /// type's version and its inline values verified.
+    fn verified(&self, r: Reg, tp: usize) -> bool {
+        self.f.vals.get(&r).is_some_and(|v| v.ty == Some(tp) && v.checked)
+    }
+
+    fn set_verified(&mut self, r: Reg, tp: usize) {
+        if let Some(v) = self.f.vals.get_mut(&r) {
+            v.ty = Some(tp);
+            v.checked = true;
+        }
     }
 
     /// Emit an instruction's slow path: from the state at the start of the
@@ -1686,19 +1764,19 @@ impl<'a> Lower<'a> {
                     Num::I64(x) => (Unboxed::I64(self.b.ins().iconst(types::I64, x)), Some(self.l.long_type)),
                     Num::Other => (Unboxed::None, None),
                 };
-                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num, ty, konst: true });
+                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num, ty, konst: true, checked: false });
                 self.next(pc);
             }
             Instr::Box { dst, src } if self.repr(*src) == Repr::I64 && self.l.numbers => {
                 let v = self.get_var(*src);
-                self.f.vals.insert(*dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false });
+                self.f.vals.insert(*dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false, checked: false });
                 self.next(pc);
             }
             Instr::Box { dst, src } if self.repr(*src) == Repr::Bool => {
                 let v = self.get_var(*src);
                 let (t, f) = (self.b.ins().iconst(self.ptr, self.l.true_ as i64), self.b.ins().iconst(self.ptr, self.l.false_ as i64));
                 let p = self.b.ins().select(v, t, f);
-                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num: Unboxed::None, ty: None, konst: true });
+                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num: Unboxed::None, ty: None, konst: true, checked: false });
                 self.next(pc);
             }
             Instr::Move { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.move_obj(pc, *dst, *src, false),
@@ -1782,14 +1860,25 @@ impl<'a> Lower<'a> {
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(obj, pc, slow);
-        if self.f.vals[&obj].ty != Some(tp) {
+        if !self.verified(obj, tp) {
             self.guard_type(p, tp, version, slow);
-        }
-        if let Some(valid) = valid {
-            let v = self.b.ins().load(types::I8, MF, p, valid);
-            self.guard(v, slow);
+            if let Some(valid) = valid {
+                let v = self.b.ins().load(types::I8, MF, p, valid);
+                self.guard(v, slow);
+            }
         }
         let v = self.b.ins().load(self.ptr, MF, p, off);
+        if self.f.u.speculate {
+            // Unset: the interpreter decides (AttributeError, `__getattr__`).
+            self.guard(v, slow);
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            self.set_verified(obj, tp);
+            self.f.vals.insert(dst, Virt::ptr(v, false));
+            return self.next(pc);
+        }
         let join = self.b.create_block();
         let x = self.b.append_block_param(join, self.ptr);
         let ok = self.b.create_block();
@@ -1819,14 +1908,14 @@ impl<'a> Lower<'a> {
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(obj, pc, slow);
-        if self.f.vals[&obj].ty != Some(tp) {
+        if !self.verified(obj, tp) {
             self.guard_type(p, tp, version, slow);
-        }
-        if let Some(values) = values {
-            let v = self.b.ins().load(types::I8, MF, p, values + 3);
-            self.guard(v, slow);
-            let d = self.b.ins().load(self.ptr, MF, p, dict);
-            self.guard_eq(d, 0, slow);
+            if let Some(values) = values {
+                let v = self.b.ins().load(types::I8, MF, p, values + 3);
+                self.guard(v, slow);
+                let d = self.b.ins().load(self.ptr, MF, p, dict);
+                self.guard_eq(d, 0, slow);
+            }
         }
         let old = self.b.ins().load(self.ptr, MF, p, off);
         // A first assignment of an inline value also appends its index to
@@ -1909,6 +1998,14 @@ impl<'a> Lower<'a> {
         }
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
+        if self.f.u.speculate {
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            self.set_verified(obj, tp);
+            return self.next(pc);
+        }
         let join = self.b.create_block();
         self.b.ins().jump(join, &[]);
         self.slow_path(slow, start, pc, |s| {
@@ -2031,6 +2128,22 @@ impl<'a> Lower<'a> {
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(reg, pc, slow);
+        if self.f.u.speculate && matches!(q, Quick::FloatOrInt) && self.l.numbers {
+            // Speculatively an exact float (an int bails out), unboxed for
+            // what follows.
+            let t = self.ob_type(p);
+            self.guard_eq(t, self.l.float_type as i64, slow);
+            let x = self.b.ins().load(types::F64, MF, p, self.l.fval);
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            if let Some(v) = self.f.vals.get_mut(&reg) {
+                v.num = Unboxed::F64(x);
+                v.ty = Some(self.l.float_type);
+            }
+            return self.next(pc);
+        }
         self.quick(p, q, slow);
         let join = self.b.create_block();
         self.b.ins().jump(join, &[]);
@@ -2148,7 +2261,7 @@ impl<'a> Lower<'a> {
             s.bail_to(pc + 1);
         });
         self.b.switch_to_block(join);
-        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(r), ty: Some(self.l.float_type), konst: false });
+        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(r), ty: Some(self.l.float_type), konst: false, checked: false });
         self.next(pc);
     }
 
@@ -2225,7 +2338,7 @@ impl<'a> Lower<'a> {
             s.bail_to(pc + 1);
         });
         self.b.switch_to_block(join);
-        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(r), ty: Some(self.l.long_type), konst: false });
+        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(r), ty: Some(self.l.long_type), konst: false, checked: false });
         self.next(pc);
     }
 
@@ -2426,6 +2539,7 @@ impl<'a> Lower<'a> {
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let mut ctor = None;
+        let mut receiver = None;
         match (&spec.guard, func, obj) {
             (CallGuard::Func(f), Some(fr), _) => {
                 let p = self.obj(fr, pc, slow);
@@ -2441,9 +2555,11 @@ impl<'a> Lower<'a> {
             }
             (CallGuard::Method { tp, version, keys, nentries, valid }, _, Some(o)) => {
                 let p = self.obj(o, pc, slow);
-                if self.f.vals[&o].ty != Some(*tp) {
+                if !self.verified(o, *tp) {
                     self.guard_type(p, *tp, *version, slow);
                 }
+                // The callee may rely on the receiver's type.
+                receiver = Some(*tp);
                 if *keys != 0 {
                     let v = self.b.ins().load(types::I8, MF, p, *valid);
                     self.guard(v, slow);
@@ -2492,7 +2608,16 @@ impl<'a> Lower<'a> {
                 self.call(self.h.vectorcall, &[callable, fp, n, none], Some(self.ptr)).unwrap()
             }
             // Not within an inlined function: one level.
-            Some(callee) if self.f.inline.is_none() && inlinable(callee) => self.inline_call(pc, &ptrs, callee, spec.desc),
+            Some(callee) if self.f.inline.is_none() && inlinable(callee) => {
+                // Its first parameter's type is verified: the receiver's,
+                // or the class of the instance just allocated.
+                let first = receiver.or(ctor.map(|(tp, _)| tp));
+                let mut known: Vec<Option<Virt>> = all.iter().map(|r| self.f.vals.get(r).copied()).collect();
+                if ctor.is_some() {
+                    known.insert(0, None);
+                }
+                self.inline_call(pc, &ptrs, &known, callee, spec.desc, first)
+            }
             _ => {
                 let frame = self.frame.expect("a frame for direct calls");
                 for (i, p) in ptrs.iter().enumerate() {
@@ -2531,6 +2656,8 @@ impl<'a> Lower<'a> {
             }
             None => r,
         };
+        // The callee ran Python code.
+        self.clobber();
         self.put(dst, r);
         let join = self.b.create_block();
         self.b.ins().jump(join, &[]);
@@ -2544,7 +2671,7 @@ impl<'a> Lower<'a> {
     /// Compile `callee` here, its parameters `args` (borrowed), its frame
     /// in a stack slot: its result (a new reference), at the end of its
     /// code. An exception leaving it raises at the call (`pc`).
-    fn inline_call(&mut self, pc: usize, args: &[Value], callee: &'a Unit<'a>, desc: usize) -> Value {
+    fn inline_call(&mut self, pc: usize, args: &[Value], known: &[Option<Virt>], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> Value {
         let ir = callee.ir;
         let nregs = ir.reprs.len();
         let frame = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, nregs.max(1) as u32 * 8, 3));
@@ -2576,8 +2703,26 @@ impl<'a> Lower<'a> {
         let fail = self.b.create_block();
         let fail_pc = self.b.append_block_param(fail, types::I32);
         let raised = self.b.create_block();
+        // The parameters' slots hold the arguments, and what the caller
+        // knows about them holds (the first one's type may be verified).
+        let seed: Vec<(Reg, Virt)> = args
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let k = known.get(i).copied().flatten();
+                let mut v = Virt { ptr: Some(p), in_slot: true, num: Unboxed::None, ty: None, konst: false, checked: false };
+                if let Some(k) = k {
+                    v = Virt { num: k.num, ty: k.ty, konst: k.konst, checked: k.checked, ..v };
+                }
+                if let Some(tp) = first.filter(|_| i == 0) {
+                    v.ty = Some(tp);
+                    v.checked = true;
+                }
+                (i as Reg, v)
+            })
+            .collect();
         let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, written: Default::default() };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined) };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
         self.b.ins().jump(first, &[]);
