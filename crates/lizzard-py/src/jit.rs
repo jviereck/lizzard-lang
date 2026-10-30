@@ -292,6 +292,71 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
     }
 }
 
+/// Whether constructing an instance of `tp` may take one about to be
+/// released (`lizzard_jit::Reuse`): no finalizer, a known weak reference
+/// list, and an `__init__` (`init`) that only assigns inline-value
+/// attributes of the instance, the same ones each time.
+fn reuse(tp: *mut ffi::PyTypeObject, init: &lizzard_jit::Unit) -> Option<lizzard_jit::Reuse> {
+    // SAFETY: a class (the cache keeps it alive).
+    unsafe {
+        if (*tp).tp_finalize.is_some() || (*tp).tp_del.is_some() {
+            return None;
+        }
+    }
+    let weakref = weakref_offset(tp)?;
+    let ir = init.ir;
+    let mut values = None;
+    let mut order = Vec::new();
+    let mut members = Vec::new();
+    for (pc, i) in ir.code.iter().enumerate() {
+        if !matches!(i, Instr::Return { .. }) && i.successors(pc as u32) != [pc as u32 + 1] {
+            return None;
+        }
+        if !i.reads().contains(&0) {
+            continue;
+        }
+        if let (Instr::StoreAttr { obj: 0, val, .. }, Spec::Member { off, .. }) = (i, &init.specs[pc]) {
+            if *val == 0 || values.is_some() {
+                return None;
+            }
+            if !members.contains(off) {
+                members.push(*off);
+            }
+            continue;
+        }
+        let (Instr::StoreAttr { obj: 0, val, .. }, Spec::Inline { off, values: v, .. }) = (i, &init.specs[pc]) else { return None };
+        if *val == 0 || values.is_some_and(|x| x != *v) || !members.is_empty() {
+            return None;
+        }
+        values = Some(*v);
+        let ix = ((off - v - 8) / 8) as u8;
+        if !order.contains(&ix) {
+            order.push(ix);
+        }
+    }
+    if !members.is_empty() {
+        // Every slot of the class (its base is `object`) is assigned.
+        // SAFETY: a class.
+        let all = unsafe {
+            if (*tp).tp_base != &raw mut ffi::PyBaseObject_Type || (*tp).tp_members.is_null() {
+                return None;
+            }
+            let mut n = 0;
+            let mut m = (*tp).tp_members;
+            while !(*m).name.is_null() {
+                if (*m).type_code != ffi::Py_T_OBJECT_EX || !members.contains(&((*m).offset as i32)) {
+                    return None;
+                }
+                n += 1;
+                m = m.add(1);
+            }
+            n
+        };
+        return (all == members.len()).then_some(lizzard_jit::Reuse { weakref, values: None, order });
+    }
+    Some(lizzard_jit::Reuse { weakref, values: Some(values?), order })
+}
+
 fn count(specs: &[Spec]) -> u32 {
     specs.iter().filter(|s| !matches!(s, Spec::None | Spec::Check(_))).count() as u32
 }
@@ -382,7 +447,10 @@ fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth
                     // A class constructed by allocating and `__init__`.
                     Some((tp, version, init)) if tp as usize == callee => match call_spec(py, f, pc, init, args.len() + 1, 0, deps, depth) {
                         // SAFETY: a class.
-                        Some((_, spec)) => Spec::Call(CallSpec { guard: CallGuard::Ctor { tp: tp as usize, version, alloc: unsafe { (*tp).tp_alloc }.map_or(0, |a| a as *const () as usize) }, ..spec }),
+                        Some((_, spec)) => {
+                            let reuse = spec.inline.as_deref().and_then(|init| reuse(tp, init));
+                            Spec::Call(CallSpec { guard: CallGuard::Ctor { tp: tp as usize, version, alloc: unsafe { (*tp).tp_alloc }.map_or(0, |a| a as *const () as usize), reuse }, ..spec })
+                        }
                         None => Spec::None,
                     },
                     _ => Spec::None,
@@ -463,8 +531,14 @@ fn call_spec<'a>(py: Python<'_>, site: &FuncRt, pc: usize, callee: *mut ffi::PyO
     let (entry, target) = if callee_rt.borrow_params { (&callee_rt.jit.entry as *const AtomicUsize as usize, &desc.target as *const Target as usize) } else { (0, 0) };
     deps.push(desc);
     // A small callee, warm (it ran), may be compiled into the caller.
-    let inline = (depth == 0 && callee_rt.ir.code.len() <= 48 && callee_rt.jit.calls.load(Ordering::Relaxed) + callee_rt.jit.compiles.load(Ordering::Relaxed) > 0)
-        .then(|| Box::new(unit(py, callee_rt, deps, 1)))
+    // Two levels at most, the second one for tiny callees (an `__init__`).
+    let small = match depth {
+        0 => callee_rt.ir.code.len() <= lizzard_jit::INLINE_MAX,
+        1 => callee_rt.ir.code.len() <= lizzard_jit::INLINE_MAX_NESTED,
+        _ => false,
+    };
+    let inline = (small && callee_rt.jit.calls.load(Ordering::Relaxed) + callee_rt.jit.compiles.load(Ordering::Relaxed) > 0)
+        .then(|| Box::new(unit(py, callee_rt, deps, depth + 1)))
         .filter(|u| lizzard_jit::inlinable(u));
     Some(((), CallSpec { guard: CallGuard::Func(0), desc: addr, nregs, checks, inline, native: false, entry, target }))
 }

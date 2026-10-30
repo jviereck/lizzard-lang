@@ -262,6 +262,21 @@ pub struct CallSpec<'a> {
     pub target: usize,
 }
 
+/// When a construction may take an instance about to be released instead
+/// of allocating one: an instance only one dead register references, with
+/// no weak references (the list at `weakref`, if instances can have one)
+/// whose attributes are exactly those `__init__` assigns, in the order it
+/// assigns them (the inline values at `values` hold `order`; None: the
+/// class keeps its attributes in `__slots__`, all of which `__init__`
+/// assigns), so that it cannot be told from a new one. The class has no
+/// finalizer.
+#[derive(Clone, Debug)]
+pub struct Reuse {
+    pub weakref: Option<i32>,
+    pub values: Option<i32>,
+    pub order: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub enum CallGuard {
     /// `Call`: the function register holds this object.
@@ -269,7 +284,7 @@ pub enum CallGuard {
     /// `Call` of class `tp` (at `version`) whose instances are created by
     /// allocating them (`alloc(tp, 0)`, its `tp_alloc`) and calling the
     /// `__init__` the call spec describes, the instance first.
-    Ctor { tp: usize, version: u32, alloc: usize },
+    Ctor { tp: usize, version: u32, alloc: usize, reuse: Option<Reuse> },
     /// `CallMethod`: the receiver's type and its version, and why no
     /// instance attribute shadows the method: `keys` is null (no `__dict__`)
     /// or the instance's inline values are in use (the byte at `valid`) and
@@ -445,7 +460,9 @@ fn carried(u: &Unit, numbers: bool, labels: &[bool], live: &[Vec<u64>]) -> Vec<V
 
 /// Instructions an inlined function may have: those compiled code does
 /// itself (given their specs), so that its slow paths are rare.
-const INLINE_MAX: usize = 48;
+pub const INLINE_MAX: usize = 48;
+/// The same, inlined into an inlined function (the second and last level).
+pub const INLINE_MAX_NESTED: usize = 16;
 
 /// Whether `u` can be compiled into its callers: small, straight-line or
 /// branching forward only, no handlers, parameters never written, and
@@ -733,6 +750,8 @@ struct Fn<'a> {
     /// The object registers whose slots its code may have written (a
     /// return releases them).
     written: std::collections::BTreeSet<Reg>,
+    /// How deeply it is inlined (0: the function compiled).
+    depth: u32,
 }
 
 /// An inlined callee: its frame and where it continues.
@@ -748,6 +767,9 @@ struct Inlined {
     fail: Block,
     /// The caller raises at its call (the frame is released).
     raised: Block,
+    /// Per parameter: the caller's register is dead after the call and its
+    /// slot holds the argument's reference (a candidate for `Reuse`).
+    donors: Vec<bool>,
 }
 
 struct Lower<'a> {
@@ -810,7 +832,7 @@ impl<'a> Lower<'a> {
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default() },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default(), depth: 0 },
             h,
             l,
             ptr,
@@ -2628,7 +2650,7 @@ impl<'a> Lower<'a> {
                 let p = self.obj(fr, pc, slow);
                 self.guard_eq(p, *f as i64, slow);
             }
-            (CallGuard::Ctor { tp, version, alloc }, Some(fr), _) => {
+            (CallGuard::Ctor { tp, version, alloc, .. }, Some(fr), _) => {
                 let p = self.obj(fr, pc, slow);
                 self.guard_eq(p, *tp as i64, slow);
                 let v = self.b.ins().load(types::I32, MF, p, self.l.tp_version);
@@ -2664,15 +2686,32 @@ impl<'a> Lower<'a> {
             }
             ptrs.push(p);
         }
+        // An instance about to be released, to construct in instead.
+        let reuse = match &spec.guard {
+            CallGuard::Ctor { tp, reuse: Some(r), .. } if self.f.u.speculate && spec.inline.as_deref().is_some_and(inlinable) => self.donor(pc, *tp, &all).map(|d| (d, r)),
+            _ => None,
+        };
         let inst = ctor.map(|(tp, alloc)| {
+            let done = self.b.create_block();
+            let o = self.b.append_block_param(done, self.ptr);
+            let fresh = self.b.create_block();
+            if let Some((d, r)) = reuse {
+                let p = self.f.vals[&d].ptr.unwrap();
+                self.reusable(p, r, fresh);
+                self.incref(p);
+                self.b.ins().jump(done, &[BlockArg::Value(p)]);
+            } else {
+                self.b.ins().jump(fresh, &[]);
+            }
+            self.b.switch_to_block(fresh);
             let tp = self.b.ins().iconst(self.ptr, tp as i64);
             let zero = self.b.ins().iconst(types::I64, 0);
-            let o = self.call(alloc, &[tp, zero], Some(self.ptr)).unwrap();
-            let (ok, failed) = (self.b.create_block(), self.b.create_block());
-            self.b.ins().brif(o, ok, &[], failed, &[]);
+            let n = self.call(alloc, &[tp, zero], Some(self.ptr)).unwrap();
+            let failed = self.b.create_block();
+            self.b.ins().brif(n, done, &[BlockArg::Value(n)], failed, &[]);
             self.b.switch_to_block(failed);
             self.raise(pc);
-            self.b.switch_to_block(ok);
+            self.b.switch_to_block(done);
             o
         });
         if let Some(o) = inst {
@@ -2691,15 +2730,18 @@ impl<'a> Lower<'a> {
                 self.call(self.h.vectorcall, &[callable, fp, n, none], Some(self.ptr)).unwrap()
             }
             // Not within an inlined function: one level.
-            Some(callee) if self.f.inline.is_none() && inlinable(callee) => {
+            Some(callee) if (self.f.depth == 0 || (self.f.depth == 1 && callee.ir.code.len() <= INLINE_MAX_NESTED)) && inlinable(callee) => {
                 // Its first parameter's type is verified: the receiver's,
                 // or the class of the instance just allocated.
                 let first = receiver.or(ctor.map(|(tp, _)| tp));
                 let mut known: Vec<Option<Virt>> = all.iter().map(|r| self.f.vals.get(r).copied()).collect();
+                // An argument whose register dies here, which owns it.
+                let mut donors: Vec<bool> = all.iter().map(|&r| self.f.inline.is_none() && !self.live_at(pc + 1, r) && all.iter().filter(|&&x| x == r).count() == 1 && !self.is_param(r) && self.f.vals.get(&r).is_some_and(|v| v.in_slot)).collect();
                 if ctor.is_some() {
                     known.insert(0, None);
+                    donors.insert(0, false);
                 }
-                self.inline_call(pc, &ptrs, &known, callee, spec.desc, first)
+                self.inline_call(pc, &ptrs, &known, &donors, callee, spec.desc, first)
             }
             _ => {
                 let frame = self.frame.expect("a frame for direct calls");
@@ -2758,7 +2800,8 @@ impl<'a> Lower<'a> {
     /// Compile `callee` here, its parameters `args` (borrowed), its frame
     /// in a stack slot: its result (a new reference), at the end of its
     /// code. An exception leaving it raises at the call (`pc`).
-    fn inline_call(&mut self, pc: usize, args: &[Value], known: &[Option<Virt>], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> Value {
+    #[allow(clippy::too_many_arguments)]
+    fn inline_call(&mut self, pc: usize, args: &[Value], known: &[Option<Virt>], donors: &[bool], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> Value {
         let ir = callee.ir;
         let nregs = ir.reprs.len();
         let frame = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, nregs.max(1) as u32 * 8, 3));
@@ -2808,8 +2851,8 @@ impl<'a> Lower<'a> {
                 (i as Reg, v)
             })
             .collect();
-        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default() };
+        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, donors: donors.to_vec() };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default(), depth: self.f.depth + 1 };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
         self.b.ins().jump(first, &[]);
@@ -2902,5 +2945,72 @@ impl<'a> Lower<'a> {
         r
     }
 
+
+
+    /// A register holding an instance of `tp` that may be constructed in
+    /// at call `pc` (`Reuse`): verified, not an argument, dead after the
+    /// call, and the only owner of its reference (its slot, or for an
+    /// inlined function's parameter, the caller's dying register's).
+    fn donor(&self, pc: usize, tp: usize, args: &[Reg]) -> Option<Reg> {
+        let mut regs: Vec<Reg> = self.f.vals.keys().copied().collect();
+        regs.sort_unstable();
+        regs.into_iter().find(|&r| {
+            let v = self.f.vals[&r];
+            let owner = match &self.f.inline {
+                Some(inl) if r < self.f.nparams => inl.donors.get(r as usize).copied().unwrap_or(false),
+                _ => v.in_slot && !self.is_param(r),
+            };
+            v.ty == Some(tp) && v.checked && v.ptr.is_some() && owner && !args.contains(&r) && !self.live_at(pc + 1, r)
+        })
+    }
+
+    /// Continue when `p` can be constructed in (`Reuse`), else at `no`:
+    /// one reference, by this thread; no weak references; its attributes
+    /// those `__init__` assigns, in its order.
+    fn reusable(&mut self, p: Value, r: &Reuse, no: Block) {
+        let yes = self.b.create_block();
+        self.unique(p, yes, no);
+        self.b.switch_to_block(yes);
+        if let Some(w) = r.weakref {
+            let l = self.b.ins().load(self.ptr, MF, p, w);
+            self.guard_eq(l, 0, no);
+        }
+        let Some(values) = r.values else { return };
+        let size = self.b.ins().load(types::I8, MF, p, values + 1);
+        self.guard_eq(size, r.order.len() as i64, no);
+        let cap = self.b.ins().load(types::I8, MF, p, values);
+        let cap = self.b.ins().uextend(types::I64, cap);
+        let at = self.b.ins().ishl_imm_u(cap, 3);
+        let at = self.b.ins().iadd(at, p);
+        for (i, &ix) in r.order.iter().enumerate() {
+            let b = self.b.ins().load(types::I8, MF, at, values + 8 + i as i32);
+            self.guard_eq(b, ix as i64, no);
+        }
+    }
+
+    /// Continue at `yes` when only the current thread references `p`, once.
+    fn unique(&mut self, p: Value, yes: Block, no: Block) {
+        match self.l.rc {
+            Rc::Calls => {
+                self.b.ins().jump(no, &[]);
+            }
+            Rc::Gil => {
+                let c = self.b.ins().load(types::I32, MF, p, 0);
+                let one = self.b.ins().icmp_imm_s(IntCC::Equal, c, 1);
+                self.b.ins().brif(one, yes, &[], no, &[]);
+            }
+            Rc::Ft { tid, local, shared } => {
+                let owner = self.b.ins().load(self.ptr, MF, p, tid);
+                let own = self.b.ins().icmp(IntCC::Equal, owner, self.tid);
+                let c = self.b.ins().load(types::I32, MF, p, local);
+                let one = self.b.ins().icmp_imm_s(IntCC::Equal, c, 1);
+                let s = self.b.ins().load(types::I64, MF, p, shared);
+                let none = self.b.ins().icmp_imm_s(IntCC::Equal, s, 0);
+                let a = self.b.ins().band(own, one);
+                let a = self.b.ins().band(a, none);
+                self.b.ins().brif(a, yes, &[], no, &[]);
+            }
+        }
+    }
 
 }

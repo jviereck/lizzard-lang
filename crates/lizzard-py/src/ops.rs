@@ -99,6 +99,11 @@ mod inline {
     pub const MANAGED_DICT: isize = -8;
     #[cfg(not(Py_GIL_DISABLED))]
     pub const MANAGED_DICT: isize = -24;
+    /// The managed weak reference list (`Py_TPFLAGS_MANAGED_WEAKREF`), just
+    /// before the dict pointer; checked at start-up (`WEAKREF_ON`).
+    pub const MANAGED_WEAKREF: isize = MANAGED_DICT - 8;
+    pub const TPFLAGS_MANAGED_WEAKREF: std::ffi::c_ulong = 1 << 3;
+    pub static WEAKREF_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     /// `struct _dictkeysobject`: kind at 10, entry count at 24, indices at
     /// 32 (`1 << dk_log2_index_bytes` bytes), then `{key, value}` entries.
     const DK_LOG2_INDEX_BYTES: usize = 9;
@@ -243,6 +248,21 @@ mod inline {
                     }
                 }
             }
+            // The weak reference list: null, then set by `weakref.ref`.
+            if ok {
+                let p = ffi::PyDict_GetItemString(globals, c"_p".as_ptr());
+                let at = (p as *mut u8).offset(MANAGED_WEAKREF) as *const *mut ffi::PyObject;
+                let flags = ffi::PyType_GetFlags(ffi::Py_TYPE(p));
+                let before = (*at).is_null();
+                let r = ffi::PyRun_String(c"import weakref as _wr\n_w = _wr.ref(_p)\n".as_ptr(), ffi::Py_file_input, globals, globals);
+                let set = !r.is_null() && !(*at).is_null();
+                if r.is_null() {
+                    ffi::PyErr_Clear();
+                } else {
+                    crate::rc::decref(r);
+                }
+                WEAKREF_ON.store(flags & TPFLAGS_MANAGED_WEAKREF != 0 && before && set, Ordering::Relaxed);
+            }
             crate::rc::decref(globals);
             ON.store(ok, Ordering::Relaxed);
         }
@@ -250,6 +270,21 @@ mod inline {
 }
 
 pub use inline::init as init_inline_values;
+
+/// Where an instance of `tp` keeps its weak reference list (an offset from
+/// the object; None: it cannot have weak references), if known.
+pub fn weakref_offset(tp: *mut ffi::PyTypeObject) -> Option<Option<i32>> {
+    unsafe {
+        if ffi::PyType_GetFlags(tp) & inline::TPFLAGS_MANAGED_WEAKREF != 0 {
+            return inline::WEAKREF_ON.load(Ordering::Relaxed).then_some(Some(inline::MANAGED_WEAKREF as i32));
+        }
+        match (*tp).tp_weaklistoffset {
+            0 => Some(None),
+            off if off > 0 => Some(Some(off as i32)),
+            _ => None,
+        }
+    }
+}
 
 /// Whether attributes in inline values are read directly (the layout check
 /// at start-up passed).

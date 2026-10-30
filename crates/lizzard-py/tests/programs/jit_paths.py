@@ -2,6 +2,9 @@
 # Paths of compiled code: specialized, guarded, inlined code meeting values
 # its caches did not see. Its output must match CPython's, compiled
 # (eagerly too) and interpreted.
+import jit_paths_patch
+
+
 class Body:
     def __init__(self, x: float, v: float) -> None:
         self.x: float = x
@@ -77,6 +80,62 @@ def deep(n: int) -> int:
     return deep(n + 1) + 1
 
 
+class P:
+    def __init__(self, x: float, y: float) -> None:
+        self.x: float = x
+        self.y: float = y
+
+    def moved(self, d: float) -> "P":
+        return P(self.x + d, self.y)
+
+
+class PS:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x: float, y: float) -> None:
+        self.x: float = x
+        self.y: float = y
+
+    def moved(self, d: float) -> "PS":
+        return PS(self.x + d, self.y)
+
+
+def walk(n: int) -> P:
+    p = P(0.0, 1.0)
+    for _ in range(n):
+        p = p.moved(1.0)
+    return p
+
+
+def walk_slots(n: int) -> PS:
+    p = PS(0.0, 1.0)
+    for _ in range(n):
+        p = p.moved(1.0)
+    return p
+
+
+def trail(n: int) -> list[P]:
+    # Every step kept: none may be constructed in.
+    ps: list[P] = []
+    p = P(0.0, 0.0)
+    for _ in range(n):
+        ps.append(p)
+        p = p.moved(0.5)
+    return ps
+
+
+def watched(n: int) -> float:
+    # Weak references and extra attributes from Python: not reused.
+    p = P(0.0, 0.0)
+    for i in range(n):
+        if i % 50 == 0:
+            jit_paths_patch.hold(p)
+        if i % 70 == 0:
+            jit_paths_patch.tag(p)
+        p = p.moved(1.0)
+    return p.x
+
+
 if __name__ == "__main__":
     bs = [Body(float(i), 1.0) for i in range(5)]
     for _ in range(3):
@@ -101,6 +160,13 @@ if __name__ == "__main__":
         keep(b)
     print(keep(b), b.x)
     print(mods(300))
+    # Instances about to be released, constructed in.
+    w = walk(1000)
+    print(w.x, w.y, jit_paths_patch.names(w), walk_slots(1000).x)
+    t = trail(400)
+    print(len({id(p) for p in t}), t[0].x, t[-1].x)
+    print(watched(500))
+    print(jit_paths_patch.report())
     # Exceptions leaving directly called compiled code.
     print([catch(i % 7) for i in range(300)][-5:])
     try:
@@ -108,7 +174,6 @@ if __name__ == "__main__":
     except RecursionError:
         print("RecursionError")
     # The class changes: guards miss, inlined code hands over.
-    import jit_paths_patch
     jit_paths_patch.patch()
     print(run(bs, 3))
     print(divide(bs, 4.0))
