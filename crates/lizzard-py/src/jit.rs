@@ -108,7 +108,30 @@ pub(crate) struct Ctx<'a, 'py> {
 
 const _: () = assert!(std::mem::size_of::<Ctx>() == lizzard_jit::CTX_SIZE as usize);
 
+impl JitCell {
+    /// Where the compiled entry is (for generators compiled code resumes).
+    pub(crate) fn entry_cell(&self) -> *const AtomicUsize {
+        &self.entry
+    }
+}
+
+impl<'a, 'py> Target<'a, 'py> {
+    pub(crate) fn new(py: Python<'py>, f: &'a FuncRt, globals: &'a Bound<'py, PyDict>, closure: &'a [Py<PyAny>]) -> Self {
+        Target { py, f, globals, closure }
+    }
+}
+
 impl<'a, 'py> Ctx<'a, 'py> {
+    /// A context for a target known by its address (a generator's).
+    pub(crate) fn raw(target: *const c_void, slots: *mut u64, want_int: bool) -> Self {
+        Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), slots, target: target as *const Target<'a, 'py>, exit: None, want_int: want_int as usize }
+    }
+
+    /// What `return` or `yield` left.
+    pub(crate) fn ret(&self) -> *mut ffi::PyObject {
+        self.ret
+    }
+
     fn new(target: &Target<'a, 'py>, slots: *mut u64) -> Self {
         Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), slots, target, exit: None, want_int: 0 }
     }
@@ -233,6 +256,7 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         call: a(lz_call as *const ()),
         for_iter: a(lz_for_iter as *const ()),
         for_iter_int: a(lz_for_iter_int as *const ()),
+        gen_resumed: a(lz_gen_resumed as *const ()),
         check: a(lz_check as *const ()),
         load_global: a(lz_load_global as *const ()),
         enter: a(lz_enter as *const ()),
@@ -522,7 +546,10 @@ fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth
                 None => Spec::None,
             },
             Instr::Check { check, .. } => Spec::Check(quick(py, f.ck(py, *check))),
-            Instr::ForIter { .. } => Spec::Iter(f.iters[pc].load(std::sync::atomic::Ordering::Relaxed)),
+            Instr::ForIter { .. } => match (f.iters[pc].load(std::sync::atomic::Ordering::Relaxed), crate::generator::hot_offset()) {
+                (lizzard_jit::ITER_GEN, Some(hot)) => Spec::IterGen { hot: hot as i32, tp: crate::generator::type_ptr() as usize },
+                (k, _) => Spec::Iter(k),
+            },
             // The global still this function: compiled code loops.
             Instr::JumpIfNotSelf { func, .. } => match global_of.get(func) {
                 // SAFETY: a valid object (the global's).
@@ -666,15 +693,12 @@ pub(crate) fn settle<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDi
             let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
             Err(e)
         }
-        Ran::YieldInt { .. } => unreachable!("an int yielded to a caller that takes objects"),
     }
 }
 
 /// How compiled code stopped.
 pub enum Ran<'py> {
     Exit(Exit<'py>),
-    /// A generator yielded an int as it is (asked for: `run_with`).
-    YieldInt { value: i64, dst: u32 },
     /// The interpreter continues at the pc.
     Bail,
     /// An exception no handler of the function caught.
@@ -684,17 +708,9 @@ pub enum Ran<'py> {
 /// Run compiled code on a frame from `*pc` (left where it stopped).
 #[allow(clippy::too_many_arguments)]
 pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>) -> Ran<'py> {
-    run_with(py, entry, f, globals, closure, regs, pc, pending, false)
-}
-
-/// `run`; `want_int`: a `yield` of an unboxed int gives `Ran::YieldInt`.
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-pub(crate) fn run_with<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>, want_int: bool) -> Ran<'py> {
     let slots = regs.as_mut_ptr();
     let target = Target { py, f, globals, closure };
     let mut ctx = Ctx::new(&target, slots);
-    ctx.want_int = want_int as usize;
     let throw = pending.is_some();
     if let Some(e) = pending {
         e.restore(py);
@@ -704,19 +720,18 @@ pub(crate) fn run_with<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: 
     // of its registers, and `ctx` outlives the call.
     let status = unsafe { entry(&mut ctx as *mut Ctx as *mut c_void, slots, &mut p, throw as u32) };
     *pc = p as usize;
+    ran(py, f, &mut ctx, status)
+}
+
+/// How a run of `f`'s compiled code with context `ctx` ended (`status`).
+pub(crate) fn ran<'py>(py: Python<'py>, f: &FuncRt, ctx: &mut Ctx<'_, 'py>, status: u32) -> Ran<'py> {
     match status {
         // SAFETY: compiled code stored a new reference.
         EXIT if !ctx.ret.is_null() => Ran::Exit(Exit::Return(unsafe { Bound::from_owned_ptr(py, ctx.ret) })),
         EXIT => Ran::Exit(*ctx.exit.take().expect("compiled code exits with a value")),
-        YIELD => {
-            let Instr::Yield { dst, .. } = f.ir.code[*pc] else { unreachable!("a yield's status at another instruction") };
-            // SAFETY: compiled code stored a new reference.
-            Ran::Exit(Exit::Yield { value: unsafe { Bound::from_owned_ptr(py, ctx.ret) }, dst })
-        }
-        YIELD_INT => {
-            let Instr::Yield { dst, .. } = f.ir.code[*pc] else { unreachable!("a yield's status at another instruction") };
-            Ran::YieldInt { value: ctx.ret as i64, dst }
-        }
+        // SAFETY: compiled code stored a new reference.
+        YIELD => Ran::Exit(Exit::Yield { value: unsafe { Bound::from_owned_ptr(py, ctx.ret) } }),
+        YIELD_INT => unreachable!("an int yielded to a caller that takes objects"),
         BAIL => {
             bailed(f);
             Ran::Bail
@@ -859,6 +874,13 @@ extern "C" fn lz_for_iter(ctx_: *mut c_void, slots: *mut u64, dst: u32, iter: u3
         }
         lz_for_iter_py(slots, dst, it)
     }
+}
+
+/// Compiled code resumed Lizzard generator `it` itself (context `gctx`)
+/// and it stopped other than at a plain `yield` (`Helpers::gen_resumed`).
+extern "C" fn lz_gen_resumed(it: *mut ffi::PyObject, gctx: *mut c_void, st: u32, pc: u32, slots: *mut u64, dst: u32, out: *mut i64) -> u32 {
+    // SAFETY: compiled code runs attached; as `Helpers::gen_resumed` says.
+    unsafe { crate::generator::resumed(Python::assume_attached(), it, gctx, st, pc, slots, dst, out) }
 }
 
 /// `lz_for_iter`, where the loop keeps its item unboxed: a Lizzard
@@ -1012,7 +1034,7 @@ extern "C" fn lz_enter(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc
     let r = match entry(py, rt) {
         Some(e) => match run(py, e, rt, globals, closure, &mut regs, &mut pc, None) {
             Ran::Exit(Exit::Return(v)) => Ok(v),
-            Ran::Exit(_) | Ran::YieldInt { .. } => unreachable!("yield in a function that is not a generator"),
+            Ran::Exit(_) => unreachable!("yield in a function that is not a generator"),
             Ran::Bail => {
                 own(&mut borrowed);
                 run_interp(py, rt, globals, closure, &mut regs, &mut pc, None).map(|e| match e {

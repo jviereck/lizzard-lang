@@ -64,6 +64,29 @@ mod layout {
     pub const SHARED_SHIFT: u32 = 2;
 }
 
+/// Whether no other thread can reach `o`: free-threaded, it is owned by
+/// this thread, its only reference local (as CPython's specialized
+/// generator loops require); with the GIL, always.
+///
+/// # Safety
+/// `o` is a valid object.
+#[inline(always)]
+pub unsafe fn unique(o: *mut ffi::PyObject) -> bool {
+    #[cfg(Py_GIL_DISABLED)]
+    unsafe {
+        let p = o as *mut u8;
+        INLINE.load(Ordering::Relaxed)
+            && *(p.add(layout::TID) as *const usize) == thread_id().unwrap_unchecked()
+            && *(p.add(layout::LOCAL) as *const u32) == 1
+            && (*(p.add(layout::SHARED) as *const AtomicIsize)).load(Ordering::Relaxed) == 0
+    }
+    #[cfg(not(Py_GIL_DISABLED))]
+    {
+        let _ = o;
+        true
+    }
+}
+
 /// `Py_INCREF(o)`.
 #[inline(always)]
 pub unsafe fn incref(o: *mut ffi::PyObject) {

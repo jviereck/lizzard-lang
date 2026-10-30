@@ -150,6 +150,9 @@ struct Lower<'a> {
     /// function's own, its class's, and the enclosing functions').
     tparams: Vec<(String, TvId)>,
     tail: Option<Tail>,
+    /// The `yield` being lowered is a statement: its value is dropped (and
+    /// not checked).
+    discarded: bool,
 }
 
 /// What a function's body is: statements, or a lambda's expression.
@@ -247,6 +250,7 @@ impl<'a> Lower<'a> {
             in_comprehension: 0,
             tparams: Vec::new(),
             tail: None,
+            discarded: false,
         }
     }
 
@@ -1320,7 +1324,9 @@ impl<'a> Lower<'a> {
         let off = self.at(s);
         match s {
             Stmt::Expr(e) => {
+                self.discarded = matches!(&*e.value, Expr::Yield(_) | Expr::YieldFrom(_));
                 self.expr(&e.value);
+                self.discarded = false;
             }
             Stmt::Assign(a) => {
                 let [target] = a.targets.as_slice() else {
@@ -2580,6 +2586,7 @@ impl<'a> Lower<'a> {
             Expr::ListComp(lc) => self.comprehension(&lc.generators, CompBody::List(&lc.elt), hint, off),
             Expr::Lambda(l) => self.lambda(l, hint, off),
             Expr::Yield(y) => {
+                let discarded = std::mem::take(&mut self.discarded);
                 let Some((yt, st)) = self.yield_context(off) else { return self.any() };
                 let v = match &y.value {
                     Some(e) => self.expr_hint(e, Some(&yt)),
@@ -2590,12 +2597,16 @@ impl<'a> Lower<'a> {
                 let src = self.obj(&v);
                 let dst = self.reg(Repr::Obj);
                 self.emit(Instr::Yield { dst, src });
-                // `next()` sends None whatever the send type is.
-                let checked = Val { reg: dst, ty: union(vec![st.clone(), Ty::None]), repr: Repr::Obj };
-                self.check(&checked, format!("the value sent to `{fname}`"), None);
+                // `next()` sends None whatever the send type is. (A sent
+                // value nothing reads is not checked: nothing typed sees it.)
+                if !discarded {
+                    let checked = Val { reg: dst, ty: union(vec![st.clone(), Ty::None]), repr: Repr::Obj };
+                    self.check(&checked, format!("the value sent to `{fname}`"), None);
+                }
                 Val { reg: dst, ty: st, repr: Repr::Obj }
             }
             Expr::YieldFrom(y) => {
+                let discarded = std::mem::take(&mut self.discarded);
                 let Some((yt, _)) = self.yield_context(off) else { return self.any() };
                 let v = self.expr(&y.value);
                 let elem = self.iter_elem(&v.ty, y.value.range().start().into());
@@ -2615,11 +2626,17 @@ impl<'a> Lower<'a> {
                 let o = self.obj(&v);
                 let iter = self.reg(Repr::Obj);
                 self.emit(Instr::GetIter { dst: iter, obj: o });
+                // A temporary iterable: the iterator holds it from here.
+                if !self.locals.values().any(|l| l.reg == o) {
+                    self.emit(Instr::Unbind { reg: o });
+                }
                 let dst = self.reg(Repr::Obj);
                 self.emit(Instr::YieldFrom { dst, iter });
                 let r = Val { reg: dst, ty, repr: Repr::Obj };
-                let what = self.src(e);
-                self.check(&r, what, None);
+                if !discarded {
+                    let what = self.src(e);
+                    self.check(&r, what, None);
+                }
                 r
             }
             Expr::Generator(_) => {

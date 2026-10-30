@@ -57,6 +57,9 @@ pub struct FuncRt {
     pub(crate) cics: Vec<OnceLock<Arc<FuncRt>>>,
     /// A global-lookup cache per instruction (used by `LoadGlobal`).
     pub(crate) gics: Vec<globals::GlobalIc>,
+    /// Per pc: a `Yield`'s or `YieldFrom`'s destination if any instruction
+    /// reads it, else `lizzard_jit::NO_SEND` (also for other instructions).
+    pub(crate) yield_dst: Vec<u32>,
     /// Per `ForIter`: the iterators it has seen (`lizzard_jit::ITER_*`).
     pub(crate) iters: Vec<std::sync::atomic::AtomicU8>,
     table: Table,
@@ -115,6 +118,15 @@ impl FuncRt {
         let ics = ir.code.iter().map(|_| ops::AttrIc::default()).collect();
         let gics = ir.code.iter().map(|_| globals::GlobalIc::default()).collect();
         let iters = ir.code.iter().map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
+        let read: std::collections::HashSet<u32> = ir.code.iter().flat_map(|i| i.reads()).collect();
+        let yield_dst = ir
+            .code
+            .iter()
+            .map(|i| match i {
+                Instr::Yield { dst, .. } | Instr::YieldFrom { dst, .. } if read.contains(dst) => *dst,
+                _ => lizzard_jit::NO_SEND,
+            })
+            .collect();
         let mics = ir.code.iter().map(|_| ops::MethodIc::default()).collect();
         let cics = ir.code.iter().map(|_| OnceLock::new()).collect();
         let ops = bytecode::lower(&ir);
@@ -123,7 +135,7 @@ impl FuncRt {
         let nparams = ir.params.len() as u32;
         let borrow_params = !ir.generator && ir.code.iter().all(|i| matches!(i, Instr::Unbind { .. }) || i.writes().iter().all(|&r| r >= nparams) || matches!(i, Instr::Take { dst, .. } if *dst >= nparams));
         let sets_handled = ir.code.iter().any(|i| matches!(i, Instr::SetHandled { .. }));
-        Ok(FuncRt { ir, objs, positional, jit: jit::JitCell::default(), borrow_params, sets_handled, consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, iters, table })
+        Ok(FuncRt { ir, objs, positional, jit: jit::JitCell::default(), borrow_params, sets_handled, consts, names, kwnames, cks, ics, mics, ops, ctics, cics, gics, yield_dst, iters, table })
     }
 }
 
@@ -186,7 +198,7 @@ impl LizzardFunction {
         if ir.generator {
             // A generator function returns a generator over a new frame.
             let g = LizzardGenerator::new(self.rt.clone(), self.globals.clone_ref(py), self.closure.iter().map(|c| c.clone_ref(py)).collect(), bound);
-            return Ok(Py::new(py, g)?.into_any());
+            return Ok(LizzardGenerator::create(py, g)?.into_any());
         }
         run(py, &self.rt, self.globals.bind(py), bound, &self.closure)
     }
@@ -607,11 +619,11 @@ fn check_args(py: Python<'_>, f: &FuncRt, bound: &[Bound<'_, PyAny>]) -> PyResul
 /// transitions a compiled function needs too.
 pub(crate) enum Exit<'py> {
     Return(Bound<'py, PyAny>),
-    /// `yield value` at the current pc; the sent value goes to `dst`.
-    Yield { value: Bound<'py, PyAny>, dst: u32 },
+    /// `yield value` at the current pc (the sent value goes to its `dst`).
+    Yield { value: Bound<'py, PyAny> },
     /// `yield from iter` at the current pc, which produced `value`; `iter`
-    /// takes over until it finishes and its return value goes to `dst`.
-    YieldFrom { value: Bound<'py, PyAny>, dst: u32, iter: Bound<'py, PyAny> },
+    /// takes over until it finishes (its return value goes to its `dst`).
+    YieldFrom { value: Bound<'py, PyAny>, iter: Bound<'py, PyAny> },
 }
 
 fn run<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, args: Vec<Bound<'py, PyAny>>, closure: &[Py<PyAny>]) -> PyResult<Py<PyAny>> {
@@ -794,7 +806,6 @@ pub(crate) fn run_interp<'py>(
                                         *pc = q;
                                         return Ok(exit);
                                     }
-                                    jit::Ran::YieldInt { .. } => unreachable!("an int yielded to a caller that takes objects"),
                                 }
                             }
                         }
@@ -1791,11 +1802,11 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
         Instr::Return { src } => return Ok(Some(Exit::Return(obj!(py, regs, *src).clone()))),
         // Both leave `pc` at the instruction: the generator resumes after it,
         // or raises there.
-        Instr::Yield { dst, src } => return Ok(Some(Exit::Yield { value: obj!(py, regs, *src).clone(), dst: *dst })),
+        Instr::Yield { src, .. } => return Ok(Some(Exit::Yield { value: obj!(py, regs, *src).clone() })),
         Instr::YieldFrom { dst, iter } => {
             let it = obj!(py, regs, *iter).clone();
             match generator::send_to(&it, &py.None().into_bound(py))? {
-                Sent::Next(value) => return Ok(Some(Exit::YieldFrom { value, dst: *dst, iter: it })),
+                Sent::Next(value) => return Ok(Some(Exit::YieldFrom { value, iter: it })),
                 Sent::Return(v) => regs.set_obj(*dst, v),
             }
         }

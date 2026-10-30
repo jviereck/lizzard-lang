@@ -257,6 +257,69 @@ def sum_from_python(n: int) -> int:
     return t
 
 
+def echo(n: int) -> Generator[int, None, None]:
+    # The value sent to the `yield` is read: next() sends None.
+    for i in range(n):
+        got = yield i
+        if got is not None:
+            yield -1
+
+
+def sum_echo(n: int) -> int:
+    t = 0
+    for x in echo(n):
+        t += x
+    return t
+
+
+def overflowing(n: int) -> Iterator[int]:
+    # Bails out inside the generator once the product leaves the i64s.
+    k = 1
+    for i in range(n):
+        k = k * 1000
+        yield k % 997
+
+
+def sum_overflowing(n: int) -> int:
+    t = 0
+    for x in overflowing(n):
+        t += x
+    return t
+
+
+def stops(n: int, at: int) -> Iterator[int]:
+    for i in range(n):
+        if i == at:
+            return
+        yield i
+
+
+def sum_stops(n: int) -> int:
+    t = 0
+    for x in stops(n, n // 2):
+        t += x
+    return t
+
+
+def spread(n: int) -> Iterator[int]:
+    yield 1
+    for i in range(n):
+        yield i
+    yield 2
+    try:
+        yield 3
+    finally:
+        pass
+    yield 4
+
+
+def sum_spread(n: int) -> int:
+    t = 0
+    for x in spread(n):
+        t = t * 3 + x
+    return t
+
+
 def rest_of(g: Iterator[int]) -> int:
     t = 0
     for x in g:
@@ -292,6 +355,8 @@ if __name__ == "__main__":
     print([sum_outer(n) for n in (3, 9)], [sum_outer(9) for _ in range(300)][-1])
     print([sum_lets_go(n) for n in (3, 9)], [sum_lets_go(9) for _ in range(300)][-1])
     print([sum_deeper(n) for n in range(300)][-1] % 1000003, [sum_from_python(n) for n in range(300)][-1])
+    print([sum_echo(n) for n in range(300)][-1], [sum_overflowing(n) for n in (3, 30)], [sum_overflowing(30) for _ in range(300)][-1])
+    print([sum_stops(n) for n in range(300)][-1], [sum_spread(n) for n in range(300)][-1] % 1000003, sum_spread(2))
     part = squares_of(10, 1)
     print(next(part), next(part), rest_of(part), [rest_of(squares_of(n, 1)) for n in range(300)][-1])
     g = thrown()

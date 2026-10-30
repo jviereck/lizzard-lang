@@ -16,7 +16,9 @@
 //! directions.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
@@ -47,10 +49,6 @@ impl Status {
 
 struct Frame {
     regs: Regs,
-    /// The `yield` / `yield from` it is suspended at (0 before it starts).
-    pc: usize,
-    /// Where the value sent to that `yield` goes.
-    dst: u32,
     /// The iterator a `yield from` delegates to.
     delegate: Option<Py<PyAny>>,
     /// The exception it was handling when it yielded (in an `except` block):
@@ -93,21 +91,74 @@ pub fn init_type(py: Python<'_>) {
     TYPE.store(py.get_type::<LizzardGenerator>().as_type_ptr(), Ordering::Relaxed);
 }
 
+/// What resuming it takes, where compiled code finds it (`lizzard_jit::GEN_*`
+/// offsets from `Hot`, at `hot_offset()` in the object): a compiled `for`
+/// resumes a plainly suspended generator itself. All but the flags are
+/// used only by the thread that set `running`.
+#[repr(C)]
+pub(crate) struct Hot {
+    running: AtomicU8,
+    status: AtomicU8,
+    /// 1: frame present, no `yield from` going on, no handled exception kept,
+    /// and code that never sets one.
+    plain: AtomicU8,
+    _pad: u8,
+    /// The `yield` / `yield from` it is suspended at (0 before it starts).
+    pc: UnsafeCell<u32>,
+    /// Where a value sent to that `yield` goes; `NO_SEND` if its code never
+    /// reads it.
+    dst: UnsafeCell<u32>,
+    _pad2: u32,
+    /// The frame's slots, once it ran in place (null before, and when done).
+    slots: UnsafeCell<*mut u64>,
+    /// Its `jit::Target`, with `slots`.
+    target: UnsafeCell<*const c_void>,
+    /// Its function's compiled entry (`JitCell::entry`).
+    entry: *const AtomicUsize,
+    /// Per pc: `FuncRt::yield_dst`.
+    yield_dst: *const u32,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(Hot, running) == lizzard_jit::GEN_RUNNING as usize);
+    assert!(std::mem::offset_of!(Hot, status) == lizzard_jit::GEN_STATUS as usize);
+    assert!(std::mem::offset_of!(Hot, plain) == lizzard_jit::GEN_PLAIN as usize);
+    assert!(std::mem::offset_of!(Hot, pc) == lizzard_jit::GEN_PC as usize);
+    assert!(std::mem::offset_of!(Hot, dst) == lizzard_jit::GEN_DST as usize);
+    assert!(std::mem::offset_of!(Hot, slots) == lizzard_jit::GEN_SLOTS as usize);
+    assert!(std::mem::offset_of!(Hot, target) == lizzard_jit::GEN_TARGET as usize);
+    assert!(std::mem::offset_of!(Hot, entry) == lizzard_jit::GEN_ENTRY as usize);
+    assert!(std::mem::offset_of!(Hot, yield_dst) == lizzard_jit::GEN_YIELD_DST as usize);
+    assert!(Status::Suspended as u8 == lizzard_jit::GEN_SUSPENDED);
+};
+
+/// Where `Hot` is in a generator object (known once one exists).
+static HOT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn hot_offset() -> Option<usize> {
+    Some(HOT_OFFSET.load(Ordering::Relaxed)).filter(|&o| o != 0)
+}
+
 /// The generator a Lizzard generator function returns.
 #[pyclass(frozen, module = "lizzard._lizzard")]
 pub struct LizzardGenerator {
     rt: Arc<FuncRt>,
     globals: Py<PyDict>,
     closure: Vec<Py<PyAny>>,
-    status: AtomicU8,
+    hot: Hot,
     /// None once it is done. Only who set `running` touches it.
     frame: UnsafeCell<Option<Frame>>,
-    running: AtomicBool,
+    /// Its `jit::Target`, made where the generator lives (`Hot::target`).
+    target: UnsafeCell<MaybeUninit<crate::jit::Target<'static, 'static>>>,
 }
 
-// SAFETY: `frame` is used only by the thread that set `running` (or by
-// `Drop`, which has the generator to itself).
+// SAFETY: `frame`, `target` and `hot`'s plain fields are used only by the
+// thread that set `running` (or by `Drop`, which has the generator to
+// itself).
 unsafe impl Sync for LizzardGenerator {}
+// SAFETY: as for `Sync`; the raw pointers point into the generator and its
+// `FuncRt`, which it keeps.
+unsafe impl Send for LizzardGenerator {}
 
 impl LizzardGenerator {
     /// A generator over a new frame with the (checked) arguments.
@@ -116,33 +167,125 @@ impl LizzardGenerator {
         for (i, a) in args.into_iter().enumerate() {
             regs.set_obj(i as u32, a);
         }
-        let frame = Frame { regs, pc: 0, dst: 0, delegate: None, handled: None };
-        LizzardGenerator { rt, globals, closure, status: AtomicU8::new(Status::Created as u8), frame: UnsafeCell::new(Some(frame)), running: AtomicBool::new(false) }
+        let frame = Frame { regs, delegate: None, handled: None };
+        let hot = Hot {
+            running: AtomicU8::new(0),
+            status: AtomicU8::new(Status::Created as u8),
+            plain: AtomicU8::new(0),
+            _pad: 0,
+            pc: UnsafeCell::new(0),
+            dst: UnsafeCell::new(NO_SEND),
+            _pad2: 0,
+            slots: UnsafeCell::new(std::ptr::null_mut()),
+            target: UnsafeCell::new(std::ptr::null()),
+            entry: rt.jit.entry_cell(),
+            yield_dst: rt.yield_dst.as_ptr(),
+        };
+        LizzardGenerator { rt, globals, closure, hot, frame: UnsafeCell::new(Some(frame)), target: UnsafeCell::new(MaybeUninit::uninit()) }
+    }
+
+    /// The object for `g` (and where its `Hot` is, the first time).
+    pub fn create(py: Python<'_>, g: LizzardGenerator) -> PyResult<Py<LizzardGenerator>> {
+        let obj = Py::new(py, g)?;
+        if HOT_OFFSET.load(Ordering::Relaxed) == 0 {
+            let off = &obj.get().hot as *const Hot as usize - obj.as_ptr() as usize;
+            HOT_OFFSET.store(off, Ordering::Relaxed);
+        }
+        Ok(obj)
     }
 
     fn status(&self) -> Status {
-        Status::from(self.status.load(Ordering::Acquire))
+        Status::from(self.hot.status.load(Ordering::Acquire))
     }
 
     fn set_status(&self, s: Status) {
-        self.status.store(s as u8, Ordering::Release);
+        self.hot.status.store(s as u8, Ordering::Release);
+    }
+
+    /// The generator object `o` (borrowed: no reference taken).
+    ///
+    /// # Safety
+    /// `o` is a LizzardGenerator, alive while the result is used.
+    unsafe fn of<'a>(o: *mut ffi::PyObject) -> &'a LizzardGenerator {
+        let at = o as usize + HOT_OFFSET.load(Ordering::Relaxed) - std::mem::offset_of!(LizzardGenerator, hot);
+        // SAFETY: as required (`HOT_OFFSET` is set once one exists).
+        unsafe { &*(at as *const LizzardGenerator) }
+    }
+
+    /// Take `running` (false: it is already). With plain stores when no
+    /// other thread can reach the generator (`rc::unique`), else atomically.
+    fn start(&self) -> bool {
+        let off = HOT_OFFSET.load(Ordering::Relaxed);
+        let obj = (&self.hot as *const Hot as usize - off) as *mut ffi::PyObject;
+        // SAFETY: the object holding this generator (`off` is known once one
+        // exists, and generators exist only as objects).
+        if off != 0 && unsafe { crate::rc::unique(obj) } {
+            if self.hot.running.load(Ordering::Relaxed) != 0 {
+                return false;
+            }
+            self.hot.running.store(1, Ordering::Relaxed);
+            return true;
+        }
+        self.hot.running.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    fn stop(&self) {
+        self.hot.running.store(0, Ordering::Release);
+    }
+
+    /// The `yield` it is suspended at, and where a value sent to it goes.
+    fn at(&self) -> (usize, u32) {
+        // SAFETY: the caller set `running`.
+        unsafe { (*self.hot.pc.get() as usize, *self.hot.dst.get()) }
+    }
+
+    /// Suspended at `pc` (a `yield` or `yield from`).
+    fn suspend_at(&self, pc: usize, frame: &Frame) {
+        // SAFETY: the caller set `running`.
+        unsafe {
+            *self.hot.pc.get() = pc as u32;
+            *self.hot.dst.get() = self.rt.yield_dst.get(pc).copied().unwrap_or(NO_SEND);
+        }
+        let plain = !self.rt.sets_handled && frame.delegate.is_none() && frame.handled.is_none();
+        self.hot.plain.store(plain as u8, Ordering::Release);
     }
 
     /// Done: its frame released (which may run Python code; `running` is
     /// still set).
     fn finish(&self, slot: &mut Option<Frame>) {
+        self.hot.plain.store(0, Ordering::Release);
         self.set_status(Status::Done);
+        // SAFETY: the caller set `running`.
+        unsafe { *self.hot.slots.get() = std::ptr::null_mut() };
         drop(slot.take());
+    }
+
+    /// The frame's slots and its target, made the first time it runs in
+    /// place (the frame and the object do not move).
+    fn place(&self, py: Python<'_>, frame: &mut Frame) -> (*mut u64, *const c_void) {
+        // SAFETY: the caller set `running`.
+        unsafe {
+            if (*self.hot.slots.get()).is_null() {
+                let t = crate::jit::Target::new(py, &self.rt, self.globals.bind(py), &self.closure);
+                // SAFETY: it refers to the generator's own fields, which
+                // live as long as it does.
+                let t: crate::jit::Target<'static, 'static> = std::mem::transmute(t);
+                (*self.target.get()).write(t);
+                *self.hot.target.get() = (*self.target.get()).as_ptr() as *const c_void;
+                *self.hot.slots.get() = frame.regs.as_mut_ptr();
+            }
+            (*self.hot.slots.get(), *self.hot.target.get())
+        }
     }
 
     /// Resume with a value or an exception; the next value it yields, or the
     /// value it returned.
     pub fn resume<'py>(&self, py: Python<'py>, op: Op<'py>) -> PyResult<Sent<'py>> {
-        if self.running.swap(true, Ordering::Acquire) {
+        if !self.start() {
             return Err(PyValueError::new_err("generator already executing"));
         }
         let r = self.resume_inner(py, op);
-        self.running.store(false, Ordering::Release);
+        self.stop();
         r
     }
 
@@ -170,6 +313,7 @@ impl LizzardGenerator {
             }
         };
         let mut pending = None;
+        let mut pc = if status == Status::Suspended { self.at().0 } else { 0 };
         if status == Status::Suspended {
             match frame.delegate.take() {
                 // `yield from`: the iterator handles it until it finishes.
@@ -185,22 +329,21 @@ impl LizzardGenerator {
                             return Ok(Sent::Next(v));
                         }
                         Ok(Sent::Return(v)) => {
-                            frame.regs.set_obj(frame.dst, v);
-                            frame.pc += 1;
+                            send(frame, self.at().1, v);
+                            pc += 1;
                         }
                         Err(e) => pending = Some(e),
                     }
                 }
                 None => match op {
                     Op::Send(v) => {
-                        frame.regs.set_obj(frame.dst, v);
-                        frame.pc += 1;
+                        send(frame, self.at().1, v);
+                        pc += 1;
                     }
                     Op::Throw(e) => pending = Some(e),
                 },
             }
         }
-        let mut pc = frame.pc;
         self.set_status(Status::Suspended);
         // The generator's own handled exception while it runs, the caller's
         // otherwise (put back only if the generator changed it). Only its
@@ -230,17 +373,16 @@ impl LizzardGenerator {
     /// The end of a run of its code (`pc` where it stopped): suspended at a
     /// yield (with the handled exception it keeps, if any), or done.
     fn after<'py>(&self, py: Python<'py>, slot: &mut Option<Frame>, pc: usize, r: PyResult<Exit<'py>>, handled: Option<Py<PyAny>>) -> PyResult<Sent<'py>> {
-        let suspend = |slot: &mut Option<Frame>, value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
+        let suspend = |slot: &mut Option<Frame>, value: Bound<'py, PyAny>, delegate: Option<Bound<'py, PyAny>>| {
             let frame = slot.as_mut().expect("a running generator's frame");
-            frame.pc = pc;
-            frame.dst = dst;
             frame.delegate = delegate.map(Bound::unbind);
             frame.handled = handled;
+            self.suspend_at(pc, frame);
             Sent::Next(value)
         };
         match r {
-            Ok(Exit::Yield { value, dst }) => Ok(suspend(slot, value, dst, None)),
-            Ok(Exit::YieldFrom { value, dst, iter }) => Ok(suspend(slot, value, dst, Some(iter))),
+            Ok(Exit::Yield { value, .. }) => Ok(suspend(slot, value, None)),
+            Ok(Exit::YieldFrom { value, iter, .. }) => Ok(suspend(slot, value, Some(iter))),
             Ok(Exit::Return(v)) => {
                 self.finish(slot);
                 Ok(Sent::Return(v))
@@ -261,17 +403,17 @@ impl LizzardGenerator {
 
     /// The next item for a `for` loop, from the generator's compiled code
     /// entered directly (no `exec` and its layers): when it is compiled,
-    /// not running, not delegating (`yield from`) and keeps no handled
-    /// exception; else `Slow` (`resume` does it). `want_int`: an int it
-    /// yields unboxed comes as it is.
+    /// not running, and keeps no handled exception (code that sets one
+    /// goes through `resume`); else `Slow` (`resume` does it). `want_int`:
+    /// an int it yields unboxed comes as it is.
     #[inline(always)]
     pub(crate) fn next_direct<'py>(&self, py: Python<'py>, want_int: bool) -> PyResult<Next<'py>> {
         let Some(entry) = crate::jit::loaded(&self.rt) else { return Ok(Next::Slow) };
-        if self.rt.sets_handled || self.running.swap(true, Ordering::Acquire) {
+        if self.rt.sets_handled || !self.start() {
             return Ok(Next::Slow);
         }
         let r = self.next_running(py, entry, want_int);
-        self.running.store(false, Ordering::Release);
+        self.stop();
         r
     }
 
@@ -284,51 +426,71 @@ impl LizzardGenerator {
             (Status::Created | Status::Suspended, Some(f)) if f.handled.is_none() => f,
             _ => return Ok(Next::Slow),
         };
+        let (at, dst) = self.at();
         let mut pending = None;
-        let mut pc = match (status, &frame.delegate) {
+        let pc = match (status, &frame.delegate) {
             // `yield from` another Lizzard generator: its next item, the
             // same way (still running, as Python's are); its end continues
             // here with its return value, its exception is raised at the
             // `yield from`.
             (Status::Suspended, Some(d)) => {
-                let d = d.bind(py).clone();
-                match delegate_next(py, d, want_int) {
+                // (Borrowed: the outer frame keeps it while the outer runs.)
+                match delegate_next(py, d.as_ptr(), want_int) {
                     Ok(Next::End(v)) => {
                         frame.delegate = None;
-                        frame.regs.set_obj(frame.dst, v);
-                        frame.pc + 1
+                        send(frame, dst, v);
+                        at + 1
                     }
                     Err(e) => {
                         frame.delegate = None;
                         pending = Some(e);
-                        frame.pc
+                        at
                     }
                     r => return r,
                 }
             }
             (Status::Suspended, None) => {
-                // `next()` sends None to the `yield`.
-                frame.regs.set_obj(frame.dst, py.None().into_bound(py));
-                frame.pc + 1
+                // `next()` sends None to the `yield` (if its code reads it).
+                if dst != NO_SEND {
+                    frame.regs.set_none(dst);
+                }
+                at + 1
             }
             _ => 0,
         };
         self.set_status(Status::Suspended);
-        let globals = self.globals.bind(py);
-        let ran = crate::jit::run_with(py, entry, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, pending, want_int);
-        let r = match ran {
-            crate::jit::Ran::Exit(Exit::Yield { value, dst }) => {
-                frame.pc = pc;
-                frame.dst = dst;
-                return Ok(Next::Value(value));
+        let (slots, target) = self.place(py, frame);
+        let throw = pending.is_some();
+        if let Some(e) = pending {
+            e.restore(py);
+        }
+        let mut ctx = crate::jit::Ctx::raw(target, slots, want_int);
+        let mut p = pc as u32;
+        // SAFETY: the entry was compiled from this function; the frame has
+        // its slots; `ctx` outlives the call.
+        let st = unsafe { entry(&mut ctx as *mut _ as *mut c_void, slots, &mut p, throw as u32) };
+        match st {
+            lizzard_jit::YIELD => {
+                self.suspend_at(p as usize, frame);
+                // SAFETY: compiled code stored a new reference.
+                Ok(Next::Value(unsafe { Bound::from_owned_ptr(py, ctx.ret()) }))
             }
-            crate::jit::Ran::YieldInt { value, dst } => {
-                frame.pc = pc;
-                frame.dst = dst;
-                return Ok(Next::Int(value));
+            lizzard_jit::YIELD_INT => {
+                self.suspend_at(p as usize, frame);
+                Ok(Next::Int(ctx.ret() as i64))
             }
-            ran => crate::jit::settle(py, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, ran),
-        };
+            st => self.ended(py, slot, &mut ctx, st, p as usize),
+        }
+    }
+
+    /// Its code stopped other than at a plain `yield` (`st`, at `pc`):
+    /// returned, raised, bailed out, or left through `step`.
+    #[cold]
+    fn ended<'py>(&self, py: Python<'py>, slot: &mut Option<Frame>, ctx: &mut crate::jit::Ctx<'_, 'py>, st: u32, pc: usize) -> PyResult<Next<'py>> {
+        let mut pc = pc;
+        let frame = slot.as_mut().expect("a running generator's frame");
+        let ran = crate::jit::ran(py, &self.rt, ctx, st);
+        let r = crate::jit::settle(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, ran);
         Ok(match self.after(py, slot, pc, r, None)? {
             Sent::Next(v) => Next::Value(v),
             Sent::Return(v) => Next::End(v),
@@ -337,10 +499,10 @@ impl LizzardGenerator {
 
     fn close_gen(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if self.status() != Status::Suspended {
-            if !self.running.swap(true, Ordering::Acquire) {
+            if self.start() {
                 // SAFETY: `running` was just set by this thread.
                 self.finish(unsafe { &mut *self.frame.get() });
-                self.running.store(false, Ordering::Release);
+                self.stop();
             }
             return Ok(py.None());
         }
@@ -353,19 +515,46 @@ impl LizzardGenerator {
     }
 }
 
+/// A sent value for register `dst` (dropped if its code never reads it).
+fn send(frame: &mut Frame, dst: u32, v: Bound<'_, PyAny>) {
+    if dst != NO_SEND {
+        frame.regs.set_obj(dst, v);
+    }
+}
+
+/// `Hot::dst` of a `yield` whose value is never read.
+pub(crate) const NO_SEND: u32 = lizzard_jit::NO_SEND;
+
+/// A compiled `for` resumed generator `it` itself and its code stopped
+/// other than at a plain `yield` (`st`, at `*pc`, its context `ctx`):
+/// `for_iter_int`'s status, its item in `dst` or `*out`. `running` is set.
+///
+/// # Safety
+/// As `for_iter_int`; `ctx` is the context compiled code made.
+pub(crate) unsafe fn resumed(py: Python<'_>, it: *mut ffi::PyObject, ctx: *mut c_void, st: u32, pc: u32, slots: *mut u64, dst: u32, out: *mut i64) -> u32 {
+    // SAFETY: as required (the loop's register keeps it).
+    let g = unsafe { LizzardGenerator::of(it) };
+    // SAFETY: compiled code set `running`.
+    let slot = unsafe { &mut *g.frame.get() };
+    let ctx = unsafe { &mut *(ctx as *mut crate::jit::Ctx<'_, '_>) };
+    let r = g.ended(py, slot, ctx, st, pc as usize);
+    g.stop();
+    // SAFETY: as required.
+    unsafe { item(py, r, slots, dst, (!out.is_null()).then_some(out)) }
+}
+
 /// The next item of the iterator a `yield from` delegates to (`next_direct`
 /// of a Lizzard generator; `Slow` for others). Kept out of line: the
 /// recursion would stop the compiler from inlining `next_direct` into the
 /// loop helpers.
 #[inline(never)]
-fn delegate_next<'py>(py: Python<'py>, d: Bound<'py, PyAny>, want_int: bool) -> PyResult<Next<'py>> {
+fn delegate_next<'py>(py: Python<'py>, d: *mut ffi::PyObject, want_int: bool) -> PyResult<Next<'py>> {
     // SAFETY: a type pointer comparison on a valid object.
-    if unsafe { ffi::Py_TYPE(d.as_ptr()) } != type_ptr() {
+    if unsafe { ffi::Py_TYPE(d) } != type_ptr() {
         return Ok(Next::Slow);
     }
-    // SAFETY: the type says what it is.
-    let inner = unsafe { d.cast_into_unchecked::<LizzardGenerator>() };
-    inner.get().next_direct(py, want_int)
+    // SAFETY: the type says what it is; the caller keeps it.
+    unsafe { LizzardGenerator::of(d) }.next_direct(py, want_int)
 }
 
 /// `ForIter` over Lizzard generator `it` (as `ops::lz_for_iter_py` over
@@ -389,10 +578,8 @@ pub(crate) unsafe fn for_iter_int(py: Python<'_>, slots: *mut u64, dst: u32, it:
 }
 
 unsafe fn for_iter_with(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi::PyObject, out: Option<*mut i64>) -> u32 {
-    use lizzard_jit::{ERROR, NEXT, NEXT_INT, TAKEN};
-    // SAFETY: as required.
-    let g = unsafe { Bound::from_borrowed_ptr(py, it).cast_into_unchecked::<LizzardGenerator>() };
-    let g = g.get();
+    // SAFETY: as required (the loop's register keeps it).
+    let g = unsafe { LizzardGenerator::of(it) };
     let r = match g.next_direct(py, out.is_some()) {
         Ok(Next::Slow) => match g.resume(py, Op::Send(py.None().into_bound(py))) {
             Ok(Sent::Next(v)) => Ok(Next::Value(v)),
@@ -401,6 +588,14 @@ unsafe fn for_iter_with(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi:
         },
         r => r,
     };
+    // SAFETY: as required.
+    unsafe { item(py, r, slots, dst, out) }
+}
+
+/// A `for`'s next item: in `dst` (`NEXT`), an int in `*out` (`NEXT_INT`),
+/// the end (`TAKEN`), or `ERROR` with the exception set.
+unsafe fn item(py: Python<'_>, r: PyResult<Next<'_>>, slots: *mut u64, dst: u32, out: Option<*mut i64>) -> u32 {
+    use lizzard_jit::{ERROR, NEXT, NEXT_INT, TAKEN};
     match r {
         Ok(Next::Value(v)) => {
             // SAFETY: a new reference for the slot.
@@ -464,12 +659,12 @@ impl LizzardGenerator {
 
     #[getter]
     fn gi_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
+        self.hot.running.load(Ordering::Acquire) != 0
     }
 
     #[getter]
     fn gi_suspended(&self) -> bool {
-        self.status() == Status::Suspended && !self.running.load(Ordering::Acquire)
+        self.status() == Status::Suspended && self.hot.running.load(Ordering::Acquire) == 0
     }
 
     #[getter]

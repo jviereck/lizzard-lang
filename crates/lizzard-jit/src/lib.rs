@@ -73,6 +73,24 @@ pub const YIELD_INT: u32 = 6;
 /// `for_iter_int`: the next item, an int, in its `out` (not in `dst`).
 pub const NEXT_INT: u32 = 7;
 
+/// A Lizzard generator as compiled code resumes it (`Spec::IterGen`): its
+/// state at these offsets from its `Hot` (bytes: `running`, status, `plain`;
+/// `u32`: pc, dst; pointers: slots, target, the entry's cell, the per-pc
+/// destination table).
+pub const GEN_RUNNING: i32 = 0;
+pub const GEN_STATUS: i32 = 1;
+pub const GEN_PLAIN: i32 = 2;
+pub const GEN_PC: i32 = 4;
+pub const GEN_DST: i32 = 8;
+pub const GEN_SLOTS: i32 = 16;
+pub const GEN_TARGET: i32 = 24;
+pub const GEN_ENTRY: i32 = 32;
+pub const GEN_YIELD_DST: i32 = 40;
+/// The status of a suspended generator.
+pub const GEN_SUSPENDED: u8 = 1;
+/// The destination of a `yield` whose value is never read.
+pub const NO_SEND: u32 = u32::MAX;
+
 /// The context's thread id (free-threaded reference counting compares an
 /// object's owner with it), and where `Return` leaves its value (a new
 /// reference).
@@ -188,6 +206,11 @@ pub struct Helpers {
     /// Lizzard generator yielding an unboxed int gives it in `*out`
     /// (`NEXT_INT`).
     pub for_iter_int: usize,
+    /// `gen_resumed(it, ctx, status, pc, regs, dst, out)`: compiled code
+    /// resumed generator `it` (`ctx`: its context) and it stopped other
+    /// than at a plain `yield` (`status` at `pc`): finishes that, releases
+    /// `running`; `for_iter_int`'s status (`out` may be null).
+    pub gen_resumed: usize,
     /// `check(ctx, regs, reg, check, pc)`
     pub check: usize,
     /// `load_global(ctx, regs, dst, pc)`
@@ -281,6 +304,10 @@ pub enum Spec<'a> {
     Check(Quick),
     /// `ForIter`: the iterators it met (`ITER_LIST`, ...; 0: none yet).
     Iter(u8),
+    /// `ForIter` that met Lizzard generators (of type `tp`, their state at
+    /// `hot` in the object, `GEN_*`): compiled code resumes a plainly
+    /// suspended one itself.
+    IterGen { hot: i32, tp: usize },
     /// `JumpIfNotSelf` of a function object (`func`) that runs this code:
     /// a self tail call loops when it is still that object.
     SelfFunc(usize),
@@ -3101,30 +3128,192 @@ impl<'a> Lower<'a> {
             self.materialize(iter, pc);
         }
         self.clobber();
-        let (d, it, p) = (self.i32c(dst), self.i32c(iter), self.pc_val(pc));
-        let (ctx, regs) = (self.ctx, self.f.regs);
         // Over a generator, an item the loop keeps unboxed may come as a
         // machine int.
-        let ints = matches!(self.f.u.specs[pc], Spec::Iter(ITER_GEN)) && self.f.carry[pc + 1].iter().any(|&(r, k)| r == dst && k == Kind::I);
-        if ints {
-            let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-            let op = self.b.ins().stack_addr(self.ptr, out, 0);
-            let st = self.call(self.h.for_iter_int, &[ctx, regs, d, it, p, op], Some(types::I32)).unwrap();
+        let ints = matches!(self.f.u.specs[pc], Spec::Iter(ITER_GEN) | Spec::IterGen { .. }) && self.f.carry[pc + 1].iter().any(|&(r, k)| r == dst && k == Kind::I);
+        let out = ints.then(|| self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3)));
+        if let Spec::IterGen { hot, tp } = self.f.u.specs[pc] {
+            let helper = self.b.create_block();
+            self.resume_gen(pc, dst, iter, target, hot, tp, out, helper);
+            self.b.switch_to_block(helper);
+        }
+        let (d, it, p) = (self.i32c(dst), self.i32c(iter), self.pc_val(pc));
+        let (ctx, regs) = (self.ctx, self.f.regs);
+        let st = match out {
+            Some(out) => {
+                let op = self.b.ins().stack_addr(self.ptr, out, 0);
+                self.call(self.h.for_iter_int, &[ctx, regs, d, it, p, op], Some(types::I32)).unwrap()
+            }
+            None => self.call(self.h.for_iter, &[ctx, regs, d, it, p], Some(types::I32)).unwrap(),
+        };
+        self.for_iter_result(pc, dst, target, st, out)
+    }
+
+    /// After `ForIter`'s helper (status `st`): an int in `out` (`NEXT_INT`),
+    /// or `for_iter_status`.
+    fn for_iter_result(&mut self, pc: usize, dst: Reg, target: u32, st: Value, out: Option<StackSlot>) {
+        if let Some(out) = out {
             let (int, rest) = (self.b.create_block(), self.b.create_block());
             let is_int = self.b.ins().icmp_imm_u(IntCC::Equal, st, NEXT_INT as i64);
             self.b.ins().brif(is_int, int, &[], rest, &[]);
             self.b.switch_to_block(int);
             let x = self.b.ins().stack_load(self.ptr, types::I64, out, 0);
-            let saved = self.f.vals.clone();
-            self.wrote(pc);
-            self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(x), ty: Some(self.l.long_type), konst: false, checked: false, global: false });
-            self.goto(pc, pc as u32 + 1);
-            self.f.vals = saved;
+            self.next_int(pc, dst, x);
             self.b.switch_to_block(rest);
-            return self.for_iter_status(pc, target, st);
         }
-        let st = self.call(self.h.for_iter, &[ctx, regs, d, it, p], Some(types::I32)).unwrap();
         self.for_iter_status(pc, target, st)
+    }
+
+    /// The loop goes on with `dst` the int `x`.
+    fn next_int(&mut self, pc: usize, dst: Reg, x: Value) {
+        let saved = self.f.vals.clone();
+        self.wrote(pc);
+        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(x), ty: Some(self.l.long_type), konst: false, checked: false, global: false });
+        self.goto(pc, pc as u32 + 1);
+        self.f.vals = saved;
+    }
+
+    /// `ForIter` over a Lizzard generator (its state at `hot`): if it is
+    /// plainly suspended (no `yield from`, no handled exception, its code
+    /// compiled, the sent value unused), compiled code takes `running` and
+    /// enters its code itself, with a context of its own; a `yield` comes
+    /// back here. Anything else continues at `helper` (`for_iter`).
+    #[allow(clippy::too_many_arguments)]
+    fn resume_gen(&mut self, pc: usize, dst: Reg, iter: Reg, target: u32, hot: i32, tp: usize, out: Option<StackSlot>, helper: Block) {
+        let saved = self.f.vals.clone();
+        let it = self.slot_load(iter);
+        self.guard(it, helper);
+        let t = self.ob_type(it);
+        self.guard_eq(t, tp as i64, helper);
+        let h = self.b.ins().iadd_imm_s(it, hot as i64);
+        let plain = self.b.ins().load(types::I8, MF, h, GEN_PLAIN);
+        self.guard(plain, helper);
+        let status = self.b.ins().load(types::I8, MF, h, GEN_STATUS);
+        self.guard_eq(status, GEN_SUSPENDED as i64, helper);
+        let sent = self.b.ins().load(types::I32, MF, h, GEN_DST);
+        self.guard_eq(sent, NO_SEND as i32 as i64, helper);
+        let slots = self.b.ins().load(self.ptr, MF, h, GEN_SLOTS);
+        self.guard(slots, helper);
+        let cell = self.b.ins().load(self.ptr, MF, h, GEN_ENTRY);
+        let entry = self.b.ins().load(self.ptr, MF, cell, 0);
+        self.guard(entry, helper);
+        // Taking `running`: with plain stores when no other thread can
+        // reach the generator (the GIL; or, free-threaded, its only
+        // reference is this thread's), as CPython's specialized loops do;
+        // else atomically.
+        let (zero8, one8) = (self.b.ins().iconst(types::I8, 0), self.b.ins().iconst(types::I8, 1));
+        let owned = self.b.create_block();
+        let alone = self.b.append_block_param(owned, types::I8);
+        let unique = match self.l.rc {
+            Rc::Gil => Some(self.b.ins().iconst(types::I8, 1)),
+            Rc::Ft { tid, local, shared } => {
+                let t = self.b.ins().load(self.ptr, MF, it, tid);
+                let c1 = self.b.ins().icmp(IntCC::Equal, t, self.tid);
+                let l = self.b.ins().load(types::I32, MF, it, local);
+                let c2 = self.b.ins().icmp_imm_s(IntCC::Equal, l, 1);
+                let sh = self.b.ins().load(self.ptr, MF, it, shared);
+                let c3 = self.b.ins().icmp_imm_s(IntCC::Equal, sh, 0);
+                let c = self.b.ins().band(c1, c2);
+                Some(self.b.ins().band(c, c3))
+            }
+            Rc::Calls => None,
+        };
+        let atomic = self.b.create_block();
+        match unique {
+            Some(u) => {
+                let plain = self.b.create_block();
+                self.b.ins().brif(u, plain, &[], atomic, &[]);
+                self.b.switch_to_block(plain);
+                let r = self.b.ins().load(types::I8, MF, h, GEN_RUNNING);
+                self.guard_eq(r, 0, helper);
+                self.b.ins().store(MF, one8, h, GEN_RUNNING);
+                self.b.ins().jump(owned, &[BlockArg::Value(one8)]);
+            }
+            None => {
+                self.b.ins().jump(atomic, &[]);
+            }
+        }
+        self.b.switch_to_block(atomic);
+        let old = self.b.ins().atomic_cas(MemFlagsData::trusted(), h, zero8, one8);
+        self.guard_eq(old, 0, helper);
+        self.b.ins().jump(owned, &[BlockArg::Value(zero8)]);
+        self.b.switch_to_block(owned);
+        // Running: its context, entered after its `yield`.
+        let ctx = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, CTX_SIZE as u32 + 8, 3));
+        let z = self.b.ins().iconst(self.ptr, 0);
+        self.b.ins().stack_store(self.ptr, self.tid, ctx, CTX_TID);
+        self.b.ins().stack_store(self.ptr, z, ctx, CTX_RET);
+        self.b.ins().stack_store(self.ptr, slots, ctx, CTX_SLOTS);
+        let tgt = self.b.ins().load(self.ptr, MF, h, GEN_TARGET);
+        self.b.ins().stack_store(self.ptr, tgt, ctx, CTX_TARGET);
+        self.b.ins().stack_store(self.ptr, z, ctx, CTX_EXIT);
+        let want = self.b.ins().iconst(self.ptr, out.is_some() as i64);
+        self.b.ins().stack_store(self.ptr, want, ctx, CTX_WANT_INT);
+        let at = self.b.ins().load(types::I32, MF, h, GEN_PC);
+        let at = self.b.ins().iadd_imm_s(at, 1);
+        self.b.ins().stack_store(self.ptr, at, ctx, CTX_SIZE);
+        let cp = self.b.ins().stack_addr(self.ptr, ctx, 0);
+        let pcp = self.b.ins().stack_addr(self.ptr, ctx, CTX_SIZE);
+        let z32 = self.b.ins().iconst(types::I32, 0);
+        let mut sig = Signature::new(self.call_conv);
+        sig.params.extend([AbiParam::new(self.ptr), AbiParam::new(self.ptr), AbiParam::new(self.ptr), AbiParam::new(types::I32)]);
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.b.import_signature(sig);
+        let call = self.b.ins().call_indirect(sig, entry, &[cp, slots, pcp, z32]);
+        let st = self.b.inst_results(call)[0];
+        let np = self.b.ins().stack_load(self.ptr, types::I32, ctx, CTX_SIZE);
+        let (value, rest, int, other) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let c = self.b.ins().icmp_imm_u(IntCC::Equal, st, YIELD as i64);
+        self.b.ins().brif(c, value, &[], rest, &[]);
+        self.b.switch_to_block(rest);
+        let c = self.b.ins().icmp_imm_u(IntCC::Equal, st, YIELD_INT as i64);
+        self.b.ins().brif(c, int, &[], other, &[]);
+        // Suspended at its next `yield`: where, and where a value sent there
+        // goes; then it is not running.
+        let suspended = |s: &mut Self| {
+            s.b.ins().store(MF, np, h, GEN_PC);
+            let table = s.b.ins().load(s.ptr, MF, h, GEN_YIELD_DST);
+            let i = s.b.ins().uextend(types::I64, np);
+            let i = s.b.ins().ishl_imm_u(i, 2);
+            let a = s.b.ins().iadd(table, i);
+            let d = s.b.ins().load(types::I32, MF, a, 0);
+            s.b.ins().store(MF, d, h, GEN_DST);
+            let zero8 = s.b.ins().iconst(types::I8, 0);
+            let (plain, atomic, done) = (s.b.create_block(), s.b.create_block(), s.b.create_block());
+            s.b.ins().brif(alone, plain, &[], atomic, &[]);
+            s.b.switch_to_block(plain);
+            s.b.ins().store(MF, zero8, h, GEN_RUNNING);
+            s.b.ins().jump(done, &[]);
+            s.b.switch_to_block(atomic);
+            s.b.ins().atomic_store(MemFlagsData::trusted(), zero8, h);
+            s.b.ins().jump(done, &[]);
+            s.b.switch_to_block(done);
+        };
+        self.b.switch_to_block(value);
+        suspended(self);
+        let v = self.b.ins().stack_load(self.ptr, self.ptr, ctx, CTX_RET);
+        self.put(dst, v);
+        self.wrote(pc);
+        self.f.vals.insert(dst, Virt::ptr(v, true));
+        self.goto(pc, pc as u32 + 1);
+        self.f.vals = saved.clone();
+        self.b.switch_to_block(int);
+        suspended(self);
+        let x = self.b.ins().stack_load(self.ptr, types::I64, ctx, CTX_RET);
+        self.next_int(pc, dst, x);
+        // Returned, raised, bailed out: the runtime finishes it.
+        self.b.set_cold_block(other);
+        self.b.switch_to_block(other);
+        let op = match out {
+            Some(out) => self.b.ins().stack_addr(self.ptr, out, 0),
+            None => self.b.ins().iconst(self.ptr, 0),
+        };
+        let d = self.i32c(dst);
+        let regs = self.f.regs;
+        let st = self.call(self.h.gen_resumed, &[it, cp, st, np, regs, d, op], Some(types::I32)).unwrap();
+        self.for_iter_result(pc, dst, target, st, out);
+        self.f.vals = saved;
+        self.f.done = false;
     }
 
     /// After `ForIter`'s helper: its status `st`.

@@ -139,6 +139,17 @@ impl Regs {
         }
     }
 
+    /// `r = None` (immortal: no reference to take).
+    pub fn set_none(&mut self, r: u32) {
+        // SAFETY: None is a valid object.
+        let none = unsafe { ffi::Py_None() };
+        let old = std::mem::replace(&mut self.slots_mut()[r as usize], none as u64) as *mut ffi::PyObject;
+        if !old.is_null() {
+            // SAFETY: as in `set_obj`; callers are attached.
+            unsafe { crate::rc::decref(old) };
+        }
+    }
+
     /// Make register `r` unbound again.
     pub fn clear(&mut self, r: u32) {
         let old = std::mem::replace(&mut self.slots_mut()[r as usize], 0);
