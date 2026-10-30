@@ -2,6 +2,8 @@
 # Paths of compiled code: specialized, guarded, inlined code meeting values
 # its caches did not see. Its output must match CPython's, compiled
 # (eagerly too) and interpreted.
+from collections.abc import Iterable
+
 import jit_paths_patch
 
 
@@ -74,6 +76,62 @@ def catch(n: int) -> int:
         return boom(n)
     except ValueError as e:
         return -len(str(e))
+
+
+def sq(n: int) -> int:
+    if n < 0:
+        return -n * n
+    return n * n
+
+
+def sq1(k: int) -> int:
+    return sq(k) + 1
+
+
+def sqs(n: int, k: int) -> int:
+    s = 0
+    for i in range(n):
+        s += sq1(i - n // 2) % 1000 + sq1(k) % 7
+    return s
+
+
+def total(xs: list[int]) -> int:
+    t = 0
+    for x in xs:
+        t += x
+    return t
+
+
+def total_of(xs: Iterable[int]) -> int:
+    t = 0
+    for x in xs:
+        t += x
+    return t
+
+
+def halves(xs: list[int]) -> list[int]:
+    out: list[int] = []
+    it = iter(xs)
+    for x in it:
+        if x == 3:
+            break
+        out.append(x)
+    for x in it:
+        out.append(-x)
+    # Exhausted: stays so, even as the list grows.
+    xs.append(99)
+    for x in it:
+        out.append(x)
+    return out
+
+
+def grow(xs: list[int]) -> int:
+    n = 0
+    for x in xs:
+        if x < 5:
+            xs.append(x + 10)
+        n += 1
+    return n
 
 
 def deep(n: int) -> int:
@@ -167,6 +225,14 @@ if __name__ == "__main__":
     print(len({id(p) for p in t}), t[0].x, t[-1].x)
     print(watched(500))
     print(jit_paths_patch.report())
+    # Ints returned unboxed from inlined calls, then too big for that.
+    print(sqs(300, 3), sqs(10, 2**31), sqs(10, 2**40), sqs(10, -(2**40)), sqs(10, 2**70))
+    print(sq1(2**31), sq1(2**40), sq1(-(2**40)), sq1(2**70), sq1(3))
+    # Iterating lists inline; then other iterables.
+    print(sum([total([i, 2, 3]) for i in range(300)]), total(list(range(10))))
+    print(halves([1, 2, 3, 4, 5]), [len(halves([1, 2, 3, i])) for i in range(300)][-1])
+    print([grow([1, 7, 3]) for _ in range(300)][-1])
+    print(sum([total_of([i, 2]) for i in range(300)]), total_of(range(5)), total_of({1: 0, 2: 0}), total_of((4, 5)))
     # Exceptions leaving directly called compiled code.
     print([catch(i % 7) for i in range(300)][-5:])
     try:

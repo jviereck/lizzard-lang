@@ -269,6 +269,7 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         false_: unsafe { ffi::Py_False() } as usize,
         epoch: crate::globals::epoch_addr(),
         small_ints: small_ints(),
+        list_iter: list_iter(),
     };
     let mut deps = f.jit.deps.try_lock().ok()?;
     let unit = unit(py, f, &mut deps, 0);
@@ -380,6 +381,45 @@ extern "C" fn lz_missed(ctx_: *mut c_void) {
         f.jit.loops.store(0, Ordering::Relaxed);
         f.jit.entry.store(0, Ordering::Release);
     }
+}
+
+/// The layout of list iterators, if CPython's agrees with what compiled
+/// code reads (checked once on a list being iterated).
+fn list_iter() -> Option<lizzard_jit::ListIter> {
+    static LAYOUT: OnceLock<Option<lizzard_jit::ListIter>> = OnceLock::new();
+    *LAYOUT.get_or_init(|| {
+        let head = std::mem::size_of::<ffi::PyObject>();
+        let l = lizzard_jit::ListIter { tp: 0, index: head as i32, seq: head as i32 + 8, size: head as i32, items: head as i32 + 8, end_index: false };
+        // SAFETY: attached (compiling); the objects are released again.
+        unsafe {
+            let a = ffi::PyLong_FromLongLong(1000);
+            let b = ffi::PyLong_FromLongLong(2000);
+            let list = ffi::PyList_New(0);
+            ffi::PyList_Append(list, a);
+            ffi::PyList_Append(list, b);
+            let it = ffi::PyObject_GetIter(list);
+            let first = ffi::PyIter_Next(it);
+            let at = |o: *mut ffi::PyObject, off: i32| *((o as *mut u8).add(off as usize) as *const usize);
+            let ok = !first.is_null()
+                && first == a
+                && at(it, l.index) == 1
+                && at(it, l.seq) == list as usize
+                && at(list, l.size) == 2
+                && *(at(list, l.items) as *const *mut ffi::PyObject).add(1) == b;
+            // How the end is marked: no list, or (free threading) no index.
+            let second = ffi::PyIter_Next(it);
+            let past = ffi::PyIter_Next(it);
+            let end_index = at(it, l.seq) != 0;
+            let ok = ok && second == b && past.is_null() && ffi::PyErr_Occurred().is_null() && (if end_index { at(it, l.index) == usize::MAX && at(it, l.seq) == list as usize } else { true });
+            let tp = ffi::Py_TYPE(it) as usize;
+            for o in [first, second, it, list, a, b] {
+                if !o.is_null() {
+                    ffi::Py_DecRef(o);
+                }
+            }
+            ok.then_some(lizzard_jit::ListIter { tp, end_index, ..l })
+        }
+    })
 }
 
 /// Where CPython keeps its preallocated small ints (-5..=256), if they are
