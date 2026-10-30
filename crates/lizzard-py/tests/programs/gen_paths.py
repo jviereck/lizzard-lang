@@ -183,6 +183,80 @@ def sum_chained(n: int) -> int:
     return t
 
 
+def sum_delegating(n: int) -> int:
+    # `r = yield from ...` and a value after it, from a compiled loop.
+    t = 0
+    for x in delegating(n):
+        t = t * 3 + x
+    return t
+
+
+def inner_fails(n: int) -> Generator[int, None, int]:
+    for i in range(n):
+        if i == 4:
+            raise KeyError(i)
+        yield i
+    return -1
+
+
+def outer_catches(n: int) -> Iterator[int]:
+    try:
+        r = yield from inner_fails(n)
+        yield r
+    except KeyError as e:
+        yield 1000 + len(str(e))
+    yield 5
+
+
+def outer_lets_go(n: int) -> Iterator[int]:
+    yield from inner_fails(n)
+    yield 6
+
+
+def sum_outer(n: int) -> int:
+    t = 0
+    for x in outer_catches(n):
+        t = t * 7 + x
+    return t
+
+
+def sum_lets_go(n: int) -> int:
+    t = 0
+    try:
+        for x in outer_lets_go(n):
+            t += x
+    except KeyError:
+        t = -t
+    return t
+
+
+def deeper(n: int, depth: int) -> Iterator[int]:
+    if depth == 0:
+        yield from count(n)
+    else:
+        yield from deeper(n, depth - 1)
+        yield depth
+
+
+def sum_deeper(n: int) -> int:
+    t = 0
+    for x in deeper(n, 4):
+        t = t * 2 + x
+    return t
+
+
+def from_python(n: int) -> Iterator[int]:
+    yield from gen_paths_patch.py_gen(n)
+    yield 9
+
+
+def sum_from_python(n: int) -> int:
+    t = 0
+    for x in from_python(n):
+        t += x
+    return t
+
+
 def rest_of(g: Iterator[int]) -> int:
     t = 0
     for x in g:
@@ -214,6 +288,10 @@ if __name__ == "__main__":
     print(kept(5), [len(kept(50)) for _ in range(300)][-1])
     print([count_flags(n) for n in range(300)][-1], count_flags(5))
     print([sum_guarded(10) for _ in range(300)][-1], [sum_chained(20) for _ in range(300)][-1])
+    print([sum_delegating(n) for n in range(300)][-1], sum_delegating(3))
+    print([sum_outer(n) for n in (3, 9)], [sum_outer(9) for _ in range(300)][-1])
+    print([sum_lets_go(n) for n in (3, 9)], [sum_lets_go(9) for _ in range(300)][-1])
+    print([sum_deeper(n) for n in range(300)][-1] % 1000003, [sum_from_python(n) for n in range(300)][-1])
     part = squares_of(10, 1)
     print(next(part), next(part), rest_of(part), [rest_of(squares_of(n, 1)) for n in range(300)][-1])
     g = thrown()

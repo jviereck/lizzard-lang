@@ -689,7 +689,7 @@ pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, 
 
 /// `run`; `want_int`: a `yield` of an unboxed int gives `Ran::YieldInt`.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 pub(crate) fn run_with<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>, want_int: bool) -> Ran<'py> {
     let slots = regs.as_mut_ptr();
     let target = Target { py, f, globals, closure };

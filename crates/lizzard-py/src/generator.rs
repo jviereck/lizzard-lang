@@ -70,7 +70,8 @@ pub(crate) enum Next<'py> {
     Value(Bound<'py, PyAny>),
     /// An int it yielded as it is.
     Int(i64),
-    End,
+    /// It returned (the value).
+    End(Bound<'py, PyAny>),
     /// Not this way: `resume`.
     Slow,
 }
@@ -263,6 +264,7 @@ impl LizzardGenerator {
     /// not running, not delegating (`yield from`) and keeps no handled
     /// exception; else `Slow` (`resume` does it). `want_int`: an int it
     /// yields unboxed comes as it is.
+    #[inline(always)]
     pub(crate) fn next_direct<'py>(&self, py: Python<'py>, want_int: bool) -> PyResult<Next<'py>> {
         let Some(entry) = crate::jit::loaded(&self.rt) else { return Ok(Next::Slow) };
         if self.rt.sets_handled || self.running.swap(true, Ordering::Acquire) {
@@ -273,24 +275,47 @@ impl LizzardGenerator {
         r
     }
 
+    #[inline(always)]
     fn next_running<'py>(&self, py: Python<'py>, entry: lizzard_jit::Entry, want_int: bool) -> PyResult<Next<'py>> {
         // SAFETY: this thread set `running`: the frame is its own.
         let slot = unsafe { &mut *self.frame.get() };
         let status = self.status();
         let frame = match (status, slot.as_mut()) {
-            (Status::Created | Status::Suspended, Some(f)) if f.delegate.is_none() && f.handled.is_none() => f,
+            (Status::Created | Status::Suspended, Some(f)) if f.handled.is_none() => f,
             _ => return Ok(Next::Slow),
         };
-        let mut pc = if status == Status::Suspended {
-            // `next()` sends None to the `yield`.
-            frame.regs.set_obj(frame.dst, py.None().into_bound(py));
-            frame.pc + 1
-        } else {
-            0
+        let mut pending = None;
+        let mut pc = match (status, &frame.delegate) {
+            // `yield from` another Lizzard generator: its next item, the
+            // same way (still running, as Python's are); its end continues
+            // here with its return value, its exception is raised at the
+            // `yield from`.
+            (Status::Suspended, Some(d)) => {
+                let d = d.bind(py).clone();
+                match delegate_next(py, d, want_int) {
+                    Ok(Next::End(v)) => {
+                        frame.delegate = None;
+                        frame.regs.set_obj(frame.dst, v);
+                        frame.pc + 1
+                    }
+                    Err(e) => {
+                        frame.delegate = None;
+                        pending = Some(e);
+                        frame.pc
+                    }
+                    r => return r,
+                }
+            }
+            (Status::Suspended, None) => {
+                // `next()` sends None to the `yield`.
+                frame.regs.set_obj(frame.dst, py.None().into_bound(py));
+                frame.pc + 1
+            }
+            _ => 0,
         };
         self.set_status(Status::Suspended);
         let globals = self.globals.bind(py);
-        let ran = crate::jit::run_with(py, entry, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, None, want_int);
+        let ran = crate::jit::run_with(py, entry, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, pending, want_int);
         let r = match ran {
             crate::jit::Ran::Exit(Exit::Yield { value, dst }) => {
                 frame.pc = pc;
@@ -306,7 +331,7 @@ impl LizzardGenerator {
         };
         Ok(match self.after(py, slot, pc, r, None)? {
             Sent::Next(v) => Next::Value(v),
-            Sent::Return(_) => Next::End,
+            Sent::Return(v) => Next::End(v),
         })
     }
 
@@ -326,6 +351,21 @@ impl LizzardGenerator {
             Err(e) => Err(e),
         }
     }
+}
+
+/// The next item of the iterator a `yield from` delegates to (`next_direct`
+/// of a Lizzard generator; `Slow` for others). Kept out of line: the
+/// recursion would stop the compiler from inlining `next_direct` into the
+/// loop helpers.
+#[inline(never)]
+fn delegate_next<'py>(py: Python<'py>, d: Bound<'py, PyAny>, want_int: bool) -> PyResult<Next<'py>> {
+    // SAFETY: a type pointer comparison on a valid object.
+    if unsafe { ffi::Py_TYPE(d.as_ptr()) } != type_ptr() {
+        return Ok(Next::Slow);
+    }
+    // SAFETY: the type says what it is.
+    let inner = unsafe { d.cast_into_unchecked::<LizzardGenerator>() };
+    inner.get().next_direct(py, want_int)
 }
 
 /// `ForIter` over Lizzard generator `it` (as `ops::lz_for_iter_py` over
@@ -356,7 +396,7 @@ unsafe fn for_iter_with(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi:
     let r = match g.next_direct(py, out.is_some()) {
         Ok(Next::Slow) => match g.resume(py, Op::Send(py.None().into_bound(py))) {
             Ok(Sent::Next(v)) => Ok(Next::Value(v)),
-            Ok(Sent::Return(_)) => Ok(Next::End),
+            Ok(Sent::Return(v)) => Ok(Next::End(v)),
             Err(e) => Err(e),
         },
         r => r,

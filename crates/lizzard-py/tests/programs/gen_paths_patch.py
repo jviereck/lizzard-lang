@@ -26,3 +26,9 @@ def send_first(g, v):
         g.send(v)
     except TypeError as e:
         return f"TypeError {e}"
+
+
+def py_gen(n):
+    # A Python generator under a Lizzard `yield from`.
+    for i in range(n):
+        yield i * 2
