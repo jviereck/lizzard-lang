@@ -60,6 +60,23 @@ def mods(n: int) -> int:
     return s
 
 
+def boom(n: int) -> int:
+    if n == 0:
+        raise ValueError("boom")
+    return boom(n - 1) + 1
+
+
+def catch(n: int) -> int:
+    try:
+        return boom(n)
+    except ValueError as e:
+        return -len(str(e))
+
+
+def deep(n: int) -> int:
+    return deep(n + 1) + 1
+
+
 if __name__ == "__main__":
     bs = [Body(float(i), 1.0) for i in range(5)]
     for _ in range(3):
@@ -84,6 +101,12 @@ if __name__ == "__main__":
         keep(b)
     print(keep(b), b.x)
     print(mods(300))
+    # Exceptions leaving directly called compiled code.
+    print([catch(i % 7) for i in range(300)][-5:])
+    try:
+        deep(0)
+    except RecursionError:
+        print("RecursionError")
     # The class changes: guards miss, inlined code hands over.
     import jit_paths_patch
     jit_paths_patch.patch()

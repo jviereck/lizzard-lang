@@ -58,36 +58,69 @@ pub struct JitCell {
 const MAX_COMPILES: u32 = 4;
 const BAILS_TO_RECOMPILE: u32 = 1000;
 
-/// A function compiled code calls directly (`Helpers::enter`).
+/// A function compiled code calls directly (`Helpers::enter`, or its
+/// code with `target` for the callee's context).
 pub struct CallDesc {
     func: Py<LizzardFunction>,
+    target: Target<'static, 'static>,
 }
 
-/// What compiled code's helpers need, behind its opaque `ctx` pointer. The
-/// first two fields are at `lizzard_jit::CTX_TID` and `CTX_RET`.
+impl CallDesc {
+    fn new(func: Py<LizzardFunction>) -> Box<CallDesc> {
+        // SAFETY: the function object (on Python's heap, alive while the
+        // description holds it) does not move.
+        let lf: &'static LizzardFunction = unsafe { &*(func.get() as *const LizzardFunction) };
+        let py = unsafe { Python::assume_attached() };
+        let target = Target { py, f: &lf.rt, globals: lf.globals.bind(py), closure: &lf.closure };
+        Box::new(CallDesc { func, target })
+    }
+}
+
+// SAFETY: the target refers to the function object the description keeps;
+// it is only used by threads attached to the interpreter.
+unsafe impl Send for CallDesc {}
+unsafe impl Sync for CallDesc {}
+
+/// The function a frame runs, for compiled code's helpers.
+pub(crate) struct Target<'a, 'py> {
+    py: Python<'py>,
+    f: &'a FuncRt,
+    globals: &'a Bound<'py, PyDict>,
+    closure: &'a [Py<PyAny>],
+}
+
+/// What compiled code's helpers need, behind its opaque `ctx` pointer: the
+/// fields compiled code reads or writes (`lizzard_jit::CTX_TID`, ...), all
+/// one machine word, so that compiled code builds a callee's context
+/// itself.
 #[repr(C)]
 pub(crate) struct Ctx<'a, 'py> {
     tid: usize,
     /// The value `return` returns (a new reference).
     ret: *mut ffi::PyObject,
-    py: Python<'py>,
-    f: &'a FuncRt,
-    globals: &'a Bound<'py, PyDict>,
-    closure: &'a [Py<PyAny>],
     slots: *mut u64,
-    exit: Option<Exit<'py>>,
+    target: *const Target<'a, 'py>,
+    /// How `step` left the function (a yield).
+    exit: Option<Box<Exit<'py>>>,
 }
 
+const _: () = assert!(std::mem::size_of::<Ctx>() == lizzard_jit::CTX_SIZE as usize);
+
 impl<'a, 'py> Ctx<'a, 'py> {
-    fn new(py: Python<'py>, f: &'a FuncRt, globals: &'a Bound<'py, PyDict>, closure: &'a [Py<PyAny>], slots: *mut u64) -> Self {
-        Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), py, f, globals, closure, slots, exit: None }
+    fn new(target: &Target<'a, 'py>, slots: *mut u64) -> Self {
+        Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), slots, target, exit: None }
+    }
+
+    fn t(&self) -> &'a Target<'a, 'py> {
+        // SAFETY: the target outlives the frame's code.
+        unsafe { &*self.target }
     }
 
     /// A view of the frame's registers.
     fn regs(&self) -> Regs {
         // SAFETY: the frame's slots, one per register of `f`; nothing else
         // uses them while a helper runs.
-        unsafe { Regs::window(self.slots, &self.f.objs) }
+        unsafe { Regs::window(self.slots, &self.t().f.objs) }
     }
 }
 
@@ -212,6 +245,11 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         init_returned: a(lz_init_returned as *const ()),
         finish: a(lz_finish as *const ()),
         vectorcall: a(ffi::PyObject_Vectorcall as *const ()),
+        enter_recursive: a(ffi::Py_EnterRecursiveCall as *const ()),
+        leave_recursive: a(ffi::Py_LeaveRecursiveCall as *const ()),
+        recursion_msg: c" while calling a Lizzard function".as_ptr() as usize,
+        resume: a(lz_resume as *const ()),
+        take_exit: a(lz_take_exit as *const ()),
         unwind: a(lz_unwind as *const ()),
     };
     let head = std::mem::size_of::<ffi::PyObject>() as i32;
@@ -262,12 +300,12 @@ fn count(specs: &[Spec]) -> u32 {
 /// caches know more by now, recompile (once the function is warm again).
 extern "C" fn lz_missed(ctx_: *mut c_void) {
     let ctx = ctx(ctx_);
-    let f = ctx.f;
+    let f = ctx.t().f;
     if f.jit.compiles.load(Ordering::Relaxed) >= MAX_COMPILES {
         return;
     }
     let mut deps = Vec::new();
-    let now = count(&specs(ctx.py, f, &mut deps, 1));
+    let now = count(&specs(ctx.t().py, f, &mut deps, 1));
     if now > f.jit.nspecs.load(Ordering::Relaxed) {
         if debug() {
             eprintln!("lizzard: {} has more cache data: recompiling", f.ir.name);
@@ -366,7 +404,7 @@ fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth
                         // SAFETY: a valid object.
                         None if unsafe { ffi::Py_TYPE(func) } == &raw mut ffi::PyMethodDescr_Type => {
                             let n = args.len() + 1;
-                            Spec::Call(CallSpec { guard, desc: func as usize, nregs: n as u32, checks: vec![Quick::Any; n], inline: None, native: true })
+                            Spec::Call(CallSpec { guard, desc: func as usize, nregs: n as u32, checks: vec![Quick::Any; n], inline: None, native: true, entry: 0, target: 0 })
                         }
                         None => Spec::None,
                     }
@@ -418,14 +456,17 @@ fn call_spec<'a>(py: Python<'_>, site: &FuncRt, pc: usize, callee: *mut ffi::PyO
     // SAFETY: the description keeps the function alive as long as the
     // caller's code (`deps`), longer than compiling it.
     let callee_rt: &'a FuncRt = unsafe { &*Arc::as_ptr(&rt) };
-    let desc = Box::new(CallDesc { func });
+    let desc = CallDesc::new(func);
     let addr = &*desc as *const CallDesc as usize;
+    // Called directly when it never writes its parameters (they are the
+    // caller's).
+    let (entry, target) = if callee_rt.borrow_params { (&callee_rt.jit.entry as *const AtomicUsize as usize, &desc.target as *const Target as usize) } else { (0, 0) };
     deps.push(desc);
     // A small callee, warm (it ran), may be compiled into the caller.
     let inline = (depth == 0 && callee_rt.ir.code.len() <= 48 && callee_rt.jit.calls.load(Ordering::Relaxed) + callee_rt.jit.compiles.load(Ordering::Relaxed) > 0)
         .then(|| Box::new(unit(py, callee_rt, deps, 1)))
         .filter(|u| lizzard_jit::inlinable(u));
-    Some(((), CallSpec { guard: CallGuard::Func(0), desc: addr, nregs, checks, inline, native: false }))
+    Some(((), CallSpec { guard: CallGuard::Func(0), desc: addr, nregs, checks, inline, native: false, entry, target }))
 }
 
 /// Run a frame from `pc` in compiled code until it returns or yields, as
@@ -467,7 +508,8 @@ pub enum Ran<'py> {
 #[allow(clippy::too_many_arguments)]
 pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>) -> Ran<'py> {
     let slots = regs.as_mut_ptr();
-    let mut ctx = Ctx::new(py, f, globals, closure, slots);
+    let target = Target { py, f, globals, closure };
+    let mut ctx = Ctx::new(&target, slots);
     let throw = pending.is_some();
     if let Some(e) = pending {
         e.restore(py);
@@ -480,7 +522,7 @@ pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, 
     match status {
         // SAFETY: compiled code stored a new reference.
         EXIT if !ctx.ret.is_null() => Ran::Exit(Exit::Return(unsafe { Bound::from_owned_ptr(py, ctx.ret) })),
-        EXIT => Ran::Exit(ctx.exit.take().expect("compiled code exits with a value")),
+        EXIT => Ran::Exit(*ctx.exit.take().expect("compiled code exits with a value")),
         BAIL => {
             bailed(f);
             Ran::Bail
@@ -499,14 +541,14 @@ fn ctx<'c>(ctx: *mut c_void) -> &'c mut Ctx<'c, 'c> {
 extern "C" fn lz_step(ctx_: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
     let ctx = ctx(ctx_);
     let mut regs = ctx.regs();
-    let py = ctx.py;
+    let py = ctx.t().py;
     let mut next = pc as usize;
-    let r = catch_unwind(AssertUnwindSafe(|| step(py, ctx.f, ctx.globals, ctx.closure, &mut regs, &mut next)));
+    let r = catch_unwind(AssertUnwindSafe(|| step(py, ctx.t().f, ctx.t().globals, ctx.t().closure, &mut regs, &mut next)));
     match r {
         Ok(Ok(None)) if next == pc as usize + 1 => NEXT,
         Ok(Ok(None)) => TAKEN,
         Ok(Ok(Some(exit))) => {
-            ctx.exit = Some(exit);
+            ctx.exit = Some(Box::new(exit));
             EXIT
         }
         Ok(Err(e)) => {
@@ -524,15 +566,15 @@ extern "C" fn lz_step(ctx_: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
 extern "C" fn lz_catch(ctx_: *mut c_void, _slots: *mut u64, reg: u32) {
     let ctx = ctx(ctx_);
     let mut regs = ctx.regs();
-    let e = PyErr::fetch(ctx.py);
-    regs.set_obj(reg, e.into_value(ctx.py).into_bound(ctx.py).into_any());
+    let e = PyErr::fetch(ctx.t().py);
+    regs.set_obj(reg, e.into_value(ctx.t().py).into_bound(ctx.t().py).into_any());
 }
 
 /// At a loop back-edge, now and then: run signal handlers (Ctrl-C raises
 /// KeyboardInterrupt), and detach for a moment so that a stop-the-world
 /// pause (the free-threaded GC) can happen.
 extern "C" fn lz_safepoint(ctx_: *mut c_void) -> u32 {
-    let py = ctx(ctx_).py;
+    let py = ctx(ctx_).t().py;
     if let Err(e) = py.check_signals() {
         e.restore(py);
         return ERROR;
@@ -545,7 +587,7 @@ extern "C" fn lz_safepoint(ctx_: *mut c_void) -> u32 {
 extern "C" fn lz_call(ctx_: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
     let ctx = ctx(ctx_);
     let mut regs = ctx.regs();
-    let (py, f) = (ctx.py, ctx.f);
+    let (py, f) = (ctx.t().py, ctx.t().f);
     let pc = pc as usize;
     let r = match &f.ir.code[pc] {
         Instr::Call { dst, .. } | Instr::CallMethod { dst, .. } => crate::interp::call_at(py, f, pc, &regs).map(|v| (*dst, v)),
@@ -567,9 +609,9 @@ extern "C" fn lz_call(ctx_: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
 extern "C" fn lz_load_global(ctx_: *mut c_void, _slots: *mut u64, dst: u32, pc: u32) -> u32 {
     let ctx = ctx(ctx_);
     let mut regs = ctx.regs();
-    let (py, f) = (ctx.py, ctx.f);
+    let (py, f) = (ctx.t().py, ctx.t().f);
     let Instr::LoadGlobal { name, .. } = &f.ir.code[pc as usize] else { unreachable!("lz_load_global on another instruction") };
-    let r = crate::interp::builtins_dict(py).and_then(|b| crate::globals::load(py, &f.gics[pc as usize], ctx.globals, b, f.names[*name as usize].bind(py)));
+    let r = crate::interp::builtins_dict(py).and_then(|b| crate::globals::load(py, &f.gics[pc as usize], ctx.t().globals, b, f.names[*name as usize].bind(py)));
     match r {
         Ok(v) => {
             regs.set_obj(dst, v);
@@ -588,7 +630,7 @@ extern "C" fn lz_check(ctx_: *mut c_void, slots: *mut u64, reg: u32, idx: u32, p
     unsafe {
         let o = *slots.add(reg as usize) as *mut ffi::PyObject;
         let c = ctx(ctx_);
-        if !o.is_null() && crate::rt::quick(o, c.f.ck(c.py, idx)) {
+        if !o.is_null() && crate::rt::quick(o, c.t().f.ck(c.t().py, idx)) {
             return NEXT;
         }
         lz_step(ctx_, slots, pc)
@@ -631,7 +673,7 @@ extern "C" fn lz_long_value(o: *mut ffi::PyObject, out: *mut i64) -> u32 {
 /// from `pc` on `frame`, its parameters borrowed; then the frame is
 /// released. Its result (a new reference), or null with an exception set.
 extern "C" fn lz_finish(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc, pc: u32) -> *mut ffi::PyObject {
-    let py = ctx(ctx_).py;
+    let py = ctx(ctx_).t().py;
     // SAFETY: the description lives as long as the caller's code.
     let lf = unsafe { (*desc).func.get() };
     let rt = &*lf.rt;
@@ -653,6 +695,30 @@ extern "C" fn lz_finish(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDes
             e.restore(py);
             std::ptr::null_mut()
         }
+    }
+}
+
+/// A function compiled code called directly bailed out at `pc`: the
+/// interpreter finishes it (as `lz_finish`).
+extern "C" fn lz_resume(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc, pc: u32) -> *mut ffi::PyObject {
+    // SAFETY: the description lives as long as the caller's code.
+    bailed(unsafe { &(*desc).func.get().rt });
+    lz_finish(ctx_, frame, desc, pc)
+}
+
+/// A function compiled code called directly returned through `step`: its
+/// value, and the frame released (but the borrowed parameters).
+extern "C" fn lz_take_exit(callee: *mut c_void, desc: *const CallDesc) -> *mut ffi::PyObject {
+    let c = ctx(callee);
+    // SAFETY: the description lives as long as the caller's code.
+    let rt = unsafe { &*(*desc).func.get().rt };
+    let n = rt.ir.params.len();
+    // SAFETY: the frame's slots.
+    let slots = unsafe { std::slice::from_raw_parts_mut(c.slots, rt.objs.len()) };
+    crate::frame::release_slots(&mut slots[n..], &rt.objs[n..]);
+    match c.exit.take().map(|e| *e) {
+        Some(Exit::Return(v)) => v.into_ptr(),
+        _ => unreachable!("a function that is not a generator exits by returning"),
     }
 }
 
@@ -690,7 +756,7 @@ extern "C" fn lz_init_returned(r: *mut ffi::PyObject) {
 /// reference), or null with an exception set. The frame is released.
 extern "C" fn lz_enter(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc) -> *mut ffi::PyObject {
     let caller = ctx(ctx_);
-    let py = caller.py;
+    let py = caller.t().py;
     // SAFETY: the description lives as long as the caller's code.
     let lf = unsafe { (*desc).func.get() };
     let rt = &*lf.rt;

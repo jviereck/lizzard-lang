@@ -69,6 +69,12 @@ pub const BAIL: u32 = 4;
 /// reference).
 pub const CTX_TID: i32 = 0;
 pub const CTX_RET: i32 = 8;
+/// The frame's slots, the function's description for the helpers, and
+/// where `step` leaves a yield (null on entry); the context's size.
+pub const CTX_SLOTS: i32 = 16;
+pub const CTX_TARGET: i32 = 24;
+pub const CTX_EXIT: i32 = 32;
+pub const CTX_SIZE: i32 = 40;
 
 pub type Entry = unsafe extern "C" fn(ctx: *mut c_void, regs: *mut u64, pc: *mut u32, pending: u32) -> u32;
 
@@ -167,14 +173,26 @@ pub struct Helpers {
     pub init_returned: usize,
     /// `PyObject_Vectorcall(callable, args, nargs, kwnames)`.
     pub vectorcall: usize,
+    /// `Py_EnterRecursiveCall(where)` (`recursion_msg`) and
+    /// `Py_LeaveRecursiveCall()`, around direct calls of compiled code.
+    pub enter_recursive: usize,
+    pub leave_recursive: usize,
+    pub recursion_msg: usize,
+    /// `resume(ctx, frame, desc, pc) -> object`: a directly called
+    /// function's code bailed out at `pc`: the interpreter finishes it, as
+    /// `finish`.
+    pub resume: usize,
+    /// `take_exit(callee_ctx, desc) -> object`: a directly called function
+    /// returned through `step`: its value, and the frame released.
+    pub take_exit: usize,
     /// `finish(ctx, frame, desc, pc) -> object`: the interpreter runs the
     /// rest of an inlined call of `desc`'s function from `pc` on `frame`
     /// (its parameters borrowed) and releases the frame; the result (a new
     /// reference), or null with an exception set.
     pub finish: usize,
     /// `unwind(frame, desc, pc)`: an exception raised at `pc` leaves an
-    /// inlined call: note where, and release the frame (but its borrowed
-    /// parameters).
+    /// inlined or directly called function: note where, and release the
+    /// frame (but its borrowed parameters).
     pub unwind: usize,
     /// `missed(ctx)`: the generic paths of sites compiled without what
     /// their caches see (`Unit::misses`) ran `MISSES` times.
@@ -236,6 +254,12 @@ pub struct CallSpec<'a> {
     /// Not a Lizzard function: `desc` is a callable (a builtin method) that
     /// takes the arguments with `Helpers::vectorcall`, unchecked.
     pub native: bool,
+    /// For a callee that never writes its parameters: the address of the
+    /// word holding its compiled entry (0 while it has none), and its
+    /// context's target (`CTX_TARGET`). Compiled code then calls it
+    /// directly. 0 otherwise.
+    pub entry: usize,
+    pub target: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -706,6 +730,9 @@ struct Fn<'a> {
     /// What is known at its first instruction (an inlined function's
     /// parameters).
     seed: Vec<(Reg, Virt)>,
+    /// The object registers whose slots its code may have written (a
+    /// return releases them).
+    written: std::collections::BTreeSet<Reg>,
 }
 
 /// An inlined callee: its frame and where it continues.
@@ -721,8 +748,6 @@ struct Inlined {
     fail: Block,
     /// The caller raises at its call (the frame is released).
     raised: Block,
-    /// The object registers whose slots the code may have written.
-    written: std::collections::BTreeSet<Reg>,
 }
 
 struct Lower<'a> {
@@ -737,6 +762,8 @@ struct Lower<'a> {
     exit: Block,
     fail: Block,
     bail: Block,
+    /// `return`: its value (a new reference) and pc.
+    ret_block: Block,
     ctx: Value,
     pcp: Value,
     /// The thread's id (free-threaded reference counting).
@@ -769,6 +796,9 @@ impl<'a> Lower<'a> {
             blk
         };
         let (exit, fail, bail) = (leave(), leave(), leave());
+        let ret_block = b.create_block();
+        b.append_block_param(ret_block, ptr);
+        b.append_block_param(ret_block, types::I32);
         let fuel = b.declare_var(types::I64);
         let vars = ir.reprs.iter().map(|r| matches!(r, Repr::I64 | Repr::Bool).then(|| b.declare_var(types::I64))).collect();
         let tid = match l.rc {
@@ -776,10 +806,11 @@ impl<'a> Lower<'a> {
             _ => b.ins().iconst(ptr, 0),
         };
         let max_frame = frame_regs(u);
+        let seed = Vec::new();
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed: Vec::new() },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default() },
             h,
             l,
             ptr,
@@ -788,6 +819,7 @@ impl<'a> Lower<'a> {
             exit,
             fail,
             bail,
+            ret_block,
             ctx: ps[0],
             pcp: ps[2],
             tid,
@@ -884,6 +916,7 @@ impl<'a> Lower<'a> {
             let blk = self.f.catch_blocks[k];
             self.b.switch_to_block(blk);
             let exc = self.b.ins().iconst(types::I32, h.exc as i64);
+            self.f.written.insert(h.exc);
             self.call(self.h.catch, &[self.ctx, self.f.regs, exc], None);
             match self.f.labels.get(h.target as usize).copied().flatten() {
                 Some(t) => {
@@ -894,6 +927,21 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // A return releases the frame's references the code may have stored
+        // (its owner releases whatever else it holds).
+        self.b.switch_to_block(self.ret_block);
+        let (p, pc) = (self.b.block_params(self.ret_block)[0], self.b.block_params(self.ret_block)[1]);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        for r in self.f.written.clone() {
+            if self.is_param(r) {
+                continue;
+            }
+            let v = self.slot_load(r);
+            self.b.ins().store(MF, zero, self.f.regs, r as i32 * 8);
+            self.xdecref(v);
+        }
+        self.b.ins().store(MF, p, self.ctx, CTX_RET);
+        self.b.ins().jump(self.exit, &[BlockArg::Value(pc)]);
         for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL)] {
             self.b.switch_to_block(blk);
             let pc = self.b.block_params(blk)[0];
@@ -972,10 +1020,8 @@ impl<'a> Lower<'a> {
     }
 
     fn slot_store(&mut self, v: Value, r: Reg) {
-        if let Some(inl) = &mut self.f.inline {
-            if self.f.ir.reprs[r as usize] == Repr::Obj {
-                inl.written.insert(r);
-            }
+        if self.f.ir.reprs[r as usize] == Repr::Obj {
+            self.f.written.insert(r);
         }
         self.b.ins().store(MF, v, self.f.regs, r as i32 * 8);
     }
@@ -1280,6 +1326,9 @@ impl<'a> Lower<'a> {
     fn wrote(&mut self, pc: usize) {
         for r in self.f.ir.code[pc].writes() {
             self.f.vals.remove(&r);
+            if self.f.ir.reprs[r as usize] == Repr::Obj {
+                self.f.written.insert(r);
+            }
             if let Some(v) = self.f.vars[r as usize] {
                 let x = self.slot_load(r);
                 self.b.def_var(v, x);
@@ -2268,7 +2317,35 @@ impl<'a> Lower<'a> {
     /// `a op b` for int operands (statically): an int result in an `i64`,
     /// kept unboxed; overflow and other cases take the generic path, and the
     /// interpreter continues if its result does not fit.
+    /// Speculatively, object operands of int operations are ints: unbox
+    /// `regs` that are objects (else bail out at `pc`) and keep the values
+    /// on the registers for later uses.
+    fn speculate_ints(&mut self, pc: usize, regs: &[Reg]) {
+        if !self.f.u.speculate {
+            return;
+        }
+        let todo: Vec<Reg> = regs.iter().copied().filter(|r| !matches!(self.f.vals.get(r).map(|v| v.num), Some(Unboxed::I64(_) | Unboxed::F64(_)))).collect();
+        if todo.is_empty() {
+            return;
+        }
+        let start = self.f.vals.clone();
+        let bail = self.b.create_block();
+        for r in todo {
+            let p = self.obj(r, pc, bail);
+            let x = self.as_i64(p, bail);
+            if let Some(v) = self.f.vals.get_mut(&r) {
+                v.num = Unboxed::I64(x);
+                v.ty = Some(self.l.long_type);
+            }
+        }
+        let cont = self.b.create_block();
+        self.b.ins().jump(cont, &[]);
+        self.bail_path(bail, start, pc);
+        self.b.switch_to_block(cont);
+    }
+
     fn int_binop(&mut self, pc: usize, dst: Reg, op: BinOp, a: Reg, b: Reg) {
+        self.speculate_ints(pc, &[a, b]);
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let f = |s: &mut Self, r: Reg| -> Value {
@@ -2345,6 +2422,13 @@ impl<'a> Lower<'a> {
     /// `dst: Bool = a op b`: inline for two ints or two floats, else
     /// generic.
     fn compare_bool(&mut self, pc: usize, dst: Reg, op: CmpOp, a: Reg, b: Reg) {
+        // An object compared with an int is speculatively an int.
+        let int = |s: &Self, r: Reg| matches!(s.f.vals.get(&r).map(|v| v.num), Some(Unboxed::I64(_)));
+        if int(self, a) && !int(self, b) {
+            self.speculate_ints(pc, &[b]);
+        } else if int(self, b) && !int(self, a) {
+            self.speculate_ints(pc, &[a]);
+        }
         let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let x = self.operand(a, pc, slow);
@@ -2502,9 +2586,8 @@ impl<'a> Lower<'a> {
                 self.b.ins().jump(exit, &[BlockArg::Value(p)]);
             }
             None => {
-                self.b.ins().store(MF, p, self.ctx, CTX_RET);
                 let pcv = self.pc_val(pc);
-                self.b.ins().jump(self.exit, &[BlockArg::Value(pcv)]);
+                self.b.ins().jump(self.ret_block, &[BlockArg::Value(p), BlockArg::Value(pcv)]);
             }
         }
         self.f.vals = start;
@@ -2525,10 +2608,10 @@ impl<'a> Lower<'a> {
         } else {
             self.secure_borrowed(pc + 1, pc, &reads);
         }
-        // The arguments must stay alive during the call: in their slots or
-        // kept by the code.
         let mut all: Vec<Reg> = obj.into_iter().collect();
         all.extend(args);
+        // The arguments must stay alive during the call: in their slots or
+        // kept by the code.
         for &r in &all {
             if let Some(v) = self.f.vals.get(&r).copied() {
                 if !v.in_slot && !v.konst {
@@ -2629,7 +2712,11 @@ impl<'a> Lower<'a> {
                 }
                 let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
                 let desc = self.b.ins().iconst(self.ptr, spec.desc as i64);
-                self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap()
+                if spec.entry != 0 {
+                    self.native_call(fp, desc, spec.entry, spec.target)
+                } else {
+                    self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap()
+                }
             }
         };
         let (ok, failed) = (self.b.create_block(), self.b.create_block());
@@ -2721,8 +2808,8 @@ impl<'a> Lower<'a> {
                 (i as Reg, v)
             })
             .collect();
-        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, written: Default::default() };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed };
+        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default() };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
         self.b.ins().jump(first, &[]);
@@ -2731,7 +2818,6 @@ impl<'a> Lower<'a> {
             self.b.ins().trap(TrapCode::unwrap_user(5));
         }
         let done = std::mem::replace(&mut self.f, caller);
-        let inl = done.inline.unwrap();
         // An exception: release the frame, raise at the call.
         self.b.switch_to_block(fail);
         let d = self.b.ins().iconst(self.ptr, desc as i64);
@@ -2742,11 +2828,79 @@ impl<'a> Lower<'a> {
         // The result: release what the frame holds (but the borrowed
         // parameters).
         self.b.switch_to_block(exit);
-        for &r in inl.written.iter().filter(|&&r| r >= ir.params.len() as u32) {
+        for &r in done.written.iter().filter(|&&r| r >= ir.params.len() as u32) {
             let v = self.b.ins().load(types::I64, MF, regs, r as i32 * 8);
             self.xdecref(v);
         }
         result
     }
+
+
+    /// Call a compiled function directly on `frame` (its arguments in
+    /// place, borrowed): its result (a new reference), or null with an
+    /// exception set. `enter` while it has no code.
+    fn native_call(&mut self, fp: Value, desc: Value, entry: usize, target: usize) -> Value {
+        let done = self.b.create_block();
+        let r = self.b.append_block_param(done, self.ptr);
+        let cell = self.b.ins().iconst(self.ptr, entry as i64);
+        let code = self.b.ins().load(self.ptr, MF, cell, 0);
+        let (native, helper) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(code, native, &[], helper, &[]);
+        self.b.switch_to_block(helper);
+        let v = self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap();
+        self.b.ins().jump(done, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(native);
+        let zero = self.b.ins().iconst(self.ptr, 0);
+        let msg = self.b.ins().iconst(self.ptr, self.h.recursion_msg as i64);
+        let deep = self.call(self.h.enter_recursive, &[msg], Some(types::I32)).unwrap();
+        let go = self.b.create_block();
+        self.b.ins().brif(deep, done, &[BlockArg::Value(zero)], go, &[]);
+        self.b.switch_to_block(go);
+        // The callee's context: thread, return value, frame, target, exit.
+        let ctx = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, CTX_SIZE as u32 + 8, 3));
+        self.b.ins().stack_store(self.ptr, self.tid, ctx, CTX_TID);
+        self.b.ins().stack_store(self.ptr, zero, ctx, CTX_RET);
+        self.b.ins().stack_store(self.ptr, fp, ctx, CTX_SLOTS);
+        let t = self.b.ins().iconst(self.ptr, target as i64);
+        self.b.ins().stack_store(self.ptr, t, ctx, CTX_TARGET);
+        self.b.ins().stack_store(self.ptr, zero, ctx, CTX_EXIT);
+        // `*pc`, after the context.
+        let z32 = self.b.ins().iconst(types::I32, 0);
+        self.b.ins().stack_store(self.ptr, z32, ctx, CTX_SIZE);
+        let cp = self.b.ins().stack_addr(self.ptr, ctx, 0);
+        let pcp = self.b.ins().stack_addr(self.ptr, ctx, CTX_SIZE);
+        let mut sig = Signature::new(self.call_conv);
+        sig.params.extend([AbiParam::new(self.ptr), AbiParam::new(self.ptr), AbiParam::new(self.ptr), AbiParam::new(types::I32)]);
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.b.import_signature(sig);
+        let call = self.b.ins().call_indirect(sig, code, &[cp, fp, pcp, z32]);
+        let st = self.b.inst_results(call)[0];
+        self.call(self.h.leave_recursive, &[], None);
+        let (exited, other, returned, stepped, bailed, raised) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, st, EXIT as i64);
+        self.b.ins().brif(c, exited, &[], other, &[]);
+        self.b.switch_to_block(exited);
+        let v = self.b.ins().stack_load(self.ptr, self.ptr, ctx, CTX_RET);
+        self.b.ins().brif(v, returned, &[], stepped, &[]);
+        self.b.switch_to_block(returned);
+        self.b.ins().jump(done, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(stepped);
+        let v = self.call(self.h.take_exit, &[cp, desc], Some(self.ptr)).unwrap();
+        self.b.ins().jump(done, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(other);
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, st, BAIL as i64);
+        self.b.ins().brif(c, bailed, &[], raised, &[]);
+        self.b.switch_to_block(bailed);
+        let pcv = self.b.ins().stack_load(self.ptr, types::I32, ctx, CTX_SIZE);
+        let v = self.call(self.h.resume, &[self.ctx, fp, desc, pcv], Some(self.ptr)).unwrap();
+        self.b.ins().jump(done, &[BlockArg::Value(v)]);
+        self.b.switch_to_block(raised);
+        let pcv = self.b.ins().stack_load(self.ptr, types::I32, ctx, CTX_SIZE);
+        self.call(self.h.unwind, &[fp, desc, pcv], None);
+        self.b.ins().jump(done, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(done);
+        r
+    }
+
 
 }
