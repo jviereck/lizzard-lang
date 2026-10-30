@@ -45,6 +45,8 @@ pub struct JitCell {
     failed: AtomicBool,
     /// See `lizzard_jit::Unit::misses`.
     misses: AtomicU32,
+    /// Bail-outs made it recompile: no unboxed registers across jumps.
+    bail_recompiled: AtomicBool,
     /// How many instructions the current code has specs for.
     nspecs: AtomicU32,
     lock: Mutex<()>,
@@ -156,6 +158,7 @@ fn bailed(f: &FuncRt) {
             eprintln!("lizzard: {} bails out often: recompiling", f.ir.name);
         }
         f.jit.bails.store(0, Ordering::Relaxed);
+        f.jit.bail_recompiled.store(true, Ordering::Relaxed);
         f.jit.calls.store(0, Ordering::Relaxed);
         f.jit.loops.store(0, Ordering::Relaxed);
         // The old code stays valid for frames running it.
@@ -316,6 +319,7 @@ fn unit<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth:
         ics: f.ics.iter().map(|c| c as *const AttrIc as usize).collect(),
         borrow_params: f.borrow_params,
         misses: &f.jit.misses as *const AtomicU32 as usize,
+        carry: !f.jit.bail_recompiled.load(Ordering::Relaxed),
     }
 }
 

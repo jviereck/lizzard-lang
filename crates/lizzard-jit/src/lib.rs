@@ -282,6 +282,140 @@ pub struct Unit<'a> {
     /// The address of a `u32` counting the generic executions of attribute
     /// accesses, global loads and calls compiled without a spec.
     pub misses: usize,
+    /// Registers that hold floats or ints at a label stay unboxed across
+    /// jumps to it (`carried`). Off after bail-outs made the runtime
+    /// recompile.
+    pub carry: bool,
+}
+
+/// What a register holds at an instruction, as far as compiled code
+/// produces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Not reached yet (the analysis' start).
+    Top,
+    Unbound,
+    /// Some object.
+    Obj,
+    /// A float or an int compiled code made (it bails out otherwise).
+    F,
+    I,
+    Mixed,
+}
+
+fn meet(a: Kind, b: Kind) -> Kind {
+    match (a, b) {
+        (Kind::Top, x) | (x, Kind::Top) => x,
+        (x, y) if x == y => x,
+        _ => Kind::Mixed,
+    }
+}
+
+/// Per label, the registers that hold a float (`Kind::F`) or an int
+/// (`Kind::I`) on every path into it and are live there: they stay unboxed
+/// across the jumps (Cranelift block parameters). Not at the entry, handler
+/// targets or after yields, which the runtime enters with the slots alone.
+fn carried(u: &Unit, numbers: bool, labels: &[bool], live: &[Vec<u64>]) -> Vec<Vec<(Reg, Kind)>> {
+    let ir = u.ir;
+    let n = ir.code.len();
+    let nregs = ir.reprs.len();
+    let mut out = vec![Vec::new(); n];
+    if !u.carry || !numbers || n == 0 {
+        return out;
+    }
+    let obj = |r: Reg| ir.reprs[r as usize] == Repr::Obj;
+    let mut at: Vec<Vec<Kind>> = vec![vec![Kind::Top; nregs]; n];
+    for (r, k) in at[0].iter_mut().enumerate() {
+        *k = if r < ir.params.len() { Kind::Obj } else { Kind::Unbound };
+    }
+    let handler_of = |pc: u32| -> Vec<usize> { ir.handlers.iter().filter(|h| h.ranges.iter().any(|(s, e)| *s <= pc && pc < *e)).map(|h| h.target as usize).filter(|&t| t < n).collect() };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for pc in 0..n {
+            let i = &ir.code[pc];
+            let before = at[pc].clone();
+            let mut st = before.clone();
+            let w = |st: &mut Vec<Kind>, r: Reg, k: Kind| st[r as usize] = k;
+            match i {
+                Instr::Const { dst, idx } => w(&mut st, *dst, match u.nums[*idx as usize] {
+                    Num::F64(_) => Kind::F,
+                    Num::I64(_) => Kind::I,
+                    Num::Other => Kind::Obj,
+                }),
+                Instr::BinOp { dst, op, .. } => {
+                    let k = match ir.hints.get(pc).copied().unwrap_or(0) {
+                        HINT_FLOAT if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => Kind::F,
+                        HINT_INT if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) => Kind::I,
+                        _ => Kind::Obj,
+                    };
+                    w(&mut st, *dst, k);
+                }
+                Instr::Box { dst, src } if ir.reprs[*src as usize] == Repr::I64 => w(&mut st, *dst, Kind::I),
+                Instr::Move { dst, src } if obj(*src) && obj(*dst) => w(&mut st, *dst, before[*src as usize]),
+                Instr::Take { dst, src } if obj(*src) && obj(*dst) => {
+                    w(&mut st, *dst, before[*src as usize]);
+                    if !(u.borrow_params && (*src as usize) < ir.params.len()) {
+                        w(&mut st, *src, Kind::Unbound);
+                    }
+                }
+                Instr::Unbind { reg } => w(&mut st, *reg, Kind::Unbound),
+                _ => {
+                    for r in i.writes() {
+                        w(&mut st, r, Kind::Obj);
+                    }
+                }
+            }
+            let mut flow = |t: usize, st: &[Kind], at: &mut Vec<Vec<Kind>>| {
+                for r in 0..nregs {
+                    let m = meet(at[t][r], st[r]);
+                    if m != at[t][r] {
+                        at[t][r] = m;
+                        changed = true;
+                    }
+                }
+            };
+            for t in i.successors(pc as u32) {
+                if (t as usize) < n {
+                    flow(t as usize, &st, &mut at);
+                }
+            }
+            for h in handler_of(pc as u32) {
+                let mut hs = before.clone();
+                for r in i.writes() {
+                    hs[r as usize] = meet(hs[r as usize], Kind::Obj);
+                }
+                for hd in ir.handlers.iter().filter(|x| x.target as usize == h) {
+                    hs[hd.exc as usize] = Kind::Obj;
+                }
+                flow(h, &hs, &mut at);
+            }
+        }
+    }
+    let mut excluded = vec![false; n];
+    excluded[0] = true;
+    for h in &ir.handlers {
+        if (h.target as usize) < n {
+            excluded[h.target as usize] = true;
+        }
+    }
+    for (pc, i) in ir.code.iter().enumerate() {
+        if matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. }) && pc + 1 < n {
+            excluded[pc + 1] = true;
+        }
+    }
+    for pc in 0..n {
+        if !labels[pc] || excluded[pc] {
+            continue;
+        }
+        for r in 0..nregs {
+            let k = at[pc][r];
+            if matches!(k, Kind::F | Kind::I) && live[pc][r / 64] & (1 << (r % 64)) != 0 {
+                out[pc].push((r as Reg, k));
+            }
+        }
+    }
+    out
 }
 
 /// Instructions an inlined function may have: those compiled code does
@@ -332,6 +466,23 @@ fn frame_regs(u: &Unit) -> Option<u32> {
             _ => None,
         })
         .max()
+}
+
+/// A block per label, with a parameter per carried register.
+fn label_blocks(b: &mut FunctionBuilder, is_label: &[bool], carry: &[Vec<(Reg, Kind)>]) -> Vec<Option<Block>> {
+    is_label
+        .iter()
+        .zip(carry)
+        .map(|(&x, c)| {
+            x.then(|| {
+                let blk = b.create_block();
+                for (_, k) in c {
+                    b.append_block_param(blk, if *k == Kind::F { types::F64 } else { types::I64 });
+                }
+                blk
+            })
+        })
+        .collect()
 }
 
 /// The instructions that start a block: jump targets, the instruction
@@ -532,6 +683,9 @@ struct Fn<'a> {
     vars: Vec<Option<Variable>>,
     vals: HashMap<Reg, Virt>,
     live: Vec<Vec<u64>>,
+    /// Per label, its unboxed registers (`carried`), in the order of the
+    /// block's parameters.
+    carry: Vec<Vec<(Reg, Kind)>>,
     nparams: u32,
     /// The current block has ended (a jump, a return).
     done: bool,
@@ -590,7 +744,9 @@ impl<'a> Lower<'a> {
         let ptr = module.target_config().pointer_type();
 
         let is_label = label_pcs(ir);
-        let labels = is_label.iter().map(|&x| x.then(|| b.create_block())).collect();
+        let live = liveness(ir);
+        let carry = carried(u, l.numbers, &is_label, &live);
+        let labels = label_blocks(&mut b, &is_label, &carry);
         let catch_blocks = (0..ir.handlers.len()).map(|_| b.create_block()).collect();
         let mut leave = || {
             let blk = b.create_block();
@@ -608,7 +764,7 @@ impl<'a> Lower<'a> {
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live: liveness(ir), nparams: ir.params.len() as u32, done: false, inline: None },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None },
             h,
             l,
             ptr,
@@ -661,12 +817,30 @@ impl<'a> Lower<'a> {
         }
         at.extend(yields.iter().map(|p| p + 1));
         let mut sw = Switch::new();
+        let mut unbox = Vec::new();
         for p in at {
             if let Some(Some(blk)) = self.f.labels.get(p) {
-                sw.set_entry(p as u128, *blk);
+                if self.f.carry[p].is_empty() {
+                    sw.set_entry(p as u128, *blk);
+                } else {
+                    // Its unboxed registers from their slots.
+                    let pre = self.b.create_block();
+                    sw.set_entry(p as u128, pre);
+                    unbox.push((p, pre));
+                }
             }
         }
         sw.emit(&mut self.b, pc, bad);
+        for (p, pre) in unbox {
+            self.b.switch_to_block(pre);
+            let fallback = self.b.create_block();
+            let args = self.carried_args(p, p, fallback);
+            let blk = self.f.labels[p].unwrap();
+            self.b.ins().jump(blk, &args);
+            self.b.switch_to_block(fallback);
+            self.f.vals.clear();
+            self.bail_to(p);
+        }
 
         self.b.switch_to_block(throw);
         let mut sw = Switch::new();
@@ -728,6 +902,11 @@ impl<'a> Lower<'a> {
                 }
                 self.b.switch_to_block(blk);
                 self.f.vals.clear();
+                let params = self.b.block_params(blk).to_vec();
+                for (&(r, k), v) in self.f.carry[pc].iter().zip(params) {
+                    let (num, ty) = if k == Kind::F { (Unboxed::F64(v), self.l.float_type) } else { (Unboxed::I64(v), self.l.long_type) };
+                    self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: Some(ty), konst: false });
+                }
                 self.f.done = false;
             } else if self.f.done {
                 // Unreachable.
@@ -1102,49 +1281,94 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(self.bail, &[BlockArg::Value(v)]);
     }
 
-    /// Continue at `target` from instruction `from` (the registers live
-    /// there materialized); a backward jump spends fuel and runs a
+    /// The values of label `t`'s unboxed registers, from the current state
+    /// (unboxing slots, at `pc`); a value of another type continues at
+    /// `fallback`.
+    fn carried_args(&mut self, t: usize, pc: usize, fallback: Block) -> Vec<BlockArg> {
+        let carried = self.f.carry[t].clone();
+        let mut args = Vec::new();
+        for (r, k) in carried {
+            let v = match (k, self.f.vals.get(&r).map(|v| v.num)) {
+                (Kind::F, Some(Unboxed::F64(x))) | (Kind::I, Some(Unboxed::I64(x))) => x,
+                _ => {
+                    let p = self.obj(r, pc, fallback);
+                    if k == Kind::F {
+                        let ty = self.ob_type(p);
+                        self.guard_eq(ty, self.l.float_type as i64, fallback);
+                        self.b.ins().load(types::F64, MF, p, self.l.fval)
+                    } else {
+                        self.as_i64(p, fallback)
+                    }
+                }
+            };
+            args.push(BlockArg::Value(v));
+        }
+        args
+    }
+
+    /// Continue at `target` from instruction `from`: the registers live
+    /// there materialized, but those it keeps unboxed, which are passed as
+    /// they are (or, if one is not a number of its kind, the interpreter
+    /// continues at `target`). A backward jump spends fuel and runs a
     /// safepoint when it is gone.
     fn goto(&mut self, from: usize, target: u32) {
         let t = target as usize;
-        self.flush(t);
+        let start = self.f.vals.clone();
+        let fallback = self.b.create_block();
+        let args = self.carried_args(t, from, fallback);
+        let keep: Vec<Reg> = self.f.carry[t].iter().map(|(r, _)| *r).collect();
+        // The others, materialized.
+        let mut regs: Vec<Reg> = self.f.vals.keys().copied().filter(|r| !keep.contains(r)).collect();
+        regs.sort_unstable();
+        let mut live = Vec::new();
+        for r in regs {
+            if !self.f.vals[&r].in_slot && self.live_at(t, r) {
+                live.push(r);
+            }
+        }
+        self.materialize_many(live, from);
+        let carried: Vec<(Reg, Kind, Value)> = self.f.carry[t].iter().zip(&args).map(|(&(r, k), a)| (r, k, if let BlockArg::Value(v) = a { *v } else { unreachable!() })).collect();
         self.f.vals.clear();
         let blk = self.f.labels[t].expect("a jump to a label");
         if t > from {
-            self.b.ins().jump(blk, &[]);
-            return;
+            self.b.ins().jump(blk, &args);
+        } else {
+            let fuel = self.b.use_var(self.fuel);
+            let fuel = self.b.ins().iadd_imm_s(fuel, -1);
+            self.b.def_var(self.fuel, fuel);
+            let check = self.b.create_block();
+            self.b.ins().brif(fuel, blk, &args, check, &[]);
+            self.b.switch_to_block(check);
+            let call = self.call(self.h.safepoint, &[self.ctx], Some(types::I32)).unwrap();
+            let refuel = self.b.ins().iconst(types::I64, FUEL);
+            self.b.def_var(self.fuel, refuel);
+            let failed = self.b.create_block();
+            self.b.ins().brif(call, failed, &[], blk, &args);
+            self.b.switch_to_block(failed);
+            // The unboxed registers too, for a handler.
+            for (r, k, v) in carried {
+                let num = if k == Kind::F { Unboxed::F64(v) } else { Unboxed::I64(v) };
+                self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: None, konst: false });
+            }
+            self.flush(from);
+            self.f.vals.clear();
+            self.raise(from);
         }
-        let fuel = self.b.use_var(self.fuel);
-        let fuel = self.b.ins().iadd_imm_s(fuel, -1);
-        self.b.def_var(self.fuel, fuel);
-        let check = self.b.create_block();
-        self.b.ins().brif(fuel, blk, &[], check, &[]);
-        self.b.switch_to_block(check);
-        let call = self.call(self.h.safepoint, &[self.ctx], Some(types::I32)).unwrap();
-        let refuel = self.b.ins().iconst(types::I64, FUEL);
-        self.b.def_var(self.fuel, refuel);
-        let failed = self.b.create_block();
-        self.b.ins().brif(call, failed, &[], blk, &[]);
-        self.b.switch_to_block(failed);
-        self.raise(from);
+        self.b.switch_to_block(fallback);
+        self.f.vals = start;
+        self.bail_to(t);
+        self.f.vals.clear();
     }
 
     /// A branch from instruction `from`: to `yes` when `cond`, else `no`.
     fn branch(&mut self, from: usize, cond: Value, yes: u32, no: u32) {
-        // Both targets' registers, then no more virtual ones.
-        let mut regs: Vec<Reg> = self.f.vals.keys().copied().collect();
-        regs.sort_unstable();
-        for r in regs {
-            if !self.f.vals[&r].in_slot && (self.live_at(yes as usize, r) || self.live_at(no as usize, r)) {
-                self.materialize(r, from);
-            }
-        }
-        self.f.vals.clear();
+        let saved = self.f.vals.clone();
         let (y, n) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(cond, y, &[], n, &[]);
         self.b.switch_to_block(y);
         self.goto(from, yes);
         self.b.switch_to_block(n);
+        self.f.vals = saved;
         self.goto(from, no);
         self.f.done = true;
     }
@@ -2343,14 +2567,17 @@ impl<'a> Lower<'a> {
                 })
             })
             .collect();
-        let labels: Vec<Option<Block>> = label_pcs(ir).iter().map(|&x| x.then(|| self.b.create_block())).collect();
+        let is_label = label_pcs(ir);
+        let live = liveness(ir);
+        let carry = carried(callee, self.l.numbers, &is_label, &live);
+        let labels = label_blocks(&mut self.b, &is_label, &carry);
         let exit = self.b.create_block();
         let result = self.b.append_block_param(exit, self.ptr);
         let fail = self.b.create_block();
         let fail_pc = self.b.append_block_param(fail, types::I32);
         let raised = self.b.create_block();
         let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, written: Default::default() };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live: liveness(ir), nparams: ir.params.len() as u32, done: false, inline: Some(inlined) };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined) };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
         self.b.ins().jump(first, &[]);
