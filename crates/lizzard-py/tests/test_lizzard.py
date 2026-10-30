@@ -259,9 +259,24 @@ class Programs(unittest.TestCase):
         # Handled exceptions are released in both engines (PyO3 defers the
         # releases it makes outside its own entry points).
         with Scratch() as s:
+            # A context manager whose `__enter__` has no `__get__`.
+            s.write("cm.py", """\
+                class Enter:
+                    def __call__(self, *args):
+                        return None
+
+
+                class CM:
+                    __enter__ = Enter()
+
+                    def __exit__(self, *args):
+                        return None
+                """)
             p = s.write("m.py", """\
                 # lizzard: module
                 import gc
+
+                import cm
 
 
                 def boom(n: int) -> int:
@@ -286,18 +301,30 @@ class Programs(unittest.TestCase):
                     return s
 
 
-                def alive() -> int:
-                    return len([o for o in gc.get_objects() if type(o) is ValueError])
+                def enters(m: int) -> int:
+                    # No exception here: nothing to release a dropped one.
+                    s = 0
+                    for i in range(m):
+                        with cm.CM():
+                            s += 1
+                    return s
+
+
+                def alive(t: type) -> int:
+                    return len([o for o in gc.get_objects() if type(o) is t])
 
 
                 if __name__ == "__main__":
                     catches(10)
-                    before = alive()
-                    print(catches(3000), alive() - before)
+                    enters(10)
+                    before = alive(ValueError)
+                    print(catches(3000), alive(ValueError) - before)
+                    before = alive(AttributeError)
+                    print(enters(3000), alive(AttributeError) - before)
                 """)
             for jit in ("1", "0"):
                 code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": jit})
-                self.assertEqual((code, out), (0, "6000 0\n"), err)
+                self.assertEqual((code, out), (0, "6000 0\n3000 0\n"), err)
 
     def test_interpreted_calls_do_not_use_the_c_stack(self):
         # The interpreter runs calls between Lizzard functions in one loop:

@@ -408,6 +408,10 @@ unsafe extern "C" fn lz_vectorcall(callable: *mut ffi::PyObject, args: *const *m
 /// attaches through PyO3, which in a loop of plain calls never happens.
 /// Called where exceptions are handled or leave a function, not on every
 /// call: attaching costs about as much as a call. No exception may be set.
+/// So code here must not drop a `PyErr` it neither raises nor hands to a
+/// handler (a failed lookup it ignores): it would wait for a release that
+/// may never come. Ask CPython without an exception instead (type slots,
+/// `PyObject_GetOptionalAttr`).
 pub(crate) fn release_deferred() {
     Python::attach(|_| ());
 }
@@ -1738,10 +1742,15 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
             let t = o.get_type();
             let n = f.names[*name as usize].bind(py);
             let a = t.getattr(n).map_err(|_| PyTypeError::new_err(format!("'{}' object does not support the context manager protocol", t.name().map(|s| s.to_string()).unwrap_or_default())))?;
-            // Bind it like a method lookup does.
-            let v = match a.get_type().getattr("__get__") {
-                Ok(get) => get.call1((&a, o, &t))?,
-                Err(_) => a,
+            // Bound as CPython binds special methods: through its type's
+            // `tp_descr_get`, if any (no failed lookup, whose error PyO3
+            // would only release at its next attach).
+            // SAFETY: a valid object's type.
+            let v = match unsafe { (*ffi::Py_TYPE(a.as_ptr())).tp_descr_get } {
+                // SAFETY: valid objects; a new reference or null with an
+                // exception set.
+                Some(get) => unsafe { Bound::from_owned_ptr_or_err(py, get(a.as_ptr(), o.as_ptr(), t.as_ptr()))? },
+                None => a,
             };
             regs.set_obj(*dst, v);
         }
