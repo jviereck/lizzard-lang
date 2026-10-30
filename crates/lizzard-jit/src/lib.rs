@@ -165,6 +165,17 @@ pub struct Helpers {
     /// `init_returned(obj)`: `__init__` returned `obj` (a new reference),
     /// not None: release it and raise TypeError.
     pub init_returned: usize,
+    /// `PyObject_Vectorcall(callable, args, nargs, kwnames)`.
+    pub vectorcall: usize,
+    /// `finish(ctx, frame, desc, pc) -> object`: the interpreter runs the
+    /// rest of an inlined call of `desc`'s function from `pc` on `frame`
+    /// (its parameters borrowed) and releases the frame; the result (a new
+    /// reference), or null with an exception set.
+    pub finish: usize,
+    /// `unwind(frame, desc, pc)`: an exception raised at `pc` leaves an
+    /// inlined call: note where, and release the frame (but its borrowed
+    /// parameters).
+    pub unwind: usize,
     /// `missed(ctx)`: the generic paths of sites compiled without what
     /// their caches see (`Unit::misses`) ran `MISSES` times.
     pub missed: usize,
@@ -190,7 +201,7 @@ pub enum Quick {
 
 /// What the runtime's caches saw at an instruction.
 #[derive(Clone, Debug)]
-pub enum Spec {
+pub enum Spec<'a> {
     None,
     /// `LoadAttr` / `StoreAttr` of an instance attribute kept in inline
     /// values, on instances of type `tp` at `version`: the value pointer is
@@ -205,13 +216,13 @@ pub enum Spec {
     /// `LoadGlobal`: `value` while the epoch is `epoch`.
     Global { epoch: u64, value: usize },
     Check(Quick),
-    Call(CallSpec),
+    Call(CallSpec<'a>),
 }
 
 /// A call (`Call` or `CallMethod`) that reaches a Lizzard function compiled
 /// code can enter directly.
 #[derive(Clone, Debug)]
-pub struct CallSpec {
+pub struct CallSpec<'a> {
     pub guard: CallGuard,
     /// For `Helpers::enter`.
     pub desc: usize,
@@ -219,6 +230,12 @@ pub struct CallSpec {
     pub nregs: u32,
     /// The checks of its parameters (the receiver first) a caller makes.
     pub checks: Vec<Quick>,
+    /// The callee, to compile into the caller instead of calling it, if it
+    /// qualifies (`inlinable`).
+    pub inline: Option<Box<Unit<'a>>>,
+    /// Not a Lizzard function: `desc` is a callable (a builtin method) that
+    /// takes the arguments with `Helpers::vectorcall`, unchecked.
+    pub native: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -246,17 +263,18 @@ pub enum Num {
 }
 
 /// What to compile.
+#[derive(Clone, Debug)]
 pub struct Unit<'a> {
     pub ir: &'a FuncIr,
     /// Per instruction.
-    pub specs: &'a [Spec],
+    pub specs: Vec<Spec<'a>>,
     /// The constants (alive as long as the code) and their values.
-    pub consts: &'a [usize],
-    pub nums: &'a [Num],
+    pub consts: Vec<usize>,
+    pub nums: Vec<Num>,
     /// The interned names.
-    pub names: &'a [usize],
+    pub names: Vec<usize>,
     /// Each instruction's attribute cache, for the helpers.
-    pub ics: &'a [usize],
+    pub ics: Vec<usize>,
     /// The parameters are never written: their slots may hold references
     /// the frame does not own (a direct call's arguments), so compiled code
     /// never releases them or moves them out (`Take` copies).
@@ -264,6 +282,86 @@ pub struct Unit<'a> {
     /// The address of a `u32` counting the generic executions of attribute
     /// accesses, global loads and calls compiled without a spec.
     pub misses: usize,
+}
+
+/// Instructions an inlined function may have: those compiled code does
+/// itself (given their specs), so that its slow paths are rare.
+const INLINE_MAX: usize = 48;
+
+/// Whether `u` can be compiled into its callers: small, straight-line or
+/// branching forward only, no handlers, parameters never written, and
+/// nothing that always takes a generic path.
+pub fn inlinable(u: &Unit) -> bool {
+    let ir = u.ir;
+    if ir.generator || !ir.handlers.is_empty() || !u.borrow_params || ir.code.len() > INLINE_MAX || ir.reprs.len() > 64 {
+        return false;
+    }
+    let obj = |r: Reg| ir.reprs[r as usize] == Repr::Obj;
+    ir.code.iter().enumerate().all(|(pc, i)| {
+        if i.successors(pc as u32).iter().any(|&t| t as usize <= pc) {
+            return false;
+        }
+        let spec = &u.specs[pc];
+        match i {
+            Instr::Const { .. } | Instr::Move { .. } | Instr::Take { .. } | Instr::Unbind { .. } | Instr::Check { .. } | Instr::I64Const { .. } | Instr::I64Lt { .. } | Instr::I64Add { .. } | Instr::Jump { .. } => true,
+            Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => !obj(*cond),
+            Instr::Not { src, dst } => !obj(*src) && !obj(*dst),
+            Instr::Box { src, .. } => matches!(ir.reprs[*src as usize], Repr::I64 | Repr::Bool),
+            Instr::LoadAttr { .. } | Instr::StoreAttr { .. } => matches!(spec, Spec::Inline { .. } | Spec::Member { .. }),
+            Instr::LoadGlobal { .. } => matches!(spec, Spec::Global { .. }),
+            Instr::Call { kwnames, .. } | Instr::CallMethod { kwnames, .. } => kwnames.is_empty() && matches!(spec, Spec::Call(_)),
+            Instr::BinOp { op, .. } => match ir.hints.get(pc).copied().unwrap_or(0) {
+                HINT_FLOAT => matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
+                HINT_INT => matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor),
+                _ => false,
+            },
+            Instr::CompareBool { dst, op, .. } => !obj(*dst) && (rich_code(*op).is_some() || matches!(op, CmpOp::Is | CmpOp::IsNot)),
+            Instr::Truthy { dst, .. } => !obj(*dst),
+            Instr::Return { src } => obj(*src),
+            _ => false,
+        }
+    })
+}
+
+/// The registers direct calls in `u` (and in what it inlines) need.
+fn frame_regs(u: &Unit) -> Option<u32> {
+    u.specs
+        .iter()
+        .filter_map(|s| match s {
+            Spec::Call(c) => Some(c.inline.as_deref().and_then(frame_regs).unwrap_or(0).max(c.nregs)),
+            _ => None,
+        })
+        .max()
+}
+
+/// The instructions that start a block: jump targets, the instruction
+/// after any that can branch, handler targets, entries.
+fn label_pcs(ir: &FuncIr) -> Vec<bool> {
+    let n = ir.code.len();
+    let mut is_label = vec![false; n];
+    if n > 0 {
+        is_label[0] = true;
+    }
+    for (pc, i) in ir.code.iter().enumerate() {
+        let succ = i.successors(pc as u32);
+        let jumps = matches!(i, Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. } | Instr::ForIter { .. });
+        if jumps || succ.len() > 1 || succ.first().is_some_and(|&t| t as usize != pc + 1) {
+            for t in succ {
+                if (t as usize) < n {
+                    is_label[t as usize] = true;
+                }
+            }
+        }
+        if matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. }) && pc + 1 < n {
+            is_label[pc + 1] = true;
+        }
+    }
+    for h in &ir.handlers {
+        if (h.target as usize) < n {
+            is_label[h.target as usize] = true;
+        }
+    }
+    is_label
 }
 
 /// Loop iterations between safepoints.
@@ -418,39 +516,65 @@ enum Operand {
     Obj(Value),
 }
 
-struct Lower<'a> {
-    b: FunctionBuilder<'a>,
+/// What compiling a function needs about it: the one being compiled, or
+/// one inlined into it.
+struct Fn<'a> {
     u: &'a Unit<'a>,
     ir: &'a FuncIr,
-    h: &'a Helpers,
-    l: &'a Layout,
-    ptr: Type,
-    call_conv: CallConv,
-    sigs: HashMap<(Vec<Type>, Option<Type>), SigRef>,
     /// A block per instruction that can be reached other than by falling
     /// through (a jump target, an entry, a handler).
     labels: Vec<Option<Block>>,
     /// Per handler: stores the exception and jumps to the handler.
     catch_blocks: Vec<Block>,
+    /// Its register slots.
+    regs: Value,
+    /// The variable of each `I64` and `Bool` register.
+    vars: Vec<Option<Variable>>,
+    vals: HashMap<Reg, Virt>,
+    live: Vec<Vec<u64>>,
+    nparams: u32,
+    /// The current block has ended (a jump, a return).
+    done: bool,
+    /// Set when it is inlined.
+    inline: Option<Inlined>,
+}
+
+/// An inlined callee: its frame and where it continues.
+struct Inlined {
+    frame: StackSlot,
+    /// For the helpers (`Helpers::finish`, `Helpers::unwind`).
+    desc: usize,
+    /// The caller's call instruction.
+    call_pc: usize,
+    /// Its result (a new reference) continues the caller here.
+    exit: Block,
+    /// An exception raised at the parameter's pc leaves it.
+    fail: Block,
+    /// The caller raises at its call (the frame is released).
+    raised: Block,
+    /// The object registers whose slots the code may have written.
+    written: std::collections::BTreeSet<Reg>,
+}
+
+struct Lower<'a> {
+    b: FunctionBuilder<'a>,
+    f: Fn<'a>,
+    h: &'a Helpers,
+    l: &'a Layout,
+    ptr: Type,
+    call_conv: CallConv,
+    sigs: HashMap<(Vec<Type>, Option<Type>), SigRef>,
     /// Leave with `*pc` = the parameter and status `EXIT`, `ERROR`, `BAIL`.
     exit: Block,
     fail: Block,
     bail: Block,
     ctx: Value,
-    regs: Value,
     pcp: Value,
     /// The thread's id (free-threaded reference counting).
     tid: Value,
     fuel: Variable,
-    /// The variable of each `I64` and `Bool` register.
-    vars: Vec<Option<Variable>>,
-    vals: HashMap<Reg, Virt>,
-    live: Vec<Vec<u64>>,
     /// Where direct calls build the callee's frame.
     frame: Option<StackSlot>,
-    nparams: u32,
-    /// The current block has ended (a jump, a return).
-    done: bool,
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
 }
 
@@ -459,38 +583,13 @@ const MF: MemFlagsData = MemFlagsData::trusted();
 impl<'a> Lower<'a> {
     fn new(mut b: FunctionBuilder<'a>, u: &'a Unit<'a>, h: &'a Helpers, l: &'a Layout, module: &JITModule) -> Lower<'a> {
         let ir = u.ir;
-        let n = ir.code.len();
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let ps = b.block_params(entry).to_vec();
         let ptr = module.target_config().pointer_type();
 
-        // Labels: jump targets, the instruction after any that can branch,
-        // handler targets, entries.
-        let mut is_label = vec![false; n];
-        if n > 0 {
-            is_label[0] = true;
-        }
-        for (pc, i) in ir.code.iter().enumerate() {
-            let succ = i.successors(pc as u32);
-            let jumps = matches!(i, Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. } | Instr::ForIter { .. });
-            if jumps || succ.len() > 1 || succ.first().is_some_and(|&t| t as usize != pc + 1) {
-                for t in succ {
-                    if (t as usize) < n {
-                        is_label[t as usize] = true;
-                    }
-                }
-            }
-            if matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. }) && pc + 1 < n {
-                is_label[pc + 1] = true;
-            }
-        }
-        for h in &ir.handlers {
-            if (h.target as usize) < n {
-                is_label[h.target as usize] = true;
-            }
-        }
+        let is_label = label_pcs(ir);
         let labels = is_label.iter().map(|&x| x.then(|| b.create_block())).collect();
         let catch_blocks = (0..ir.handlers.len()).map(|_| b.create_block()).collect();
         let mut leave = || {
@@ -505,33 +604,24 @@ impl<'a> Lower<'a> {
             Rc::Ft { .. } => b.ins().load(ptr, MF, ps[0], CTX_TID),
             _ => b.ins().iconst(ptr, 0),
         };
-        let max_frame = u.specs.iter().filter_map(|s| if let Spec::Call(c) = s { Some(c.nregs) } else { None }).max();
+        let max_frame = frame_regs(u);
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            u,
-            ir,
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live: liveness(ir), nparams: ir.params.len() as u32, done: false, inline: None },
             h,
             l,
             ptr,
             call_conv: module.isa().default_call_conv(),
             sigs: HashMap::new(),
-            labels,
-            catch_blocks,
             exit,
             fail,
             bail,
             ctx: ps[0],
-            regs: ps[1],
             pcp: ps[2],
             tid,
             fuel,
-            vars,
-            vals: HashMap::new(),
-            live: liveness(ir),
             frame,
-            nparams: ir.params.len() as u32,
-            done: false,
             frontend: module.target_config(),
         };
         lw.entry(ps[3]);
@@ -542,9 +632,9 @@ impl<'a> Lower<'a> {
     /// 0, a loop header, after a `yield`, or (with an exception pending) at
     /// the `yield`.
     fn entry(&mut self, pending: Value) {
-        for r in 0..self.vars.len() {
-            if let Some(v) = self.vars[r] {
-                let x = self.b.ins().load(types::I64, MF, self.regs, r as i32 * 8);
+        for r in 0..self.f.vars.len() {
+            if let Some(v) = self.f.vars[r] {
+                let x = self.b.ins().load(types::I64, MF, self.f.regs, r as i32 * 8);
                 self.b.def_var(v, x);
             }
         }
@@ -556,7 +646,7 @@ impl<'a> Lower<'a> {
         let bad = self.b.create_block();
         self.b.ins().brif(pending, throw, &[], resume, &[]);
 
-        let ir = self.ir;
+        let ir = self.f.ir;
         let yields: Vec<usize> = ir.code.iter().enumerate().filter(|(_, i)| matches!(i, Instr::Yield { .. } | Instr::YieldFrom { .. })).map(|(p, _)| p).collect();
         self.b.switch_to_block(resume);
         // 0, loop headers (targets of backward jumps), after yields.
@@ -572,7 +662,7 @@ impl<'a> Lower<'a> {
         at.extend(yields.iter().map(|p| p + 1));
         let mut sw = Switch::new();
         for p in at {
-            if let Some(Some(blk)) = self.labels.get(p) {
+            if let Some(Some(blk)) = self.f.labels.get(p) {
                 sw.set_entry(p as u128, *blk);
             }
         }
@@ -596,32 +686,17 @@ impl<'a> Lower<'a> {
     }
 
     fn lower(mut self) {
-        let n = self.ir.code.len();
-        self.done = true;
-        for pc in 0..n {
-            if let Some(blk) = self.labels[pc] {
-                if !self.done {
-                    self.goto(pc - 1, pc as u32);
-                }
-                self.b.switch_to_block(blk);
-                self.vals.clear();
-                self.done = false;
-            } else if self.done {
-                // Unreachable.
-                continue;
-            }
-            self.instr(pc);
-        }
-        if !self.done {
+        self.body();
+        if !self.f.done {
             self.b.ins().trap(TrapCode::unwrap_user(2));
         }
-        for k in 0..self.ir.handlers.len() {
-            let h = &self.ir.handlers[k];
-            let blk = self.catch_blocks[k];
+        for k in 0..self.f.ir.handlers.len() {
+            let h = &self.f.ir.handlers[k];
+            let blk = self.f.catch_blocks[k];
             self.b.switch_to_block(blk);
             let exc = self.b.ins().iconst(types::I32, h.exc as i64);
-            self.call(self.h.catch, &[self.ctx, self.regs, exc], None);
-            match self.labels.get(h.target as usize).copied().flatten() {
+            self.call(self.h.catch, &[self.ctx, self.f.regs, exc], None);
+            match self.f.labels.get(h.target as usize).copied().flatten() {
                 Some(t) => {
                     self.b.ins().jump(t, &[]);
                 }
@@ -640,6 +715,26 @@ impl<'a> Lower<'a> {
         self.b.seal_all_blocks();
         let config = self.frontend;
         self.b.finalize(config);
+    }
+
+    /// The instructions of the current function, from its first label.
+    fn body(&mut self) {
+        let n = self.f.ir.code.len();
+        self.f.done = true;
+        for pc in 0..n {
+            if let Some(blk) = self.f.labels[pc] {
+                if !self.f.done {
+                    self.goto(pc - 1, pc as u32);
+                }
+                self.b.switch_to_block(blk);
+                self.f.vals.clear();
+                self.f.done = false;
+            } else if self.f.done {
+                // Unreachable.
+                continue;
+            }
+            self.instr(pc);
+        }
     }
 
     // ---- Calls, slots, reference counts ----
@@ -674,23 +769,28 @@ impl<'a> Lower<'a> {
     }
 
     fn slot_load(&mut self, r: Reg) -> Value {
-        self.b.ins().load(types::I64, MF, self.regs, r as i32 * 8)
+        self.b.ins().load(types::I64, MF, self.f.regs, r as i32 * 8)
     }
 
     fn slot_store(&mut self, v: Value, r: Reg) {
-        self.b.ins().store(MF, v, self.regs, r as i32 * 8);
+        if let Some(inl) = &mut self.f.inline {
+            if self.f.ir.reprs[r as usize] == Repr::Obj {
+                inl.written.insert(r);
+            }
+        }
+        self.b.ins().store(MF, v, self.f.regs, r as i32 * 8);
     }
 
     fn repr(&self, r: Reg) -> Repr {
-        self.ir.reprs[r as usize]
+        self.f.ir.reprs[r as usize]
     }
 
     fn is_param(&self, r: Reg) -> bool {
-        r < self.nparams && self.u.borrow_params
+        r < self.f.nparams && self.f.u.borrow_params
     }
 
     fn live_at(&self, pc: usize, r: Reg) -> bool {
-        self.live.get(pc).is_some_and(|l| l[r as usize / 64] & (1 << (r % 64)) != 0)
+        self.f.live.get(pc).is_some_and(|l| l[r as usize / 64] & (1 << (r % 64)) != 0)
     }
 
     /// Continue in a new block (returned after switching to it).
@@ -837,7 +937,7 @@ impl<'a> Lower<'a> {
 
     /// The registers holding borrowed pointers.
     fn borrowed(&self) -> Vec<Reg> {
-        let mut regs: Vec<Reg> = self.vals.iter().filter(|(_, v)| !v.in_slot && !v.konst && v.ptr.is_some()).map(|(r, _)| *r).collect();
+        let mut regs: Vec<Reg> = self.f.vals.iter().filter(|(_, v)| !v.in_slot && !v.konst && v.ptr.is_some()).map(|(r, _)| *r).collect();
         regs.sort_unstable();
         regs
     }
@@ -849,7 +949,7 @@ impl<'a> Lower<'a> {
         regs.dedup();
         let mut owned = Vec::new();
         for r in regs {
-            let Some(v) = self.vals.get(&r).copied() else { continue };
+            let Some(v) = self.f.vals.get(&r).copied() else { continue };
             if v.in_slot {
                 continue;
             }
@@ -866,7 +966,7 @@ impl<'a> Lower<'a> {
         }
         for (r, p, v) in owned {
             self.put(r, p);
-            self.vals.insert(r, Virt { ptr: Some(p), in_slot: true, konst: false, ..v });
+            self.f.vals.insert(r, Virt { ptr: Some(p), in_slot: true, konst: false, ..v });
         }
     }
 
@@ -886,17 +986,17 @@ impl<'a> Lower<'a> {
     /// executing it, a handler or the interpreter will read) and forget the
     /// others.
     fn flush(&mut self, pc: usize) {
-        let mut regs: Vec<Reg> = self.vals.keys().copied().collect();
+        let mut regs: Vec<Reg> = self.f.vals.keys().copied().collect();
         regs.sort_unstable();
         let mut live = Vec::new();
         for r in regs {
-            if self.vals[&r].in_slot {
+            if self.f.vals[&r].in_slot {
                 continue;
             }
             if self.live_at(pc, r) {
                 live.push(r);
             } else {
-                self.vals.remove(&r);
+                self.f.vals.remove(&r);
             }
         }
         self.materialize_many(live, pc);
@@ -908,14 +1008,14 @@ impl<'a> Lower<'a> {
     fn secure_borrowed(&mut self, live_pc: usize, pc: usize, keep: &[Reg]) {
         let mut list = Vec::new();
         for r in self.borrowed() {
-            let v = self.vals[&r];
+            let v = self.f.vals[&r];
             if keep.contains(&r) {
                 list.push(r);
             } else if !self.live_at(live_pc, r) {
-                self.vals.remove(&r);
+                self.f.vals.remove(&r);
             } else if !matches!(v.num, Unboxed::None) {
                 // The value is known: drop the pointer instead.
-                self.vals.insert(r, Virt { ptr: None, ..v });
+                self.f.vals.insert(r, Virt { ptr: None, ..v });
             } else {
                 list.push(r);
             }
@@ -925,24 +1025,24 @@ impl<'a> Lower<'a> {
 
     /// The object in register `r` (not null); unbound continues at `slow`.
     fn obj(&mut self, r: Reg, pc: usize, slow: Block) -> Value {
-        if let Some(v) = self.vals.get(&r).copied() {
+        if let Some(v) = self.f.vals.get(&r).copied() {
             if let Some(p) = v.ptr {
                 return p;
             }
             self.materialize(r, pc);
-            return self.vals[&r].ptr.unwrap();
+            return self.f.vals[&r].ptr.unwrap();
         }
         let p = self.slot_load(r);
         let ok = self.b.create_block();
         self.b.ins().brif(p, ok, &[], slow, &[]);
         self.b.switch_to_block(ok);
-        self.vals.insert(r, Virt::ptr(p, true));
+        self.f.vals.insert(r, Virt::ptr(p, true));
         p
     }
 
     /// Register `r` as an arithmetic operand.
     fn operand(&mut self, r: Reg, pc: usize, slow: Block) -> Operand {
-        match self.vals.get(&r).map(|v| v.num) {
+        match self.f.vals.get(&r).map(|v| v.num) {
             Some(Unboxed::F64(x)) => Operand::F64(x),
             Some(Unboxed::I64(x)) => Operand::I64(x),
             _ => Operand::Obj(self.obj(r, pc, slow)),
@@ -952,9 +1052,9 @@ impl<'a> Lower<'a> {
     /// Forget what is known about the registers instruction `pc` writes (a
     /// helper wrote them), and reload the scalar ones.
     fn wrote(&mut self, pc: usize) {
-        for r in self.ir.code[pc].writes() {
-            self.vals.remove(&r);
-            if let Some(v) = self.vars[r as usize] {
+        for r in self.f.ir.code[pc].writes() {
+            self.f.vals.remove(&r);
+            if let Some(v) = self.f.vars[r as usize] {
                 let x = self.slot_load(r);
                 self.b.def_var(v, x);
             }
@@ -962,13 +1062,13 @@ impl<'a> Lower<'a> {
     }
 
     fn set_var(&mut self, r: Reg, x: Value) {
-        let v = self.vars[r as usize].expect("a scalar register");
+        let v = self.f.vars[r as usize].expect("a scalar register");
         self.b.def_var(v, x);
         self.slot_store(x, r);
     }
 
     fn get_var(&mut self, r: Reg) -> Value {
-        let v = self.vars[r as usize].expect("a scalar register");
+        let v = self.f.vars[r as usize].expect("a scalar register");
         self.b.use_var(v)
     }
 
@@ -977,10 +1077,16 @@ impl<'a> Lower<'a> {
     /// An exception was raised by instruction `p` (the registers are
     /// materialized): its innermost handler, else leave the function.
     fn raise(&mut self, p: usize) {
+        if let Some(inl) = &self.f.inline {
+            let fail = inl.fail;
+            let pc = self.pc_val(p);
+            self.b.ins().jump(fail, &[BlockArg::Value(pc)]);
+            return;
+        }
         let at = p as u32;
-        match self.ir.handlers.iter().rposition(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
+        match self.f.ir.handlers.iter().rposition(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
             Some(k) => {
-                self.b.ins().jump(self.catch_blocks[k], &[]);
+                self.b.ins().jump(self.f.catch_blocks[k], &[]);
             }
             None => {
                 let pc = self.pc_val(p);
@@ -1002,8 +1108,8 @@ impl<'a> Lower<'a> {
     fn goto(&mut self, from: usize, target: u32) {
         let t = target as usize;
         self.flush(t);
-        self.vals.clear();
-        let blk = self.labels[t].expect("a jump to a label");
+        self.f.vals.clear();
+        let blk = self.f.labels[t].expect("a jump to a label");
         if t > from {
             self.b.ins().jump(blk, &[]);
             return;
@@ -1026,28 +1132,28 @@ impl<'a> Lower<'a> {
     /// A branch from instruction `from`: to `yes` when `cond`, else `no`.
     fn branch(&mut self, from: usize, cond: Value, yes: u32, no: u32) {
         // Both targets' registers, then no more virtual ones.
-        let mut regs: Vec<Reg> = self.vals.keys().copied().collect();
+        let mut regs: Vec<Reg> = self.f.vals.keys().copied().collect();
         regs.sort_unstable();
         for r in regs {
-            if !self.vals[&r].in_slot && (self.live_at(yes as usize, r) || self.live_at(no as usize, r)) {
+            if !self.f.vals[&r].in_slot && (self.live_at(yes as usize, r) || self.live_at(no as usize, r)) {
                 self.materialize(r, from);
             }
         }
-        self.vals.clear();
+        self.f.vals.clear();
         let (y, n) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(cond, y, &[], n, &[]);
         self.b.switch_to_block(y);
         self.goto(from, yes);
         self.b.switch_to_block(n);
         self.goto(from, no);
-        self.done = true;
+        self.f.done = true;
     }
 
     /// Continue with the next instruction.
     fn next(&mut self, pc: usize) {
-        if pc + 1 >= self.ir.code.len() {
+        if pc + 1 >= self.f.ir.code.len() {
             self.b.ins().trap(TrapCode::unwrap_user(2));
-            self.done = true;
+            self.f.done = true;
         }
         // A label is entered by `lower`.
     }
@@ -1064,13 +1170,16 @@ impl<'a> Lower<'a> {
     /// Run instruction `pc` with a helper `f(args)` returning a status
     /// (`after_status` decides), the registers materialized first.
     fn generic(&mut self, pc: usize) {
+        if self.f.inline.is_some() {
+            return self.deopt(pc);
+        }
         self.flush(pc);
-        let ir = self.ir;
+        let ir = self.f.ir;
         let i = &ir.code[pc];
-        if matches!(self.u.specs[pc], Spec::None) && matches!(i, Instr::LoadAttr { .. } | Instr::StoreAttr { .. } | Instr::LoadGlobal { .. } | Instr::Call { .. } | Instr::CallMethod { .. }) {
+        if matches!(self.f.u.specs[pc], Spec::None) && matches!(i, Instr::LoadAttr { .. } | Instr::StoreAttr { .. } | Instr::LoadGlobal { .. } | Instr::Call { .. } | Instr::CallMethod { .. }) {
             self.count_miss();
         }
-        let regs = self.regs;
+        let regs = self.f.regs;
         let ctx = self.ctx;
         let ops = |s: &mut Self, xs: &[u32]| -> Vec<Value> { xs.iter().map(|x| s.i32c(*x)).collect() };
         let h = *self.h;
@@ -1078,16 +1187,16 @@ impl<'a> Lower<'a> {
             Instr::LoadAttr { dst, obj, name } => {
                 let mut a = vec![regs];
                 a.extend(ops(self, &[*dst, *obj]));
-                a.push(self.b.ins().iconst(self.ptr, self.u.names[*name as usize] as i64));
-                a.push(self.b.ins().iconst(self.ptr, self.u.ics[pc] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.f.u.names[*name as usize] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.f.u.ics[pc] as i64));
                 let st = self.call(h.load_attr, &a, Some(types::I32)).unwrap();
                 self.check_status(st, pc);
             }
             Instr::StoreAttr { obj, name, val } => {
                 let mut a = vec![regs];
                 a.extend(ops(self, &[*obj, *val]));
-                a.push(self.b.ins().iconst(self.ptr, self.u.names[*name as usize] as i64));
-                a.push(self.b.ins().iconst(self.ptr, self.u.ics[pc] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.f.u.names[*name as usize] as i64));
+                a.push(self.b.ins().iconst(self.ptr, self.f.u.ics[pc] as i64));
                 let st = self.call(h.store_attr, &a, Some(types::I32)).unwrap();
                 self.check_status(st, pc);
             }
@@ -1146,7 +1255,7 @@ impl<'a> Lower<'a> {
                 self.goto(pc, *target);
                 self.b.switch_to_block(next);
                 self.goto(pc, pc as u32 + 1);
-                self.done = true;
+                self.f.done = true;
                 return;
             }
             _ => {
@@ -1160,7 +1269,10 @@ impl<'a> Lower<'a> {
     /// Count a generic execution compiled without a spec; the `MISSES`th
     /// tells the runtime.
     fn count_miss(&mut self) {
-        let addr = self.b.ins().iconst(self.ptr, self.u.misses as i64);
+        if self.f.inline.is_some() {
+            return;
+        }
+        let addr = self.b.ins().iconst(self.ptr, self.f.u.misses as i64);
         let n = self.b.ins().load(types::I32, MF, addr, 0);
         let n = self.b.ins().iadd_imm_s(n, 1);
         self.b.ins().store(MF, n, addr, 0);
@@ -1176,10 +1288,13 @@ impl<'a> Lower<'a> {
     /// Execute instruction `pc` with the `step` helper (registers
     /// materialized) and continue as it says.
     fn step(&mut self, pc: usize) {
+        if self.f.inline.is_some() {
+            return self.deopt(pc);
+        }
         self.flush(pc);
         let p = self.pc_val(pc);
-        let st = self.call(self.h.step, &[self.ctx, self.regs, p], Some(types::I32)).unwrap();
-        let ir = self.ir;
+        let st = self.call(self.h.step, &[self.ctx, self.f.regs, p], Some(types::I32)).unwrap();
+        let ir = self.f.ir;
         let i = &ir.code[pc];
         let other = self.b.create_block();
         let next = self.b.create_block();
@@ -1214,13 +1329,30 @@ impl<'a> Lower<'a> {
         let succ = i.successors(pc as u32);
         if succ.is_empty() {
             self.b.ins().trap(TrapCode::unwrap_user(4));
-            self.done = true;
+            self.f.done = true;
         } else if succ.len() > 1 || succ[0] as usize != pc + 1 {
             self.goto(pc, pc as u32 + 1);
-            self.done = true;
+            self.f.done = true;
         } else {
             self.next(pc);
         }
+    }
+
+    /// In an inlined function: the interpreter runs the rest of the call
+    /// from instruction `pc` (`Helpers::finish`), and the caller goes on
+    /// with its result. Code emitted after this is unreachable.
+    fn deopt(&mut self, pc: usize) {
+        self.flush(pc);
+        let inl = self.f.inline.as_ref().unwrap();
+        let (frame, desc, exit, call_pc) = (inl.frame, inl.desc, inl.exit, inl.call_pc);
+        let raised = inl.raised;
+        let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
+        let d = self.b.ins().iconst(self.ptr, desc as i64);
+        let pcv = self.pc_val(pc);
+        let r = self.call(self.h.finish, &[self.ctx, fp, d, pcv], Some(self.ptr)).unwrap();
+        self.b.ins().brif(r, exit, &[BlockArg::Value(r)], raised, &[]);
+        let _ = call_pc;
+        self.cont();
     }
 
     /// Emit an instruction's slow path: from the state at the start of the
@@ -1231,33 +1363,37 @@ impl<'a> Lower<'a> {
     /// as not materialized), but for the instruction's writes, which the
     /// caller describes.
     fn slow_path(&mut self, slow: Block, start: HashMap<Reg, Virt>, pc: usize, then: impl FnOnce(&mut Self)) {
-        self.vals = start.clone();
-        let done = self.done;
+        self.f.vals = start.clone();
+        let done = self.f.done;
         self.b.switch_to_block(slow);
-        self.generic(pc);
-        then(self);
-        self.vals = start;
-        for r in self.ir.code[pc].writes() {
-            self.vals.remove(&r);
+        if self.f.inline.is_some() {
+            self.deopt(pc);
+        } else {
+            self.generic(pc);
+            then(self);
         }
-        self.done = done;
+        self.f.vals = start;
+        for r in self.f.ir.code[pc].writes() {
+            self.f.vals.remove(&r);
+        }
+        self.f.done = done;
     }
 
     // ---- Instructions ----
 
     fn instr(&mut self, pc: usize) {
-        let ir = self.ir;
+        let ir = self.f.ir;
         let i = &ir.code[pc];
         match i {
             Instr::Jump { target } => {
                 self.goto(pc, *target);
-                self.done = true;
+                self.f.done = true;
             }
-            Instr::JumpIfFalse { cond, target } if self.vars[*cond as usize].is_some() => {
+            Instr::JumpIfFalse { cond, target } if self.f.vars[*cond as usize].is_some() => {
                 let c = self.get_var(*cond);
                 self.branch(pc, c, pc as u32 + 1, *target);
             }
-            Instr::JumpIfTrue { cond, target } if self.vars[*cond as usize].is_some() => {
+            Instr::JumpIfTrue { cond, target } if self.f.vars[*cond as usize].is_some() => {
                 let c = self.get_var(*cond);
                 self.branch(pc, c, *target, pc as u32 + 1);
             }
@@ -1279,25 +1415,25 @@ impl<'a> Lower<'a> {
                 self.set_var(*dst, v);
                 self.next(pc);
             }
-            Instr::Not { dst, src } if self.vars[*src as usize].is_some() && self.vars[*dst as usize].is_some() => {
+            Instr::Not { dst, src } if self.f.vars[*src as usize].is_some() && self.f.vars[*dst as usize].is_some() => {
                 let v = self.get_var(*src);
                 let v = self.b.ins().bxor_imm_u(v, 1);
                 self.set_var(*dst, v);
                 self.next(pc);
             }
             Instr::F32Bin { dst, op, a, b } if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
-                let x = self.b.ins().load(types::F32, MF, self.regs, *a as i32 * 8);
-                let y = self.b.ins().load(types::F32, MF, self.regs, *b as i32 * 8);
+                let x = self.b.ins().load(types::F32, MF, self.f.regs, *a as i32 * 8);
+                let y = self.b.ins().load(types::F32, MF, self.f.regs, *b as i32 * 8);
                 let v = match op {
                     BinOp::Add => self.b.ins().fadd(x, y),
                     BinOp::Sub => self.b.ins().fsub(x, y),
                     BinOp::Mul => self.b.ins().fmul(x, y),
                     _ => self.b.ins().fdiv(x, y),
                 };
-                self.b.ins().store(MF, v, self.regs, *dst as i32 * 8);
+                self.b.ins().store(MF, v, self.f.regs, *dst as i32 * 8);
                 self.next(pc);
             }
-            Instr::Move { dst, src } | Instr::Take { dst, src } if self.vars[*src as usize].is_some() && self.vars[*dst as usize].is_some() => {
+            Instr::Move { dst, src } | Instr::Take { dst, src } if self.f.vars[*src as usize].is_some() && self.f.vars[*dst as usize].is_some() => {
                 let v = self.get_var(*src);
                 self.set_var(*dst, v);
                 self.next(pc);
@@ -1309,7 +1445,7 @@ impl<'a> Lower<'a> {
             }
             Instr::Unbind { reg } if self.repr(*reg) != Repr::Obj => self.next(pc),
             Instr::Unbind { reg } => {
-                self.vals.remove(reg);
+                self.f.vals.remove(reg);
                 if !self.is_param(*reg) {
                     self.secure_borrowed(pc + 1, pc, &[]);
                     let old = self.slot_load(*reg);
@@ -1320,25 +1456,25 @@ impl<'a> Lower<'a> {
                 self.next(pc);
             }
             Instr::Const { dst, idx } => {
-                let p = self.b.ins().iconst(self.ptr, self.u.consts[*idx as usize] as i64);
-                let (num, ty) = match self.u.nums[*idx as usize] {
+                let p = self.b.ins().iconst(self.ptr, self.f.u.consts[*idx as usize] as i64);
+                let (num, ty) = match self.f.u.nums[*idx as usize] {
                     Num::F64(x) => (Unboxed::F64(self.b.ins().f64const(x)), Some(self.l.float_type)),
                     Num::I64(x) => (Unboxed::I64(self.b.ins().iconst(types::I64, x)), Some(self.l.long_type)),
                     Num::Other => (Unboxed::None, None),
                 };
-                self.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num, ty, konst: true });
+                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num, ty, konst: true });
                 self.next(pc);
             }
             Instr::Box { dst, src } if self.repr(*src) == Repr::I64 && self.l.numbers => {
                 let v = self.get_var(*src);
-                self.vals.insert(*dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false });
+                self.f.vals.insert(*dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false });
                 self.next(pc);
             }
             Instr::Box { dst, src } if self.repr(*src) == Repr::Bool => {
                 let v = self.get_var(*src);
                 let (t, f) = (self.b.ins().iconst(self.ptr, self.l.true_ as i64), self.b.ins().iconst(self.ptr, self.l.false_ as i64));
                 let p = self.b.ins().select(v, t, f);
-                self.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num: Unboxed::None, ty: None, konst: true });
+                self.f.vals.insert(*dst, Virt { ptr: Some(p), in_slot: false, num: Unboxed::None, ty: None, konst: true });
                 self.next(pc);
             }
             Instr::Move { dst, src } if self.repr(*src) == Repr::Obj && self.repr(*dst) == Repr::Obj => self.move_obj(pc, *dst, *src, false),
@@ -1358,12 +1494,12 @@ impl<'a> Lower<'a> {
                     self.next(pc);
                 }
             }
-            Instr::CompareBool { dst, op, a, b } if self.vars[*dst as usize].is_some() && rich_code(*op).is_some() && self.l.numbers => self.compare_bool(pc, *dst, *op, *a, *b),
-            Instr::CompareBool { dst, op: op @ (CmpOp::Is | CmpOp::IsNot), a, b } if self.vars[*dst as usize].is_some() => self.compare_is(pc, *dst, *op, *a, *b),
-            Instr::Truthy { dst, src } if self.vars[*dst as usize].is_some() => self.truthy(pc, *dst, *src),
+            Instr::CompareBool { dst, op, a, b } if self.f.vars[*dst as usize].is_some() && rich_code(*op).is_some() && self.l.numbers => self.compare_bool(pc, *dst, *op, *a, *b),
+            Instr::CompareBool { dst, op: op @ (CmpOp::Is | CmpOp::IsNot), a, b } if self.f.vars[*dst as usize].is_some() => self.compare_is(pc, *dst, *op, *a, *b),
+            Instr::Truthy { dst, src } if self.f.vars[*dst as usize].is_some() => self.truthy(pc, *dst, *src),
             Instr::Return { src } if self.repr(*src) == Repr::Obj => self.ret(pc, *src),
-            Instr::Call { dst, func, args, kwnames, .. } if kwnames.is_empty() && matches!(self.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, Some(*func), None, args),
-            Instr::CallMethod { dst, obj, args, kwnames, .. } if kwnames.is_empty() && matches!(self.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, None, Some(*obj), args),
+            Instr::Call { dst, func, args, kwnames, .. } if kwnames.is_empty() && matches!(self.f.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, Some(*func), None, args),
+            Instr::CallMethod { dst, obj, args, kwnames, .. } if kwnames.is_empty() && matches!(self.f.u.specs[pc], Spec::Call(_)) => self.call_direct(pc, *dst, None, Some(*obj), args),
             Instr::Truthy { .. } | Instr::Compare { .. } | Instr::CompareBool { .. } | Instr::Call { .. } | Instr::CallMethod { .. } => {
                 self.generic(pc);
                 self.next(pc);
@@ -1376,30 +1512,30 @@ impl<'a> Lower<'a> {
     /// `Move` (`take`: `Take`) of an object.
     fn move_obj(&mut self, pc: usize, dst: Reg, src: Reg, take: bool) {
         let take = take && !self.is_param(src);
-        if let Some(v) = self.vals.get(&src).copied().filter(|v| !v.in_slot) {
+        if let Some(v) = self.f.vals.get(&src).copied().filter(|v| !v.in_slot) {
             // A value not in its slot moves as it is (a `Take` leaves the
             // source's stale slot to the next store).
             if take {
-                self.vals.remove(&src);
+                self.f.vals.remove(&src);
             }
-            self.vals.insert(dst, v);
+            self.f.vals.insert(dst, v);
             return self.next(pc);
         }
         // Storing releases `dst`'s old reference.
         self.secure_borrowed(pc + 1, pc, &[]);
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(src, pc, slow);
-        let v = self.vals[&src];
+        let v = self.f.vals[&src];
         if take {
             let z = self.b.ins().iconst(types::I64, 0);
             self.slot_store(z, src);
-            self.vals.remove(&src);
+            self.f.vals.remove(&src);
         } else {
             self.incref(p);
         }
         self.put(dst, p);
-        self.vals.insert(dst, Virt { in_slot: true, ..v });
+        self.f.vals.insert(dst, Virt { in_slot: true, ..v });
         let join = self.b.create_block();
         self.b.ins().jump(join, &[]);
         // Unbound: `step` raises.
@@ -1411,7 +1547,7 @@ impl<'a> Lower<'a> {
     }
 
     fn load_attr(&mut self, pc: usize, dst: Reg, obj: Reg) {
-        let (tp, version, off, valid) = match self.u.specs[pc] {
+        let (tp, version, off, valid) = match self.f.u.specs[pc] {
             Spec::Inline { tp, version, off, values, .. } => (tp, version, off, Some(values + 3)),
             Spec::Member { tp, version, off } => (tp, version, off, None),
             _ => {
@@ -1419,10 +1555,10 @@ impl<'a> Lower<'a> {
                 return self.next(pc);
             }
         };
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(obj, pc, slow);
-        if self.vals[&obj].ty != Some(tp) {
+        if self.f.vals[&obj].ty != Some(tp) {
             self.guard_type(p, tp, version, slow);
         }
         if let Some(valid) = valid {
@@ -1441,12 +1577,12 @@ impl<'a> Lower<'a> {
             s.b.ins().jump(join, &[BlockArg::Value(v)]);
         });
         self.b.switch_to_block(join);
-        self.vals.insert(dst, Virt::ptr(x, false));
+        self.f.vals.insert(dst, Virt::ptr(x, false));
         self.next(pc);
     }
 
     fn store_attr(&mut self, pc: usize, obj: Reg, val: Reg) {
-        let (tp, version, off, values, dict) = match self.u.specs[pc] {
+        let (tp, version, off, values, dict) = match self.f.u.specs[pc] {
             Spec::Inline { tp, version, off, values, dict } => (tp, version, off, Some(values), dict),
             Spec::Member { tp, version, off } => (tp, version, off, None, 0),
             _ => {
@@ -1456,10 +1592,10 @@ impl<'a> Lower<'a> {
         };
         // The store may release what borrowed pointers point to.
         self.secure_borrowed(pc + 1, pc, &[obj, val]);
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(obj, pc, slow);
-        if self.vals[&obj].ty != Some(tp) {
+        if self.f.vals[&obj].ty != Some(tp) {
             self.guard_type(p, tp, version, slow);
         }
         if let Some(values) = values {
@@ -1488,7 +1624,7 @@ impl<'a> Lower<'a> {
             self.b.switch_to_block(go);
             (is_first, values, ix)
         });
-        let v = self.vals.get(&val).copied();
+        let v = self.f.vals.get(&val).copied();
         let done = self.b.create_block();
         // The new reference to store, unless a float is updated in place:
         // one only the old value's slot referenced.
@@ -1590,11 +1726,11 @@ impl<'a> Lower<'a> {
     }
 
     fn load_global(&mut self, pc: usize, dst: Reg) {
-        let Spec::Global { epoch, value } = self.u.specs[pc] else {
+        let Spec::Global { epoch, value } = self.f.u.specs[pc] else {
             self.generic(pc);
             return self.next(pc);
         };
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let addr = self.b.ins().iconst(self.ptr, self.l.epoch as i64);
         let e = self.b.ins().load(types::I64, MF, addr, 0);
@@ -1608,7 +1744,7 @@ impl<'a> Lower<'a> {
             s.b.ins().jump(join, &[BlockArg::Value(v)]);
         });
         self.b.switch_to_block(join);
-        self.vals.insert(dst, Virt::ptr(x, false));
+        self.f.vals.insert(dst, Virt::ptr(x, false));
         self.next(pc);
     }
 
@@ -1658,17 +1794,17 @@ impl<'a> Lower<'a> {
     }
 
     fn check(&mut self, pc: usize, reg: Reg) {
-        let q = match self.u.specs[pc] {
+        let q = match self.f.u.specs[pc] {
             Spec::Check(q) => q,
             _ => Quick::Slow,
         };
         if self.repr(reg) != Repr::Obj {
             return self.step(pc);
         }
-        if self.known_pass(self.vals.get(&reg).copied(), q) {
+        if self.known_pass(self.f.vals.get(&reg).copied(), q) {
             return self.next(pc);
         }
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let p = self.obj(reg, pc, slow);
         self.quick(p, q, slow);
@@ -1747,7 +1883,7 @@ impl<'a> Lower<'a> {
     /// unboxed. Two ints, or anything else, take the generic path; if its
     /// result is not a float, the interpreter continues.
     fn float_binop(&mut self, pc: usize, dst: Reg, op: BinOp, a: Reg, b: Reg) {
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let f = |s: &mut Self, r: Reg| -> (Value, Value) {
             match s.operand(r, pc, slow) {
@@ -1788,7 +1924,7 @@ impl<'a> Lower<'a> {
             s.bail_to(pc + 1);
         });
         self.b.switch_to_block(join);
-        self.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(r), ty: Some(self.l.float_type), konst: false });
+        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(r), ty: Some(self.l.float_type), konst: false });
         self.next(pc);
     }
 
@@ -1796,7 +1932,7 @@ impl<'a> Lower<'a> {
     /// kept unboxed; overflow and other cases take the generic path, and the
     /// interpreter continues if its result does not fit.
     fn int_binop(&mut self, pc: usize, dst: Reg, op: BinOp, a: Reg, b: Reg) {
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let f = |s: &mut Self, r: Reg| -> Value {
             match s.operand(r, pc, slow) {
@@ -1865,14 +2001,14 @@ impl<'a> Lower<'a> {
             s.bail_to(pc + 1);
         });
         self.b.switch_to_block(join);
-        self.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(r), ty: Some(self.l.long_type), konst: false });
+        self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(r), ty: Some(self.l.long_type), konst: false });
         self.next(pc);
     }
 
     /// `dst: Bool = a op b`: inline for two ints or two floats, else
     /// generic.
     fn compare_bool(&mut self, pc: usize, dst: Reg, op: CmpOp, a: Reg, b: Reg) {
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let x = self.operand(a, pc, slow);
         let y = self.operand(b, pc, slow);
@@ -1945,11 +2081,11 @@ impl<'a> Lower<'a> {
 
     /// `dst: Bool = a is b` (or `is not`).
     fn compare_is(&mut self, pc: usize, dst: Reg, op: CmpOp, a: Reg, b: Reg) {
-        let has = |s: &Self, r: Reg| s.vals.get(&r).is_none_or(|v| v.ptr.is_some());
+        let has = |s: &Self, r: Reg| s.f.vals.get(&r).is_none_or(|v| v.ptr.is_some());
         if !has(self, a) || !has(self, b) {
             return self.step(pc);
         }
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let x = self.obj(a, pc, slow);
         let y = self.obj(b, pc, slow);
@@ -1968,7 +2104,7 @@ impl<'a> Lower<'a> {
     }
 
     fn truthy(&mut self, pc: usize, dst: Reg, src: Reg) {
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, types::I64);
@@ -1997,9 +2133,9 @@ impl<'a> Lower<'a> {
 
     /// `return src`: a new reference for the runtime.
     fn ret(&mut self, pc: usize, src: Reg) {
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
-        let v = self.vals.get(&src).copied();
+        let v = self.f.vals.get(&src).copied();
         let p = match v {
             Some(Virt { ptr: None, in_slot: false, num: Unboxed::F64(x), .. }) => {
                 let p = self.call(self.h.float_new, &[x], Some(self.ptr)).unwrap();
@@ -2023,22 +2159,30 @@ impl<'a> Lower<'a> {
                 p
             }
         };
-        self.b.ins().store(MF, p, self.ctx, CTX_RET);
-        let pcv = self.pc_val(pc);
-        self.b.ins().jump(self.exit, &[BlockArg::Value(pcv)]);
-        self.vals = start;
+        match &self.f.inline {
+            Some(inl) => {
+                let exit = inl.exit;
+                self.b.ins().jump(exit, &[BlockArg::Value(p)]);
+            }
+            None => {
+                self.b.ins().store(MF, p, self.ctx, CTX_RET);
+                let pcv = self.pc_val(pc);
+                self.b.ins().jump(self.exit, &[BlockArg::Value(pcv)]);
+            }
+        }
+        self.f.vals = start;
         self.b.switch_to_block(slow);
         self.step(pc);
-        self.done = true;
+        self.f.done = true;
     }
 
     /// A call of a Lizzard function compiled code enters directly, with the
     /// arguments borrowed from the caller's registers.
     fn call_direct(&mut self, pc: usize, dst: Reg, func: Option<Reg>, obj: Option<Reg>, args: &[Reg]) {
-        let Spec::Call(spec) = &self.u.specs[pc] else { unreachable!() };
-        let spec = spec.clone();
-        let covered = self.ir.handlers.iter().any(|h| h.ranges.iter().any(|(s, e)| (*s as usize) <= pc && pc < *e as usize));
-        let reads = self.ir.code[pc].reads();
+        let u: &'a Unit<'a> = self.f.u;
+        let Spec::Call(spec) = &u.specs[pc] else { unreachable!() };
+        let covered = self.f.ir.handlers.iter().any(|h| h.ranges.iter().any(|(s, e)| (*s as usize) <= pc && pc < *e as usize));
+        let reads = self.f.ir.code[pc].reads();
         if covered {
             self.flush(pc);
         } else {
@@ -2049,13 +2193,13 @@ impl<'a> Lower<'a> {
         let mut all: Vec<Reg> = obj.into_iter().collect();
         all.extend(args);
         for &r in &all {
-            if let Some(v) = self.vals.get(&r).copied() {
+            if let Some(v) = self.f.vals.get(&r).copied() {
                 if !v.in_slot && !v.konst {
                     self.materialize(r, pc);
                 }
             }
         }
-        let start = self.vals.clone();
+        let start = self.f.vals.clone();
         let slow = self.b.create_block();
         let mut ctor = None;
         match (&spec.guard, func, obj) {
@@ -2073,7 +2217,7 @@ impl<'a> Lower<'a> {
             }
             (CallGuard::Method { tp, version, keys, nentries, valid }, _, Some(o)) => {
                 let p = self.obj(o, pc, slow);
-                if self.vals[&o].ty != Some(*tp) {
+                if self.f.vals[&o].ty != Some(*tp) {
                     self.guard_type(p, *tp, *version, slow);
                 }
                 if *keys != 0 {
@@ -2092,7 +2236,7 @@ impl<'a> Lower<'a> {
         for (i, &r) in all.iter().enumerate() {
             let p = self.obj(r, pc, slow);
             let q = spec.checks.get(i + skip).copied().unwrap_or(Quick::Slow);
-            if !self.known_pass(self.vals.get(&r).copied(), q) {
+            if !self.known_pass(self.f.vals.get(&r).copied(), q) {
                 self.quick(p, q, slow);
             }
             ptrs.push(p);
@@ -2111,17 +2255,34 @@ impl<'a> Lower<'a> {
         if let Some(o) = inst {
             ptrs.insert(0, o);
         }
-        let frame = self.frame.expect("a frame for direct calls");
-        for (i, p) in ptrs.iter().enumerate() {
-            self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
-        }
-        let z = self.b.ins().iconst(types::I64, 0);
-        for i in ptrs.len()..spec.nregs as usize {
-            self.b.ins().stack_store(self.ptr, z, frame, i as i32 * 8);
-        }
-        let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
-        let desc = self.b.ins().iconst(self.ptr, spec.desc as i64);
-        let r = self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap();
+        let r = match spec.inline.as_deref() {
+            _ if spec.native => {
+                let frame = self.frame.expect("a frame for direct calls");
+                for (i, p) in ptrs.iter().enumerate() {
+                    self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
+                }
+                let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
+                let callable = self.b.ins().iconst(self.ptr, spec.desc as i64);
+                let n = self.b.ins().iconst(types::I64, ptrs.len() as i64);
+                let none = self.b.ins().iconst(self.ptr, 0);
+                self.call(self.h.vectorcall, &[callable, fp, n, none], Some(self.ptr)).unwrap()
+            }
+            // Not within an inlined function: one level.
+            Some(callee) if self.f.inline.is_none() && inlinable(callee) => self.inline_call(pc, &ptrs, callee, spec.desc),
+            _ => {
+                let frame = self.frame.expect("a frame for direct calls");
+                for (i, p) in ptrs.iter().enumerate() {
+                    self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
+                }
+                let z = self.b.ins().iconst(types::I64, 0);
+                for i in ptrs.len()..spec.nregs as usize {
+                    self.b.ins().stack_store(self.ptr, z, frame, i as i32 * 8);
+                }
+                let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
+                let desc = self.b.ins().iconst(self.ptr, spec.desc as i64);
+                self.call(self.h.enter, &[self.ctx, fp, desc], Some(self.ptr)).unwrap()
+            }
+        };
         let (ok, failed) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(r, ok, &[], failed, &[]);
         self.b.switch_to_block(failed);
@@ -2155,4 +2316,65 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(join);
         self.next(pc);
     }
+
+    /// Compile `callee` here, its parameters `args` (borrowed), its frame
+    /// in a stack slot: its result (a new reference), at the end of its
+    /// code. An exception leaving it raises at the call (`pc`).
+    fn inline_call(&mut self, pc: usize, args: &[Value], callee: &'a Unit<'a>, desc: usize) -> Value {
+        let ir = callee.ir;
+        let nregs = ir.reprs.len();
+        let frame = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, nregs.max(1) as u32 * 8, 3));
+        for (i, p) in args.iter().enumerate() {
+            self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
+        }
+        let z = self.b.ins().iconst(types::I64, 0);
+        for i in args.len()..nregs {
+            self.b.ins().stack_store(self.ptr, z, frame, i as i32 * 8);
+        }
+        let regs = self.b.ins().stack_addr(self.ptr, frame, 0);
+        let vars: Vec<Option<Variable>> = ir
+            .reprs
+            .iter()
+            .map(|r| {
+                matches!(r, Repr::I64 | Repr::Bool).then(|| {
+                    let v = self.b.declare_var(types::I64);
+                    self.b.def_var(v, z);
+                    v
+                })
+            })
+            .collect();
+        let labels: Vec<Option<Block>> = label_pcs(ir).iter().map(|&x| x.then(|| self.b.create_block())).collect();
+        let exit = self.b.create_block();
+        let result = self.b.append_block_param(exit, self.ptr);
+        let fail = self.b.create_block();
+        let fail_pc = self.b.append_block_param(fail, types::I32);
+        let raised = self.b.create_block();
+        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, written: Default::default() };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live: liveness(ir), nparams: ir.params.len() as u32, done: false, inline: Some(inlined) };
+        let caller = std::mem::replace(&mut self.f, callee_fn);
+        let first = self.f.labels[0].expect("an entry");
+        self.b.ins().jump(first, &[]);
+        self.body();
+        if !self.f.done {
+            self.b.ins().trap(TrapCode::unwrap_user(5));
+        }
+        let done = std::mem::replace(&mut self.f, caller);
+        let inl = done.inline.unwrap();
+        // An exception: release the frame, raise at the call.
+        self.b.switch_to_block(fail);
+        let d = self.b.ins().iconst(self.ptr, desc as i64);
+        self.call(self.h.unwind, &[regs, d, fail_pc], None);
+        self.b.ins().jump(raised, &[]);
+        self.b.switch_to_block(raised);
+        self.raise(pc);
+        // The result: release what the frame holds (but the borrowed
+        // parameters).
+        self.b.switch_to_block(exit);
+        for &r in inl.written.iter().filter(|&&r| r >= ir.params.len() as u32) {
+            let v = self.b.ins().load(types::I64, MF, regs, r as i32 * 8);
+            self.xdecref(v);
+        }
+        result
+    }
+
 }

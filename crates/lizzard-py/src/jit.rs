@@ -207,6 +207,9 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         long_value: a(lz_long_value as *const ()),
         missed: a(lz_missed as *const ()),
         init_returned: a(lz_init_returned as *const ()),
+        finish: a(lz_finish as *const ()),
+        vectorcall: a(ffi::PyObject_Vectorcall as *const ()),
+        unwind: a(lz_unwind as *const ()),
     };
     let head = std::mem::size_of::<ffi::PyObject>() as i32;
     let layout = Layout {
@@ -225,24 +228,10 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         false_: unsafe { ffi::Py_False() } as usize,
         epoch: crate::globals::epoch_addr(),
     };
-    let consts: Vec<usize> = f.consts.iter().map(|c| c.as_ptr() as usize).collect();
-    let nums: Vec<Num> = ir
-        .consts
-        .iter()
-        .map(|c| match c {
-            Const::Float(x) => Num::F64(*x),
-            Const::Int(i) => Num::I64(*i),
-            _ => Num::Other,
-        })
-        .collect();
-    let names: Vec<usize> = f.names.iter().map(|n| n.as_ptr() as usize).collect();
-    let ics: Vec<usize> = f.ics.iter().map(|c| c as *const AttrIc as usize).collect();
     let mut deps = f.jit.deps.try_lock().ok()?;
-    let specs = specs(py, f, &mut deps);
-    f.jit.nspecs.store(count(&specs), Ordering::Relaxed);
+    let unit = unit(py, f, &mut deps, 0);
+    f.jit.nspecs.store(count(&unit.specs), Ordering::Relaxed);
     f.jit.misses.store(0, Ordering::Relaxed);
-    let misses = &f.jit.misses as *const AtomicU32 as usize;
-    let unit = lizzard_jit::Unit { ir, specs: &specs, consts: &consts, nums: &nums, names: &names, ics: &ics, borrow_params: f.borrow_params, misses };
     match lizzard_jit::compile(&unit, &helpers, &layout) {
         Ok(e) => {
             f.jit.entry.store(e as usize, Ordering::Release);
@@ -275,7 +264,7 @@ extern "C" fn lz_missed(ctx_: *mut c_void) {
         return;
     }
     let mut deps = Vec::new();
-    let now = count(&specs(ctx.py, f, &mut deps));
+    let now = count(&specs(ctx.py, f, &mut deps, 1));
     if now > f.jit.nspecs.load(Ordering::Relaxed) {
         if debug() {
             eprintln!("lizzard: {} has more cache data: recompiling", f.ir.name);
@@ -305,8 +294,33 @@ fn quick(py: Python<'_>, ck: &Ck) -> Quick {
     }
 }
 
+/// What compiling `f` needs, with what its caches saw; `depth` 0 for the
+/// function compiled, 1 for one inlined into it (which inlines nothing).
+fn unit<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth: u32) -> lizzard_jit::Unit<'a> {
+    let ir = &f.ir;
+    let nums = ir
+        .consts
+        .iter()
+        .map(|c| match c {
+            Const::Float(x) => Num::F64(*x),
+            Const::Int(i) => Num::I64(*i),
+            _ => Num::Other,
+        })
+        .collect();
+    lizzard_jit::Unit {
+        ir,
+        specs: specs(py, f, deps, depth),
+        consts: f.consts.iter().map(|c| c.as_ptr() as usize).collect(),
+        nums,
+        names: f.names.iter().map(|n| n.as_ptr() as usize).collect(),
+        ics: f.ics.iter().map(|c| c as *const AttrIc as usize).collect(),
+        borrow_params: f.borrow_params,
+        misses: &f.jit.misses as *const AtomicU32 as usize,
+    }
+}
+
 /// What the caches saw, per instruction.
-fn specs(py: Python<'_>, f: &FuncRt, deps: &mut Vec<Box<CallDesc>>) -> Vec<Spec> {
+fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth: u32) -> Vec<Spec<'a>> {
     let ir = &f.ir;
     let mut out = Vec::with_capacity(ir.code.len());
     // The global each register was last loaded from, in straight-line code.
@@ -324,7 +338,7 @@ fn specs(py: Python<'_>, f: &FuncRt, deps: &mut Vec<Box<CallDesc>>) -> Vec<Spec>
                 // SAFETY: a valid object (the global's).
                 Some(&callee) if unsafe { ffi::Py_TYPE(callee as *mut ffi::PyObject) } == &raw mut ffi::PyType_Type => match ctor_spec(&f.ctics[pc]) {
                     // A class constructed by allocating and `__init__`.
-                    Some((tp, version, init)) if tp as usize == callee => match call_spec(py, f, pc, init, args.len() + 1, 0, deps) {
+                    Some((tp, version, init)) if tp as usize == callee => match call_spec(py, f, pc, init, args.len() + 1, 0, deps, depth) {
                         // SAFETY: a class.
                         Some((_, spec)) => Spec::Call(CallSpec { guard: CallGuard::Ctor { tp: tp as usize, version, alloc: unsafe { (*tp).tp_alloc }.map_or(0, |a| a as *const () as usize) }, ..spec }),
                         None => Spec::None,
@@ -333,15 +347,23 @@ fn specs(py: Python<'_>, f: &FuncRt, deps: &mut Vec<Box<CallDesc>>) -> Vec<Spec>
                 },
                 Some(&callee) => {
                     let skip = direct.as_ref().map_or(0, |d| d.skip);
-                    call_spec(py, f, pc, callee as *mut ffi::PyObject, args.len(), skip, deps).map_or(Spec::None, |(_, spec)| Spec::Call(CallSpec { guard: CallGuard::Func(callee), ..spec }))
+                    call_spec(py, f, pc, callee as *mut ffi::PyObject, args.len(), skip, deps, depth).map_or(Spec::None, |(_, spec)| Spec::Call(CallSpec { guard: CallGuard::Func(callee), ..spec }))
                 }
                 None => Spec::None,
             },
             Instr::CallMethod { args, kwnames, direct, .. } if kwnames.is_empty() => match method_spec(&f.mics[pc]) {
                 Some((tp, version, func, keys, nentries, valid)) => {
                     let skip = direct.as_ref().map_or(0, |d| d.skip);
-                    match call_spec(py, f, pc, func, args.len() + 1, skip, deps) {
-                        Some((_, spec)) => Spec::Call(CallSpec { guard: CallGuard::Method { tp, version, keys, nentries, valid }, ..spec }),
+                    let guard = CallGuard::Method { tp, version, keys, nentries, valid };
+                    match call_spec(py, f, pc, func, args.len() + 1, skip, deps, depth) {
+                        Some((_, spec)) => Spec::Call(CallSpec { guard, ..spec }),
+                        // A builtin method (alive while the type's version
+                        // holds): called with the arguments directly.
+                        // SAFETY: a valid object.
+                        None if unsafe { ffi::Py_TYPE(func) } == &raw mut ffi::PyMethodDescr_Type => {
+                            let n = args.len() + 1;
+                            Spec::Call(CallSpec { guard, desc: func as usize, nregs: n as u32, checks: vec![Quick::Any; n], inline: None, native: true })
+                        }
                         None => Spec::None,
                     }
                 }
@@ -368,7 +390,8 @@ fn specs(py: Python<'_>, f: &FuncRt, deps: &mut Vec<Box<CallDesc>>) -> Vec<Spec>
 /// A direct call of `callee` (if it is a Lizzard function compiled code can
 /// enter: plain positional parameters, `nargs` of them, not a generator)
 /// from site `pc`; its guard is left for the caller to fill in.
-fn call_spec(py: Python<'_>, site: &FuncRt, pc: usize, callee: *mut ffi::PyObject, nargs: usize, skip: u64, deps: &mut Vec<Box<CallDesc>>) -> Option<((), CallSpec)> {
+#[allow(clippy::too_many_arguments)]
+fn call_spec<'a>(py: Python<'_>, site: &FuncRt, pc: usize, callee: *mut ffi::PyObject, nargs: usize, skip: u64, deps: &mut Vec<Box<CallDesc>>, depth: u32) -> Option<((), CallSpec<'a>)> {
     // SAFETY: a valid object (kept alive by its cache's owner).
     if unsafe { ffi::Py_TYPE(callee) } != lizzard_function_type() {
         return None;
@@ -387,10 +410,18 @@ fn call_spec(py: Python<'_>, site: &FuncRt, pc: usize, callee: *mut ffi::PyObjec
         _ => 0,
     };
     let checks = ir.params.iter().enumerate().map(|(i, p)| if proven & (1 << i) != 0 { Quick::Any } else { quick(py, rt.ck(py, p.check)) }).collect();
+    let nregs = ir.reprs.len() as u32;
+    // SAFETY: the description keeps the function alive as long as the
+    // caller's code (`deps`), longer than compiling it.
+    let callee_rt: &'a FuncRt = unsafe { &*Arc::as_ptr(&rt) };
     let desc = Box::new(CallDesc { func });
     let addr = &*desc as *const CallDesc as usize;
     deps.push(desc);
-    Some(((), CallSpec { guard: CallGuard::Func(0), desc: addr, nregs: ir.reprs.len() as u32, checks }))
+    // A small callee, warm (it ran), may be compiled into the caller.
+    let inline = (depth == 0 && callee_rt.ir.code.len() <= 48 && callee_rt.jit.calls.load(Ordering::Relaxed) + callee_rt.jit.compiles.load(Ordering::Relaxed) > 0)
+        .then(|| Box::new(unit(py, callee_rt, deps, 1)))
+        .filter(|u| lizzard_jit::inlinable(u));
+    Some(((), CallSpec { guard: CallGuard::Func(0), desc: addr, nregs, checks, inline, native: false }))
 }
 
 /// Run a frame from `pc` in compiled code until it returns or yields, as
@@ -590,6 +621,53 @@ extern "C" fn lz_long_value(o: *mut ffi::PyObject, out: *mut i64) -> u32 {
         *out = v;
         1
     }
+}
+
+/// The interpreter runs the rest of an inlined call of `desc`'s function
+/// from `pc` on `frame`, its parameters borrowed; then the frame is
+/// released. Its result (a new reference), or null with an exception set.
+extern "C" fn lz_finish(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc, pc: u32) -> *mut ffi::PyObject {
+    let py = ctx(ctx_).py;
+    // SAFETY: the description lives as long as the caller's code.
+    let lf = unsafe { (*desc).func.get() };
+    let rt = &*lf.rt;
+    // The frame owns its parameters from now on.
+    for i in 0..rt.ir.params.len() {
+        // SAFETY: bound parameters.
+        unsafe { crate::rc::incref(*frame.add(i) as *mut ffi::PyObject) };
+    }
+    // SAFETY: the frame has a slot per register of `rt`.
+    let mut regs = unsafe { Regs::window(frame, &rt.objs) };
+    let mut pc = pc as usize;
+    let r = run_interp(py, rt, lf.globals.bind(py), &lf.closure, &mut regs, &mut pc, None);
+    // SAFETY: the frame's slots.
+    crate::frame::release_slots(unsafe { std::slice::from_raw_parts_mut(frame, rt.objs.len()) }, &rt.objs);
+    match r {
+        Ok(Exit::Return(v)) => v.into_ptr(),
+        Ok(_) => unreachable!("yield in a function that is not a generator"),
+        Err(e) => {
+            e.restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// An exception raised at `pc` leaves an inlined call: note where, and
+/// release the frame but its borrowed parameters.
+extern "C" fn lz_unwind(frame: *mut u64, desc: *const CallDesc, pc: u32) {
+    // SAFETY: compiled code runs attached.
+    let py = unsafe { Python::assume_attached() };
+    // SAFETY: the description lives as long as the caller's code.
+    let rt = unsafe { &*(*desc).func.get().rt };
+    let ir = &rt.ir;
+    let e = PyErr::fetch(py);
+    let line = ir.lines.get(pc as usize).copied().unwrap_or(ir.line);
+    let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
+    let n = ir.params.len();
+    // SAFETY: the frame's slots.
+    let slots = unsafe { std::slice::from_raw_parts_mut(frame, rt.objs.len()) };
+    crate::frame::release_slots(&mut slots[n..], &rt.objs[n..]);
+    e.restore(py);
 }
 
 /// `__init__` returned `r` (a new reference), not None.

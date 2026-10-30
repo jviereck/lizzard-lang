@@ -315,7 +315,7 @@ unsafe fn lookup(ic: &AttrIc, o: *mut ffi::PyObject, name: *mut ffi::PyObject, s
 
 /// What compiled code may assume at an attribute site (`store`: a store):
 /// the type and version its cache saw, and where the attribute lives.
-pub fn attr_spec(ic: &AttrIc, store: bool) -> lizzard_jit::Spec {
+pub fn attr_spec(ic: &AttrIc, store: bool) -> lizzard_jit::Spec<'static> {
     unsafe {
         let e = ic.entry.load(Ordering::Acquire);
         if e.is_null() {

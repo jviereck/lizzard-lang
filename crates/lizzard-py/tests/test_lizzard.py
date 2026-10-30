@@ -38,6 +38,7 @@ NUMBERS = HERE / "programs" / "arith_edges.py"
 INSTANCE_ATTRS = HERE / "programs" / "instance_attrs.py"
 FRAMES = HERE / "programs" / "frames.py"
 CONSTRUCTORS = HERE / "programs" / "constructors.py"
+JIT_PATHS = HERE / "programs" / "jit_paths.py"
 
 
 def run(*args, cwd=None, env=None):
@@ -177,15 +178,17 @@ class Float32Path(unittest.TestCase):
 
 class Programs(unittest.TestCase):
     def test_output_matches_cpython(self):
-        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS, FRAMES, CONSTRUCTORS):
+        for prog in (CLASSES, CONTAINERS, UNIONS, GLOBALS, EXCEPTIONS, SETS, ARGUMENTS, GENERICS, CLOSURES, DATACLASSES, GENERATORS, OPERATORS, PROPERTIES, THREADS, PROTOCOLS, LITERALS, SLOTS, REBINDING, NUMBERS, INSTANCE_ATTRS, FRAMES, CONSTRUCTORS, JIT_PATHS):
             with self.subTest(prog.name):
                 plain = run(str(prog))
                 self.assertEqual(plain[0], 0, plain[2])
-                # Compiled (the default) and interpreted.
-                for jit in ("1", "0"):
-                    lizzard = run("-m", "lizzard", str(prog), env={"LIZZARD_JIT": jit})
+                # Compiled (the default), compiled before any cache is
+                # warm, and interpreted.
+                eager = {"LIZZARD_JIT_WARM": "1", "LIZZARD_JIT_LOOPS": "1"}
+                for env in ({"LIZZARD_JIT": "1"}, {"LIZZARD_JIT": "1", **eager}, {"LIZZARD_JIT": "0"}):
+                    lizzard = run("-m", "lizzard", str(prog), env={"LIZZARD_JIT_DEBUG": "strict", **env})
                     self.assertEqual(lizzard[0], 0, lizzard[2])
-                    self.assertEqual(lizzard[1], plain[1], f"LIZZARD_JIT={jit}")
+                    self.assertEqual(lizzard[1], plain[1], env)
 
     def test_fast_paths_are_on(self):
         # The layouts the int/float fast paths and inline attribute access
