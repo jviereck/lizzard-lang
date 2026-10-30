@@ -26,7 +26,8 @@
 //! or run arbitrary code), an exception and a bail-out, the registers that
 //! are live there are *materialized*: boxed or given their reference, and
 //! stored in their slots. Scalar registers (`I64`, `Bool`) are Cranelift
-//! variables, written through to their slots.
+//! variables, stored to their slots where something reads those (a helper,
+//! the interpreter).
 //!
 //! A compiled function is
 //! `extern "C" fn(ctx, regs: *mut u64, pc: *mut u32, pending: u32) -> u32`.
@@ -99,6 +100,17 @@ pub struct Layout {
     /// The address of the `u64` that changes whenever a watched globals or
     /// builtins dict does.
     pub epoch: usize,
+    /// CPython's preallocated small ints: `count` immortal objects for the
+    /// values from `min`, the first at `first`, `stride` bytes apart.
+    pub small_ints: Option<SmallInts>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SmallInts {
+    pub first: usize,
+    pub stride: i64,
+    pub min: i64,
+    pub count: i64,
 }
 
 /// How reference counts change.
@@ -592,6 +604,15 @@ pub fn compile(u: &Unit, h: &Helpers, l: &Layout) -> Result<Entry, String> {
     }
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let code = module.get_finalized_function(id);
+    // `LIZZARD_JIT_BYTES=dir`: the machine code, as `<name>@<address>.bin`.
+    if let Some(dir) = std::env::var_os("LIZZARD_JIT_BYTES") {
+        if let Some(len) = ctx.compiled_code().map(|c| c.code_buffer().len()) {
+            // SAFETY: the function's code, `len` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(code, len) };
+            let name: String = u.ir.name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}@{:x}.bin", code as usize)), bytes);
+        }
+    }
     // The module owns the code's memory; it stays mapped for the process.
     std::mem::forget(module);
     // SAFETY: the function was compiled with `Entry`'s signature.
@@ -752,6 +773,9 @@ struct Fn<'a> {
     written: std::collections::BTreeSet<Reg>,
     /// How deeply it is inlined (0: the function compiled).
     depth: u32,
+    /// Emitting a path that leaves an inlined function's code (to the
+    /// interpreter): its slot writes do not count in `written`.
+    cold: bool,
 }
 
 /// An inlined callee: its frame and where it continues.
@@ -770,6 +794,12 @@ struct Inlined {
     /// Per parameter: the caller's register is dead after the call and its
     /// slot holds the argument's reference (a candidate for `Reuse`).
     donors: Vec<bool>,
+    /// The arguments: the parameters' slots get them only where the frame
+    /// is handed over (`prepare_frame`).
+    args: Vec<Value>,
+    /// The immortal constant every `return` so far returned (None: none
+    /// yet; Some(None): not all the same one).
+    ret_const: Option<Option<usize>>,
 }
 
 struct Lower<'a> {
@@ -790,7 +820,8 @@ struct Lower<'a> {
     pcp: Value,
     /// The thread's id (free-threaded reference counting).
     tid: Value,
-    fuel: Variable,
+    /// Loop iterations left until the next safepoint.
+    fuel: StackSlot,
     /// Where direct calls build the callee's frame.
     frame: Option<StackSlot>,
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
@@ -821,7 +852,7 @@ impl<'a> Lower<'a> {
         let ret_block = b.create_block();
         b.append_block_param(ret_block, ptr);
         b.append_block_param(ret_block, types::I32);
-        let fuel = b.declare_var(types::I64);
+        let fuel = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let vars = ir.reprs.iter().map(|r| matches!(r, Repr::I64 | Repr::Bool).then(|| b.declare_var(types::I64))).collect();
         let tid = match l.rc {
             Rc::Ft { .. } => b.ins().load(ptr, MF, ps[0], CTX_TID),
@@ -832,7 +863,7 @@ impl<'a> Lower<'a> {
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default(), depth: 0 },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default(), depth: 0, cold: false },
             h,
             l,
             ptr,
@@ -864,7 +895,7 @@ impl<'a> Lower<'a> {
             }
         }
         let fuel0 = self.b.ins().iconst(types::I64, FUEL);
-        self.b.def_var(self.fuel, fuel0);
+        self.b.ins().stack_store(self.ptr, fuel0, self.fuel, 0);
         let pc = self.b.ins().load(types::I32, MF, self.pcp, 0);
         let resume = self.b.create_block();
         let throw = self.b.create_block();
@@ -987,8 +1018,15 @@ impl<'a> Lower<'a> {
                 }
                 self.b.switch_to_block(blk);
                 self.f.vals.clear();
-                if pc == 0 {
-                    for (r, v) in self.f.seed.clone() {
+                // An inlined function's parameters never change: what is
+                // known of them holds at every label (but verified shapes,
+                // after code that may have run Python code). Their slots are
+                // only written where the frame is handed over.
+                if pc == 0 || self.f.inline.is_some() {
+                    for (r, mut v) in self.f.seed.clone() {
+                        if pc != 0 {
+                            v.checked = false;
+                        }
                         self.f.vals.insert(r, v);
                     }
                 }
@@ -1042,7 +1080,7 @@ impl<'a> Lower<'a> {
     }
 
     fn slot_store(&mut self, v: Value, r: Reg) {
-        if self.f.ir.reprs[r as usize] == Repr::Obj {
+        if self.f.ir.reprs[r as usize] == Repr::Obj && !self.f.cold {
             self.f.written.insert(r);
         }
         self.b.ins().store(MF, v, self.f.regs, r as i32 * 8);
@@ -1069,14 +1107,16 @@ impl<'a> Lower<'a> {
 
     /// `p` is an `iconst` of None, True or False: immortal.
     fn immortal(&self, p: Value) -> bool {
+        self.const_of(p).is_some_and(|v| v == self.l.none || v == self.l.true_ || v == self.l.false_)
+    }
+
+    /// The value of `p` if it is an `iconst`.
+    fn const_of(&self, p: Value) -> Option<usize> {
         use cranelift_codegen::ir::{InstructionData, Opcode, ValueDef};
-        let ValueDef::Result(inst, _) = self.b.func.dfg.value_def(p) else { return false };
+        let ValueDef::Result(inst, _) = self.b.func.dfg.value_def(p) else { return None };
         match self.b.func.dfg.insts[inst] {
-            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
-                let v = imm.bits() as usize;
-                v == self.l.none || v == self.l.true_ || v == self.l.false_
-            }
-            _ => false,
+            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits() as usize),
+            _ => None,
         }
     }
 
@@ -1257,8 +1297,31 @@ impl<'a> Lower<'a> {
     }
 
     /// `new(x)` (a new reference); null raises at `pc`.
+    /// `PyLong_FromLongLong(x)`: a small int's preallocated object without
+    /// a call. Null on failure.
+    fn new_int(&mut self, x: Value) -> Value {
+        let Some(si) = self.l.small_ints else {
+            return self.call(self.h.long_new, &[x], Some(self.ptr)).unwrap();
+        };
+        let done = self.b.create_block();
+        let r = self.b.append_block_param(done, self.ptr);
+        let (small, big) = (self.b.create_block(), self.b.create_block());
+        let i = self.b.ins().iadd_imm_s(x, -si.min);
+        let c = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, i, si.count);
+        self.b.ins().brif(c, small, &[], big, &[]);
+        self.b.switch_to_block(small);
+        let off = self.b.ins().imul_imm_s(i, si.stride);
+        let p = self.b.ins().iadd_imm_s(off, si.first as i64);
+        self.b.ins().jump(done, &[BlockArg::Value(p)]);
+        self.b.switch_to_block(big);
+        let p = self.call(self.h.long_new, &[x], Some(self.ptr)).unwrap();
+        self.b.ins().jump(done, &[BlockArg::Value(p)]);
+        self.b.switch_to_block(done);
+        r
+    }
+
     fn boxed(&mut self, new: usize, x: Value, pc: usize) -> Value {
-        let p = self.call(new, &[x], Some(self.ptr)).unwrap();
+        let p = if new == self.h.long_new { self.new_int(x) } else { self.call(new, &[x], Some(self.ptr)).unwrap() };
         let failed = self.b.create_block();
         let ok = self.b.create_block();
         self.b.ins().brif(p, ok, &[], failed, &[]);
@@ -1272,6 +1335,15 @@ impl<'a> Lower<'a> {
     /// executing it, a handler or the interpreter will read) and forget the
     /// others.
     fn flush(&mut self, pc: usize) {
+        // The scalar registers live there, into their slots.
+        for r in 0..self.f.vars.len() {
+            if let Some(v) = self.f.vars[r] {
+                if self.live_at(pc, r as Reg) {
+                    let x = self.b.use_var(v);
+                    self.slot_store(x, r as Reg);
+                }
+            }
+        }
         let mut regs: Vec<Reg> = self.f.vals.keys().copied().collect();
         regs.sort_unstable();
         let mut live = Vec::new();
@@ -1292,9 +1364,17 @@ impl<'a> Lower<'a> {
     /// (a store, a call): the registers live after it (at `live_pc`) or in
     /// `keep` get their references; the others are forgotten.
     fn secure_borrowed(&mut self, live_pc: usize, pc: usize, keep: &[Reg]) {
+        self.secure_borrowed_but(live_pc, pc, keep, None);
+    }
+
+    /// `secure_borrowed`, leaving `spare` as it is.
+    fn secure_borrowed_but(&mut self, live_pc: usize, pc: usize, keep: &[Reg], spare: Option<Reg>) {
         let mut list = Vec::new();
         for r in self.borrowed() {
             let v = self.f.vals[&r];
+            if Some(r) == spare {
+                continue;
+            }
             if keep.contains(&r) {
                 list.push(r);
             } else if !self.live_at(live_pc, r) {
@@ -1358,10 +1438,11 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Write scalar register `r` (its slot is written when something reads
+    /// it: `flush`).
     fn set_var(&mut self, r: Reg, x: Value) {
         let v = self.f.vars[r as usize].expect("a scalar register");
         self.b.def_var(v, x);
-        self.slot_store(x, r);
     }
 
     fn get_var(&mut self, r: Reg) -> Value {
@@ -1374,8 +1455,9 @@ impl<'a> Lower<'a> {
     /// An exception was raised by instruction `p` (the registers are
     /// materialized): its innermost handler, else leave the function.
     fn raise(&mut self, p: usize) {
-        if let Some(inl) = &self.f.inline {
-            let fail = inl.fail;
+        if self.f.inline.is_some() {
+            self.prepare_frame();
+            let fail = self.f.inline.as_ref().unwrap().fail;
             let pc = self.pc_val(p);
             self.b.ins().jump(fail, &[BlockArg::Value(pc)]);
             return;
@@ -1394,7 +1476,11 @@ impl<'a> Lower<'a> {
 
     /// Stop here: the interpreter continues at `pc`.
     fn bail_to(&mut self, pc: usize) {
+        // The frame goes to the interpreter: what this path stores is not
+        // the code's to release.
+        let cold = std::mem::replace(&mut self.f.cold, true);
         self.flush(pc);
+        self.f.cold = cold;
         let v = self.pc_val(pc);
         self.b.ins().jump(self.bail, &[BlockArg::Value(v)]);
     }
@@ -1451,16 +1537,19 @@ impl<'a> Lower<'a> {
         if t > from {
             self.b.ins().jump(blk, &args);
         } else {
-            let fuel = self.b.use_var(self.fuel);
+            // The fuel lives in memory: no register for it in loops.
+            let fuel = self.b.ins().stack_load(self.ptr, types::I64, self.fuel, 0);
             let fuel = self.b.ins().iadd_imm_s(fuel, -1);
-            self.b.def_var(self.fuel, fuel);
+            self.b.ins().stack_store(self.ptr, fuel, self.fuel, 0);
             let check = self.b.create_block();
+            self.b.set_cold_block(check);
             self.b.ins().brif(fuel, blk, &args, check, &[]);
             self.b.switch_to_block(check);
             let call = self.call(self.h.safepoint, &[self.ctx], Some(types::I32)).unwrap();
             let refuel = self.b.ins().iconst(types::I64, FUEL);
-            self.b.def_var(self.fuel, refuel);
+            self.b.ins().stack_store(self.ptr, refuel, self.fuel, 0);
             let failed = self.b.create_block();
+            self.b.set_cold_block(failed);
             self.b.ins().brif(call, failed, &[], blk, &args);
             self.b.switch_to_block(failed);
             // The unboxed registers too, for a handler.
@@ -1472,6 +1561,7 @@ impl<'a> Lower<'a> {
             self.f.vals.clear();
             self.raise(from);
         }
+        self.b.set_cold_block(fallback);
         self.b.switch_to_block(fallback);
         self.f.vals = start;
         self.bail_to(t);
@@ -1686,7 +1776,10 @@ impl<'a> Lower<'a> {
     /// from instruction `pc` (`Helpers::finish`), and the caller goes on
     /// with its result. Code emitted after this is unreachable.
     fn deopt(&mut self, pc: usize) {
+        let cold = std::mem::replace(&mut self.f.cold, true);
+        self.prepare_frame();
         self.flush(pc);
+        self.f.cold = cold;
         let inl = self.f.inline.as_ref().unwrap();
         let (frame, desc, exit, call_pc) = (inl.frame, inl.desc, inl.exit, inl.call_pc);
         let raised = inl.raised;
@@ -1699,12 +1792,32 @@ impl<'a> Lower<'a> {
         self.cont();
     }
 
+    /// Before an inlined function's frame is handed over (to the
+    /// interpreter, or released after an exception): its parameters in their
+    /// slots, and the object slots its code has not written so far null
+    /// (instructions run in pc order: nothing emitted later ran yet).
+    fn prepare_frame(&mut self) {
+        let inl = self.f.inline.as_ref().unwrap();
+        let regs = self.f.regs;
+        let args = inl.args.clone();
+        for (i, p) in args.iter().enumerate() {
+            self.b.ins().store(MF, *p, regs, i as i32 * 8);
+        }
+        let z = self.b.ins().iconst(types::I64, 0);
+        for r in args.len()..self.f.ir.reprs.len() {
+            if self.f.ir.reprs[r] == Repr::Obj && !self.f.written.contains(&(r as Reg)) {
+                self.b.ins().store(MF, z, regs, r as i32 * 8);
+            }
+        }
+    }
+
     /// Emit a speculative instruction's failure path: from the state at its
     /// start, the interpreter executes it (in an inlined function: finishes
     /// the call). The fast path's state stays: nothing joins it.
     fn bail_path(&mut self, blk: Block, start: HashMap<Reg, Virt>, pc: usize) {
         let fast = std::mem::replace(&mut self.f.vals, start);
         let done = self.f.done;
+        self.b.set_cold_block(blk);
         self.b.switch_to_block(blk);
         if self.f.inline.is_some() {
             self.deopt(pc);
@@ -1738,6 +1851,7 @@ impl<'a> Lower<'a> {
     fn slow_path(&mut self, slow: Block, start: HashMap<Reg, Virt>, pc: usize, then: impl FnOnce(&mut Self)) {
         self.f.vals = start.clone();
         let done = self.f.done;
+        self.b.set_cold_block(slow);
         self.b.switch_to_block(slow);
         if self.f.inline.is_some() {
             self.deopt(pc);
@@ -2028,12 +2142,11 @@ impl<'a> Lower<'a> {
                 f
             }
             Some(Virt { ptr: None, in_slot: false, num, .. }) => {
-                let (new, x) = match num {
-                    Unboxed::F64(x) => (self.h.float_new, x),
-                    Unboxed::I64(x) => (self.h.long_new, x),
+                let f = match num {
+                    Unboxed::F64(x) => self.call(self.h.float_new, &[x], Some(self.ptr)).unwrap(),
+                    Unboxed::I64(x) => self.new_int(x),
                     Unboxed::None => unreachable!(),
                 };
-                let f = self.call(new, &[x], Some(self.ptr)).unwrap();
                 self.guard(f, slow);
                 f
             }
@@ -2127,6 +2240,16 @@ impl<'a> Lower<'a> {
         let addr = self.b.ins().iconst(self.ptr, self.l.epoch as i64);
         let e = self.b.ins().load(types::I64, MF, addr, 0);
         self.guard_eq(e, epoch as i64, slow);
+        if self.f.u.speculate {
+            // A changed global: the interpreter goes on.
+            let v = self.b.ins().iconst(self.ptr, value as i64);
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            self.f.vals.insert(dst, Virt::ptr(v, false));
+            return self.next(pc);
+        }
         let join = self.b.create_block();
         let x = self.b.append_block_param(join, self.ptr);
         let v = self.b.ins().iconst(self.ptr, value as i64);
@@ -2150,6 +2273,7 @@ impl<'a> Lower<'a> {
         };
         match (q, ty) {
             (Quick::Any, _) => true,
+            (Quick::Is(o), _) => v.ptr.and_then(|p| self.const_of(p)) == Some(o),
             (Quick::Type(t), Some(u)) => t == u,
             (Quick::FloatOrInt, Some(u)) => u == self.l.float_type || u == self.l.long_type,
             _ => false,
@@ -2315,6 +2439,16 @@ impl<'a> Lower<'a> {
                 self.b.ins().fdiv(x, y)
             }
         };
+        if self.f.u.speculate {
+            // Anything else (two ints, another type, x / 0): the interpreter
+            // goes on.
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::F64(v), ty: Some(self.l.float_type), konst: false, checked: false });
+            return self.next(pc);
+        }
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, types::F64);
         self.b.ins().jump(join, &[BlockArg::Value(v)]);
@@ -2425,6 +2559,15 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if self.f.u.speculate {
+            // Overflow, another type, x // 0: the interpreter goes on.
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(v), ty: Some(self.l.long_type), konst: false, checked: false });
+            return self.next(pc);
+        }
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, types::I64);
         self.b.ins().jump(join, &[BlockArg::Value(v)]);
@@ -2586,7 +2729,7 @@ impl<'a> Lower<'a> {
                 p
             }
             Some(Virt { ptr: None, in_slot: false, num: Unboxed::I64(x), .. }) => {
-                let p = self.call(self.h.long_new, &[x], Some(self.ptr)).unwrap();
+                let p = self.new_int(x);
                 self.guard(p, slow);
                 p
             }
@@ -2602,8 +2745,14 @@ impl<'a> Lower<'a> {
                 p
             }
         };
-        match &self.f.inline {
+        let c = self.const_of(p).filter(|_| self.immortal(p));
+        match &mut self.f.inline {
             Some(inl) => {
+                inl.ret_const = Some(match inl.ret_const {
+                    None => c,
+                    Some(prev) if prev == c => c,
+                    Some(_) => None,
+                });
                 let exit = inl.exit;
                 self.b.ins().jump(exit, &[BlockArg::Value(p)]);
             }
@@ -2624,11 +2773,16 @@ impl<'a> Lower<'a> {
         let u: &'a Unit<'a> = self.f.u;
         let Spec::Call(spec) = &u.specs[pc] else { unreachable!() };
         let covered = self.f.ir.handlers.iter().any(|h| h.ranges.iter().any(|(s, e)| (*s as usize) <= pc && pc < *e as usize));
-        let reads = self.f.ir.code[pc].reads();
+        // The arguments must stay alive during the call; the function
+        // need not (the guard proves it is the one the call's description
+        // keeps).
+        let mut keep: Vec<Reg> = obj.into_iter().chain(args.iter().copied()).collect();
+        let spare = func.filter(|&r| !self.live_at(pc + 1, r));
+        keep.extend(func.filter(|_| spare.is_none()));
         if covered {
             self.flush(pc);
         } else {
-            self.secure_borrowed(pc + 1, pc, &reads);
+            self.secure_borrowed_but(pc + 1, pc, &keep, spare);
         }
         let mut all: Vec<Reg> = obj.into_iter().collect();
         all.extend(args);
@@ -2787,6 +2941,21 @@ impl<'a> Lower<'a> {
         };
         // The callee ran Python code.
         self.clobber();
+        if self.f.u.speculate {
+            // A failed guard bails out: nothing joins, and an immortal
+            // constant result (None) needs no slot.
+            if self.immortal(r) {
+                self.f.vals.insert(dst, Virt { ptr: Some(r), in_slot: false, num: Unboxed::None, ty: None, konst: true, checked: false });
+            } else {
+                self.put(dst, r);
+                self.f.vals.insert(dst, Virt::ptr(r, true));
+            }
+            let cont = self.b.create_block();
+            self.b.ins().jump(cont, &[]);
+            self.bail_path(slow, start, pc);
+            self.b.switch_to_block(cont);
+            return self.next(pc);
+        }
         self.put(dst, r);
         let join = self.b.create_block();
         self.b.ins().jump(join, &[]);
@@ -2804,14 +2973,10 @@ impl<'a> Lower<'a> {
     fn inline_call(&mut self, pc: usize, args: &[Value], known: &[Option<Virt>], donors: &[bool], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> Value {
         let ir = callee.ir;
         let nregs = ir.reprs.len();
+        // The frame: initialized where it is used (`init` below,
+        // `prepare_frame`).
         let frame = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, nregs.max(1) as u32 * 8, 3));
-        for (i, p) in args.iter().enumerate() {
-            self.b.ins().stack_store(self.ptr, *p, frame, i as i32 * 8);
-        }
         let z = self.b.ins().iconst(types::I64, 0);
-        for i in args.len()..nregs {
-            self.b.ins().stack_store(self.ptr, z, frame, i as i32 * 8);
-        }
         let regs = self.b.ins().stack_addr(self.ptr, frame, 0);
         let vars: Vec<Option<Variable>> = ir
             .reprs
@@ -2851,15 +3016,25 @@ impl<'a> Lower<'a> {
                 (i as Reg, v)
             })
             .collect();
-        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, donors: donors.to_vec() };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default(), depth: self.f.depth + 1 };
+        let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, donors: donors.to_vec(), args: args.to_vec(), ret_const: None };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default(), depth: self.f.depth + 1, cold: false };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
-        self.b.ins().jump(first, &[]);
+        let init = self.b.create_block();
+        self.b.ins().jump(init, &[]);
         self.body();
         if !self.f.done {
             self.b.ins().trap(TrapCode::unwrap_user(5));
         }
+        // The slots the code may write (and the exit releases) start null.
+        self.b.switch_to_block(init);
+        for r in self.f.written.clone() {
+            if r as usize >= args.len() {
+                self.b.ins().store(MF, z, regs, r as i32 * 8);
+            }
+        }
+        self.b.ins().jump(first, &[]);
+        let ret_const = self.f.inline.as_ref().and_then(|i| i.ret_const).flatten();
         let done = std::mem::replace(&mut self.f, caller);
         // An exception: release the frame, raise at the call.
         self.b.switch_to_block(fail);
@@ -2875,7 +3050,11 @@ impl<'a> Lower<'a> {
             let v = self.b.ins().load(types::I64, MF, regs, r as i32 * 8);
             self.xdecref(v);
         }
-        result
+        // Always the same immortal constant (None): known here.
+        match ret_const {
+            Some(c) => self.b.ins().iconst(self.ptr, c as i64),
+            None => result,
+        }
     }
 
 

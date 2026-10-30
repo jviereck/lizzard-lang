@@ -268,6 +268,7 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         true_: unsafe { ffi::Py_True() } as usize,
         false_: unsafe { ffi::Py_False() } as usize,
         epoch: crate::globals::epoch_addr(),
+        small_ints: small_ints(),
     };
     let mut deps = f.jit.deps.try_lock().ok()?;
     let unit = unit(py, f, &mut deps, 0);
@@ -379,6 +380,37 @@ extern "C" fn lz_missed(ctx_: *mut c_void) {
         f.jit.loops.store(0, Ordering::Relaxed);
         f.jit.entry.store(0, Ordering::Release);
     }
+}
+
+/// Where CPython keeps its preallocated small ints (-5..=256), if they are
+/// immortal objects at evenly spaced addresses (checked once).
+fn small_ints() -> Option<lizzard_jit::SmallInts> {
+    static SMALL: OnceLock<Option<lizzard_jit::SmallInts>> = OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let (min, max) = (-5i64, 256i64);
+        // SAFETY: attached (compiling); the ints are released again.
+        unsafe {
+            let at = |v: i64| {
+                let p = ffi::PyLong_FromLongLong(v);
+                let immortal = !p.is_null() && ffi::Py_REFCNT(p) > (1 << 29);
+                if !p.is_null() {
+                    ffi::Py_DecRef(p);
+                }
+                immortal.then_some(p as i64)
+            };
+            let first = at(min)?;
+            let stride = at(min + 1)? - first;
+            if stride <= 0 {
+                return None;
+            }
+            for v in min..=max {
+                if at(v)? != first + (v - min) * stride {
+                    return None;
+                }
+            }
+            Some(lizzard_jit::SmallInts { first: first as usize, stride, min, count: max - min + 1 })
+        }
+    })
 }
 
 /// A check by type pointers, for compiled code.
