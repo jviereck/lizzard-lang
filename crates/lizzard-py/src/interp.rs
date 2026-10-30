@@ -389,14 +389,27 @@ unsafe extern "C" fn lz_vectorcall(callable: *mut ffi::PyObject, args: *const *m
     match r {
         Ok(Ok(v)) => v.into_ptr(),
         Ok(Err(e)) => {
+            release_deferred();
             e.restore(py);
             std::ptr::null_mut()
         }
         Err(_) => {
+            release_deferred();
             pyo3::panic::PanicException::new_err("panic in a Lizzard function").restore(py);
             std::ptr::null_mut()
         }
     }
+}
+
+/// Run the reference releases PyO3 deferred. Code CPython calls directly
+/// (`lz_vectorcall`, compiled code's helpers) does not tell PyO3 that the
+/// thread is attached, so the references PyO3 drops there (a `PyErr`'s,
+/// as an exception is handled or created) wait in its pool until something
+/// attaches through PyO3, which in a loop of plain calls never happens.
+/// Called where exceptions are handled or leave a function, not on every
+/// call: attaching costs about as much as a call. No exception may be set.
+pub(crate) fn release_deferred() {
+    Python::attach(|_| ());
 }
 
 unsafe extern "C" {
@@ -700,6 +713,7 @@ pub(crate) fn run_interp<'py>(
                 match ir.handlers.iter().rev().find(|h| h.ranges.iter().any(|(s, e)| *s <= at && at < *e)) {
                     Some(h) => {
                         regs.set_obj(h.exc, e.into_value(py).into_bound(py).into_any());
+                        release_deferred();
                         p = h.target as usize;
                     }
                     None => {

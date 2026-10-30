@@ -255,6 +255,50 @@ class Programs(unittest.TestCase):
                 code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": jit})
                 self.assertEqual((code, out), (0, "RecursionError\n"), err)
 
+    def test_caught_exceptions_are_released(self):
+        # Handled exceptions are released in both engines (PyO3 defers the
+        # releases it makes outside its own entry points).
+        with Scratch() as s:
+            p = s.write("m.py", """\
+                # lizzard: module
+                import gc
+
+
+                def boom(n: int) -> int:
+                    raise ValueError("x")
+
+
+                def catches(m: int) -> int:
+                    s = 0
+                    for i in range(m):
+                        try:
+                            raise ValueError("x")
+                        except ValueError:
+                            s += 1
+                        try:
+                            s += int("x")
+                        except ValueError as e:
+                            s += len(str(e)) * 0
+                        try:
+                            s += boom(i)
+                        except:
+                            s += 1
+                    return s
+
+
+                def alive() -> int:
+                    return len([o for o in gc.get_objects() if type(o) is ValueError])
+
+
+                if __name__ == "__main__":
+                    catches(10)
+                    before = alive()
+                    print(catches(3000), alive() - before)
+                """)
+            for jit in ("1", "0"):
+                code, out, err = run("-m", "lizzard", str(p), env={"LIZZARD_JIT": jit})
+                self.assertEqual((code, out), (0, "6000 0\n"), err)
+
     def test_interpreted_calls_do_not_use_the_c_stack(self):
         # The interpreter runs calls between Lizzard functions in one loop:
         # recursion as deep as sys.getrecursionlimit() allows, then

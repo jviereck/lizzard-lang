@@ -738,6 +738,7 @@ extern "C" fn lz_catch(ctx_: *mut c_void, _slots: *mut u64, reg: u32) {
     let mut regs = ctx.regs();
     let e = PyErr::fetch(ctx.t().py);
     regs.set_obj(reg, e.into_value(ctx.t().py).into_bound(ctx.t().py).into_any());
+    crate::interp::release_deferred();
 }
 
 /// At a loop back-edge, now and then: run signal handlers (Ctrl-C raises
