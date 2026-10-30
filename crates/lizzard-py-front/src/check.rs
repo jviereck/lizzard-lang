@@ -60,6 +60,27 @@ enum Cleanup {
 
 /// A protected range being emitted: its handler, where it (or its current
 /// segment) starts, and `cleanups.len()` when it was opened.
+/// A function that calls itself in tail position (`return f(...)`): such
+/// calls rebind its variables and jump back to `head` when the name still
+/// means this function.
+struct Tail {
+    /// The function's name, and its key (`Direct::key`).
+    name: String,
+    key: String,
+    /// The registers holding the parameters' values (copies: the
+    /// parameters themselves stay as the caller passed them).
+    vars: Vec<Reg>,
+    /// The self tail calls so far (`I64`).
+    depth: Reg,
+    /// Where the body starts.
+    head: u32,
+    /// The jumps to the code that clears the other locals and jumps to
+    /// `head` (emitted at the end, when every local is known).
+    jumps: Vec<usize>,
+    /// The `return f(...)` call being lowered: its source range.
+    site: Option<(u32, u32)>,
+}
+
 struct Region {
     handler: usize,
     start: u32,
@@ -128,6 +149,7 @@ struct Lower<'a> {
     /// Type parameters in scope for annotations in the body (the
     /// function's own, its class's, and the enclosing functions').
     tparams: Vec<(String, TvId)>,
+    tail: Option<Tail>,
 }
 
 /// What a function's body is: statements, or a lambda's expression.
@@ -224,6 +246,7 @@ impl<'a> Lower<'a> {
             gen: None,
             in_comprehension: 0,
             tparams: Vec::new(),
+            tail: None,
         }
     }
 
@@ -266,7 +289,7 @@ impl<'a> Lower<'a> {
 
     fn patch(&mut self, at: usize, to: u32) {
         match &mut self.code[at] {
-            Instr::Jump { target } | Instr::JumpIfFalse { target, .. } | Instr::JumpIfTrue { target, .. } | Instr::ForIter { target, .. } => *target = to,
+            Instr::Jump { target } | Instr::JumpIfFalse { target, .. } | Instr::JumpIfTrue { target, .. } | Instr::ForIter { target, .. } | Instr::JumpIfNotSelf { target, .. } => *target = to,
             _ => unreachable!("patching a non-jump"),
         }
     }
@@ -878,6 +901,26 @@ impl<'a> Lower<'a> {
             }
             l.cell_regs.insert(c, cell);
         }
+        // Self tail calls loop: the parameters' values in variables they
+        // can rebind.
+        if let FnBody::Stmts(body) = spec.body {
+            let plain = params.iter().all(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::PosOrKw)) && params.len() <= 64;
+            if !generator && l.method.is_none() && spec.free.is_empty() && l.cell_regs.is_empty() && spec.key == spec.name && plain && has_self_tail_call(body, &spec.name) {
+                let mut vars = Vec::new();
+                for (i, p) in params.iter().enumerate() {
+                    let v = l.reg(Repr::Obj);
+                    l.emit(Instr::Move { dst: v, src: i as Reg });
+                    if let Some(local) = l.locals.get_mut(&p.name) {
+                        local.reg = v;
+                    }
+                    vars.push(v);
+                }
+                let depth = l.reg(Repr::I64);
+                l.emit(Instr::I64Const { dst: depth, value: 0 });
+                let head = l.here();
+                l.tail = Some(Tail { name: spec.name.clone(), key: spec.key.clone(), vars, depth, head, jumps: Vec::new(), site: None });
+            }
+        }
         let mut body_ty = Ty::None;
         match spec.body {
             FnBody::Stmts(body) => {
@@ -904,6 +947,24 @@ impl<'a> Lower<'a> {
                 body_ty = v.ty.clone();
                 let r = l.obj(&v);
                 l.emit(Instr::Return { src: r });
+            }
+        }
+        // Where self tail calls continue: the other locals unbound (as on
+        // entry), then the body again.
+        if let Some(t) = l.tail.take().filter(|t| !t.jumps.is_empty()) {
+            let mut regs: Vec<Reg> = l.locals.values().filter(|v| v.repr == Repr::Obj && !v.cell && v.reg as usize >= params.len() && !t.vars.contains(&v.reg)).map(|v| v.reg).collect();
+            regs.sort_unstable();
+            regs.dedup();
+            let mut at = t.head;
+            if !regs.is_empty() {
+                at = l.here();
+                for reg in regs {
+                    l.emit(Instr::Unbind { reg });
+                }
+                l.emit(Instr::Jump { target: t.head });
+            }
+            for j in t.jumps {
+                l.patch(j, at);
             }
         }
         let mut hints = vec![0u8; l.code.len()];
@@ -1387,6 +1448,12 @@ impl<'a> Lower<'a> {
                 }
             }
             Stmt::Return(r) if !self.toplevel => {
+                // `return f(...)` in `f`, outside handlers and cleanups.
+                if let (Some(t), Some(Expr::Call(c))) = (&mut self.tail, r.value.as_deref()) {
+                    if self.cleanups.is_empty() && self.regions.is_empty() && self.handled.is_empty() && self.in_comprehension == 0 {
+                        t.site = Some((c.range().start().into(), c.range().end().into()));
+                    }
+                }
                 let want = self.ret.clone();
                 let v = match &r.value {
                     Some(e) => self.expr_hint(e, Some(&want)),
@@ -3178,6 +3245,7 @@ impl<'a> Lower<'a> {
             None => {
                 let direct = if kwnames.is_empty() { self.direct_call(&fv.ty, &pos_tys) } else { None };
                 let func = self.obj(&fv);
+                self.tail_call(c, func, &args, direct.as_ref());
                 self.emit(Instr::Call { dst, func, args, kwnames, direct });
             }
         }
@@ -3187,6 +3255,45 @@ impl<'a> Lower<'a> {
             self.check(&v, what, origin);
         }
         self.unbox_f32(v)
+    }
+
+    /// Before the call `c` of `func`: if it is this function's own tail
+    /// call (every argument proven), and `func` is still this function at
+    /// runtime, its arguments become the variables and the body starts
+    /// over; else the call goes on.
+    fn tail_call(&mut self, c: &ast::ExprCall, func: Reg, args: &[Reg], direct: Option<&Direct>) {
+        let range: (u32, u32) = (c.range().start().into(), c.range().end().into());
+        let Some(t) = self.tail.as_mut().filter(|t| t.site == Some(range)) else { return };
+        t.site = None;
+        let own = matches!(&*c.func, Expr::Name(n) if n.id.as_str() == t.name);
+        let proven = (1u64 << args.len()).wrapping_sub(1);
+        if !own || self.locals.contains_key(&t.name) || args.len() != t.vars.len() || !direct.is_some_and(|d| d.key == t.key && d.skip & proven == proven) {
+            return;
+        }
+        let (vars, depth) = (t.vars.clone(), t.depth);
+        let check = self.emit(Instr::JumpIfNotSelf { func, depth, target: u32::MAX });
+        // A variable passed on is saved first if an earlier one of the
+        // moves below writes it (`Move`s become `Take`s where the source
+        // dies).
+        let mut srcs = Vec::new();
+        for (i, &a) in args.iter().enumerate() {
+            if vars[..i].iter().zip(args).any(|(&v, &b)| v == a && b != v) {
+                let tmp = self.reg(Repr::Obj);
+                self.emit(Instr::Move { dst: tmp, src: a });
+                srcs.push(tmp);
+            } else {
+                srcs.push(a);
+            }
+        }
+        for (i, src) in srcs.into_iter().enumerate() {
+            if src != vars[i] {
+                self.emit(Instr::Move { dst: vars[i], src });
+            }
+        }
+        let j = self.emit(Instr::Jump { target: u32::MAX });
+        self.tail.as_mut().unwrap().jumps.push(j);
+        let at = self.here();
+        self.patch(check, at);
     }
 
     fn reveal(&mut self, t: &Ty, off: u32) {
@@ -3814,7 +3921,8 @@ impl<'a> Lower<'a> {
         let dst = self.reg(Repr::Obj);
         let pc = self.emit(Instr::BinOp { dst, op: bop, a, b: bb, inplace });
         match (&lt, &rt) {
-            (Ty::Float, Ty::Float) => self.hints.push((pc, crate::ir::HINT_FLOAT)),
+            // (An int with a float: float arithmetic, the int converted.)
+            (Ty::Float, Ty::Float | Ty::Int) | (Ty::Int, Ty::Float) => self.hints.push((pc, crate::ir::HINT_FLOAT)),
             (Ty::Int, Ty::Int) => self.hints.push((pc, crate::ir::HINT_INT)),
             _ => {}
         }
@@ -4501,6 +4609,28 @@ fn contains_yield(body: &[Stmt]) -> bool {
     let mut f = Finder(false);
     body.iter().for_each(|s| f.visit_stmt(s));
     f.0
+}
+
+/// Whether `body` has a `return name(...)`.
+fn has_self_tail_call(body: &[Stmt], name: &str) -> bool {
+    struct Finder<'n>(&'n str, bool);
+    impl<'a> Visitor<'a> for Finder<'_> {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            match s {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                Stmt::Return(r) => {
+                    if let Some(Expr::Call(c)) = r.value.as_deref() {
+                        self.1 |= matches!(&*c.func, Expr::Name(n) if n.id.as_str() == self.0);
+                    }
+                }
+                s => walk_stmt(self, s),
+            }
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let mut f = Finder(name, false);
+    body.iter().for_each(|s| f.visit_stmt(s));
+    f.1
 }
 
 fn is_builtin_call(c: &ast::ExprCall, name: &str) -> bool {

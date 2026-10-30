@@ -1138,6 +1138,28 @@ pub(crate) enum Called<'py> {
 /// interpreted Lizzard function (or the `__init__` of a class being
 /// constructed) comes back as a frame set up on it, to run in the same loop.
 #[inline(always)]
+/// The `d`th self tail call of a frame: RecursionError where CPython's
+/// frames would reach the recursion limit.
+pub(crate) fn tail_depth(d: i64) -> PyResult<()> {
+    if d as usize >= recursion_limit() {
+        return Err(pyo3::exceptions::PyRecursionError::new_err("maximum recursion depth exceeded"));
+    }
+    Ok(())
+}
+
+/// Whether `o` is a function running `f` with `globals` and `closure`:
+/// calling it is running this code again.
+pub(crate) fn is_self(o: *mut ffi::PyObject, f: &FuncRt, globals: &Bound<'_, PyDict>, closure: &[Py<PyAny>]) -> bool {
+    // SAFETY: a type pointer comparison on a valid object.
+    if unsafe { ffi::Py_TYPE(o) } != lizzard_function_type() {
+        return false;
+    }
+    // SAFETY: the type says what it is.
+    let lf = unsafe { Bound::from_borrowed_ptr(globals.py(), o).cast_into_unchecked::<LizzardFunction>() };
+    let lf = lf.get();
+    std::ptr::eq(&*lf.rt, f) && lf.globals.is(globals) && lf.closure.len() == closure.len() && lf.closure.iter().zip(closure).all(|(a, b)| a.is(b))
+}
+
 pub(crate) fn call_or_frame<'py>(py: Python<'py>, f: &FuncRt, pc: usize, regs: &Regs, mut stack: Option<&mut Vec<u64>>) -> PyResult<Called<'py>> {
     let (callee, slf, args, nkw, direct) = match &f.ir.code[pc] {
         Instr::Call { func, args, kwnames, direct, .. } => (regs.obj(py, *func)?.clone(), None, args, kwnames.len(), direct),
@@ -1652,6 +1674,15 @@ pub(crate) fn step<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict
         }
         Instr::JumpIfTrue { cond, target } => {
             if regs.bool(*cond) {
+                next = *target as usize;
+            }
+        }
+        Instr::JumpIfNotSelf { func, depth, target } => {
+            if is_self(obj!(py, regs, *func).as_ptr(), f, globals, closure) {
+                let d = regs.i64(*depth) + 1;
+                tail_depth(d)?;
+                regs.set_i64(*depth, d);
+            } else {
                 next = *target as usize;
             }
         }

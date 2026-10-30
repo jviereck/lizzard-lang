@@ -171,6 +171,11 @@ pub enum Instr {
     Jump { target: u32 },
     JumpIfFalse { cond: Reg, target: u32 },
     JumpIfTrue { cond: Reg, target: u32 },
+    /// Continue unless `func` is the function this frame runs (its code,
+    /// globals and closure): a self tail call becomes a loop. It counts
+    /// the calls in `depth` (`I64`), and raises RecursionError where
+    /// CPython's frames would pass the recursion limit.
+    JumpIfNotSelf { func: Reg, depth: Reg, target: u32 },
     /// `raise exc` (a class is instantiated), or `raise exc from cause`.
     Raise { exc: Reg, cause: Option<Reg> },
     /// Suspend the generator, producing `src`; it resumes at the next
@@ -290,7 +295,8 @@ pub struct FuncIr {
     pub hints: Vec<u8>,
 }
 
-/// Both operands are statically `float` (at runtime: a float or an int).
+/// Both operands are statically `float`, or one is an `int` (at runtime: a
+/// float or an int each; the result a float unless both are ints).
 pub const HINT_FLOAT: u8 = 1;
 /// Both operands are statically `int`.
 pub const HINT_INT: u8 = 2;
@@ -343,6 +349,7 @@ impl Instr {
             }
             BuildString { parts, .. } => v.extend(parts),
             JumpIfFalse { cond, .. } | JumpIfTrue { cond, .. } => v.push(*cond),
+            JumpIfNotSelf { func, depth, .. } => v.extend([*func, *depth]),
             Raise { exc, cause } => {
                 v.push(*exc);
                 v.extend(cause);
@@ -363,6 +370,7 @@ impl Instr {
         match self {
             Const { dst, .. } | LoadGlobal { dst, .. } | MakeCell { dst } | LoadCell { dst, .. } | LoadFree { dst, .. } | LoadFreeCell { dst, .. } | MakeFunction { dst, .. } | Move { dst, .. } | LoadAttr { dst, .. } | Call { dst, .. } | CallMethod { dst, .. } | CallEx { dst, .. } | ListToTuple { dst, .. } | BinOp { dst, .. } | Neg { dst, .. } | Invert { dst, .. } | Pos { dst, .. } | Compare { dst, .. } | CompareBool { dst, .. } | GetItem { dst, .. } | BuildList { dst, .. } | BuildTuple { dst, .. } | BuildDict { dst, .. } | BuildSet { dst, .. } | BuildSlice { dst, .. } | GetIter { dst, .. } | ForIter { dst, .. } | Format { dst, .. } | BuildString { dst, .. } | Truthy { dst, .. } | Not { dst, .. } | Yield { dst, .. } | YieldFrom { dst, .. } | ExcMatch { dst, .. } | GetHandled { dst } | TypeOf { dst, .. } | LoadSpecial { dst, .. } | I64Const { dst, .. } | I64Lt { dst, .. } | I64Add { dst, .. } | Len { dst, .. } | Box { dst, .. } | Unbox { dst, .. } | ArrLoadF32 { dst, .. } | F32Bin { dst, .. } => vec![*dst],
             Take { dst, src } => vec![*dst, *src],
+            JumpIfNotSelf { depth, .. } => vec![*depth],
             Unbind { reg } => vec![*reg],
             Unpack { dsts, .. } => dsts.clone(),
             _ => Vec::new(),
@@ -375,7 +383,7 @@ impl Instr {
         use Instr::*;
         match self {
             Jump { target } => vec![*target],
-            JumpIfFalse { target, .. } | JumpIfTrue { target, .. } | ForIter { target, .. } => vec![pc + 1, *target],
+            JumpIfFalse { target, .. } | JumpIfTrue { target, .. } | ForIter { target, .. } | JumpIfNotSelf { target, .. } => vec![pc + 1, *target],
             Return { .. } | Raise { .. } | Reraise { .. } => Vec::new(),
             _ => vec![pc + 1],
         }

@@ -52,7 +52,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Module};
-use lizzard_py_front::ir::{BinOp, CmpOp, FuncIr, Instr, Reg, Repr, HINT_FLOAT, HINT_INT};
+use lizzard_py_front::ir::{BinOp, CmpOp, FuncIr, Instr, Reg, Repr, RtCheck, HINT_FLOAT, HINT_INT};
 
 /// The helper executed the instruction; continue with the next one.
 pub const NEXT: u32 = 0;
@@ -205,6 +205,9 @@ pub struct Helpers {
     pub enter_recursive: usize,
     pub leave_recursive: usize,
     pub recursion_msg: usize,
+    /// `tail_depth(d) -> status`: a frame's `d`th self tail call; `ERROR`
+    /// (RecursionError) at the recursion limit.
+    pub tail_depth: usize,
     /// `resume(ctx, frame, desc, pc) -> object`: a directly called
     /// function's code bailed out at `pc`: the interpreter finishes it, as
     /// `finish`.
@@ -261,6 +264,9 @@ pub enum Spec<'a> {
     /// `LoadGlobal`: `value` while the epoch is `epoch`.
     Global { epoch: u64, value: usize },
     Check(Quick),
+    /// `JumpIfNotSelf` of a function object (`func`) that runs this code:
+    /// a self tail call loops when it is still that object.
+    SelfFunc(usize),
     Call(CallSpec<'a>),
 }
 
@@ -390,7 +396,14 @@ fn kinds(u: &Unit, params: &[Kind]) -> Vec<Vec<Kind>> {
         return at;
     }
     for (r, k) in at[0].iter_mut().enumerate() {
-        *k = if r < ir.params.len() { params.get(r).copied().unwrap_or(Kind::Obj) } else { Kind::Unbound };
+        // Without what a caller knows: what the parameter is declared
+        // (speculatively; copies of it are unboxed or bail out).
+        let declared = || match ir.checks.get(ir.params[r].check as usize).map(|c| &c.check) {
+            Some(RtCheck::Int) => Kind::I,
+            Some(RtCheck::Float) => Kind::F,
+            _ => Kind::Obj,
+        };
+        *k = if r < ir.params.len() { params.get(r).copied().unwrap_or_else(declared) } else { Kind::Unbound };
     }
     let handler_of = |pc: u32| -> Vec<usize> { ir.handlers.iter().filter(|h| h.ranges.iter().any(|(s, e)| *s <= pc && pc < *e)).map(|h| h.target as usize).filter(|&t| t < n).collect() };
     let mut reached = vec![false; n];
@@ -1813,7 +1826,7 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(other);
         let raised = self.b.create_block();
         match i {
-            Instr::ForIter { target, .. } => {
+            Instr::ForIter { target, .. } | Instr::JumpIfNotSelf { target, .. } => {
                 let taken = self.b.create_block();
                 let is_taken = self.b.ins().icmp_imm_u(IntCC::Equal, st, TAKEN as i64);
                 self.b.ins().brif(is_taken, taken, &[], raised, &[]);
@@ -2069,6 +2082,10 @@ impl<'a> Lower<'a> {
                 self.generic(pc);
                 self.next(pc);
             }
+            Instr::JumpIfNotSelf { func, depth, target } => match self.f.u.specs[pc] {
+                Spec::SelfFunc(f) if self.f.inline.is_none() && self.f.vars[*depth as usize].is_some() => self.jump_if_not_self(pc, *func, *depth, *target, f),
+                _ => self.step(pc),
+            },
             Instr::ForIter { dst, iter, target } if self.l.list_iter.is_some() && self.repr(*dst) == Repr::Obj => self.for_iter_list(pc, *dst, *iter, *target),
             Instr::ForIter { .. } => self.generic(pc),
             _ => self.step(pc),
@@ -2830,6 +2847,36 @@ impl<'a> Lower<'a> {
         self.b.set_cold_block(slow);
         self.b.switch_to_block(slow);
         self.generic(pc);
+        self.f.done = true;
+    }
+
+    /// A self tail call's test: the function object that runs this code
+    /// (`f`) loops, another one is called.
+    fn jump_if_not_self(&mut self, pc: usize, func: Reg, depth: Reg, target: u32, f: usize) {
+        let start = self.f.vals.clone();
+        let slow = self.b.create_block();
+        let p = self.obj(func, pc, slow);
+        let (yes, no) = (self.b.create_block(), self.b.create_block());
+        let c = self.b.ins().icmp_imm_s(IntCC::Equal, p, f as i64);
+        self.b.ins().brif(c, yes, &[], no, &[]);
+        let after = self.f.vals.clone();
+        self.b.switch_to_block(no);
+        self.goto(pc, target);
+        self.f.vals = after;
+        self.b.switch_to_block(yes);
+        // Counted, as CPython's frames would be.
+        let var = self.f.vars[depth as usize].unwrap();
+        let d = self.b.use_var(var);
+        let d = self.b.ins().iadd_imm_s(d, 1);
+        let st = self.call(self.h.tail_depth, &[d], Some(types::I32)).unwrap();
+        self.b.def_var(var, d);
+        self.check_status(st, pc);
+        self.goto(pc, pc as u32 + 1);
+        // Unbound: `step` raises.
+        self.f.vals = start;
+        self.b.set_cold_block(slow);
+        self.b.switch_to_block(slow);
+        self.step(pc);
         self.f.done = true;
     }
 

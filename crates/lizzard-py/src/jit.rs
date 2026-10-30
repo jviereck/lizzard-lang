@@ -248,6 +248,7 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         enter_recursive: a(ffi::Py_EnterRecursiveCall as *const ()),
         leave_recursive: a(ffi::Py_LeaveRecursiveCall as *const ()),
         recursion_msg: c" while calling a Lizzard function".as_ptr() as usize,
+        tail_depth: a(lz_tail_depth as *const ()),
         resume: a(lz_resume as *const ()),
         take_exit: a(lz_take_exit as *const ()),
         unwind: a(lz_unwind as *const ()),
@@ -513,6 +514,17 @@ fn specs<'a>(py: Python<'_>, f: &'a FuncRt, deps: &mut Vec<Box<CallDesc>>, depth
                 None => Spec::None,
             },
             Instr::Check { check, .. } => Spec::Check(quick(py, f.ck(py, *check))),
+            // The global still this function: compiled code loops.
+            Instr::JumpIfNotSelf { func, .. } => match global_of.get(func) {
+                // SAFETY: a valid object (the global's).
+                Some(&callee) if unsafe { ffi::Py_TYPE(callee as *mut ffi::PyObject) } == lizzard_function_type() => {
+                    // SAFETY: the type says what it is.
+                    let lf = unsafe { Bound::from_borrowed_ptr(py, callee as *mut ffi::PyObject).cast_into_unchecked::<LizzardFunction>() };
+                    let lf = lf.get();
+                    if std::ptr::eq(&*lf.rt, f) && lf.closure.is_empty() { Spec::SelfFunc(callee) } else { Spec::None }
+                }
+                _ => Spec::None,
+            },
             Instr::Call { func, args, kwnames, direct, .. } if kwnames.is_empty() => match global_of.get(func) {
                 // SAFETY: a valid object (the global's).
                 Some(&callee) if unsafe { ffi::Py_TYPE(callee as *mut ffi::PyObject) } == &raw mut ffi::PyType_Type => match ctor_spec(&f.ctics[pc]) {
@@ -703,6 +715,18 @@ extern "C" fn lz_step(ctx_: *mut c_void, _slots: *mut u64, pc: u32) -> u32 {
         }
         Err(_) => {
             PanicException::new_err("panic in a Lizzard instruction").restore(py);
+            ERROR
+        }
+    }
+}
+
+/// A frame's `d`th self tail call (`interp::tail_depth`).
+extern "C" fn lz_tail_depth(d: i64) -> u32 {
+    match crate::interp::tail_depth(d) {
+        Ok(()) => NEXT,
+        Err(e) => {
+            // SAFETY: compiled code runs attached.
+            e.restore(unsafe { Python::assume_attached() });
             ERROR
         }
     }

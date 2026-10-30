@@ -89,7 +89,7 @@ pub fn lower(ir: &FuncIr) -> Vec<Op> {
     let valid = |i: &Instr| {
         i.reads().iter().chain(i.writes().iter()).all(|&r| (r as usize) < nregs)
             && match i {
-                Instr::Jump { target } | Instr::JumpIfFalse { target, .. } | Instr::JumpIfTrue { target, .. } | Instr::ForIter { target, .. } => (*target as usize) < n,
+                Instr::Jump { target } | Instr::JumpIfFalse { target, .. } | Instr::JumpIfTrue { target, .. } | Instr::ForIter { target, .. } | Instr::JumpIfNotSelf { target, .. } => (*target as usize) < n,
                 _ => true,
             }
             && match i {
