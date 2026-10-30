@@ -631,6 +631,9 @@ fn label_pcs(ir: &FuncIr, list_iter: bool) -> Vec<bool> {
     is_label
 }
 
+/// Where the `dirty` flag is, in the fuel's stack slot (`Lower::fuel`).
+const DIRTY: i32 = 8;
+
 /// Loop iterations between safepoints.
 const FUEL: i64 = 1024;
 
@@ -836,6 +839,9 @@ struct Fn<'a> {
     /// The object registers whose slots its code may have written (a
     /// return releases them).
     written: std::collections::BTreeSet<Reg>,
+    /// Those written only in cold blocks (slow paths), which set the
+    /// function's `dirty` flag: a return releases them only when it is set.
+    cold_written: std::collections::BTreeSet<Reg>,
     /// How deeply it is inlined (0: the function compiled).
     depth: u32,
     /// Emitting a path that leaves an inlined function's code (to the
@@ -860,8 +866,10 @@ struct Inlined {
     /// slot holds the argument's reference (a candidate for `Reuse`).
     donors: Vec<bool>,
     /// The arguments: the parameters' slots get them only where the frame
-    /// is handed over (`prepare_frame`).
-    args: Vec<Value>,
+    /// is handed over (`prepare_frame`). None: a number the caller had
+    /// unboxed (a *lazy* parameter): its slot is null until something needs
+    /// the object, and then owns it.
+    args: Vec<Option<Value>>,
     /// The immortal constant every `return` so far returned (None: none
     /// yet; Some(None): not all the same one).
     ret_const: Option<Option<usize>>,
@@ -888,8 +896,13 @@ struct Lower<'a> {
     pcp: Value,
     /// The thread's id (free-threaded reference counting).
     tid: Value,
-    /// Loop iterations left until the next safepoint.
+    /// Loop iterations left until the next safepoint; at `DIRTY`, set
+    /// (non-zero) when a cold block stores to a slot (`cold_written`).
+    /// Frames start with their slots null, or are released by their owner
+    /// (the interpreter's): unset, those slots need no release.
     fuel: StackSlot,
+    /// Emitting a slow path (all of it, whatever blocks it makes).
+    slow: bool,
     /// Where direct calls build the callee's frame.
     frame: Option<StackSlot>,
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
@@ -920,7 +933,7 @@ impl<'a> Lower<'a> {
         let ret_block = b.create_block();
         b.append_block_param(ret_block, ptr);
         b.append_block_param(ret_block, types::I32);
-        let fuel = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let fuel = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
         let vars = ir.reprs.iter().map(|r| matches!(r, Repr::I64 | Repr::Bool).then(|| b.declare_var(types::I64))).collect();
         let tid = match l.rc {
             Rc::Ft { .. } => b.ins().load(ptr, MF, ps[0], CTX_TID),
@@ -931,7 +944,7 @@ impl<'a> Lower<'a> {
         let frame = max_frame.map(|n| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3)));
         let mut lw = Lower {
             b,
-            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default(), depth: 0, cold: false },
+            f: Fn { u, ir, labels, catch_blocks, regs: ps[1], vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: None, seed, written: Default::default(), cold_written: Default::default(), depth: 0, cold: false },
             h,
             l,
             ptr,
@@ -945,6 +958,7 @@ impl<'a> Lower<'a> {
             pcp: ps[2],
             tid,
             fuel,
+            slow: false,
             frame,
             frontend: module.target_config(),
         };
@@ -964,6 +978,8 @@ impl<'a> Lower<'a> {
         }
         let fuel0 = self.b.ins().iconst(types::I64, FUEL);
         self.b.ins().stack_store(self.ptr, fuel0, self.fuel, 0);
+        let z = self.b.ins().iconst(types::I64, 0);
+        self.b.ins().stack_store(self.ptr, z, self.fuel, DIRTY);
         let pc = self.b.ins().load(types::I32, MF, self.pcp, 0);
         let resume = self.b.create_block();
         let throw = self.b.create_block();
@@ -1061,6 +1077,9 @@ impl<'a> Lower<'a> {
             self.b.ins().store(MF, zero, self.f.regs, r as i32 * 8);
             self.xdecref(v);
         }
+        let cold: Vec<Reg> = self.f.cold_written.iter().copied().filter(|r| !self.f.written.contains(r) && !self.is_param(*r)).collect();
+        let regs = self.f.regs;
+        self.release_if_dirty(&cold, regs, true);
         self.b.ins().store(MF, p, self.ctx, CTX_RET);
         self.b.ins().jump(self.exit, &[BlockArg::Value(pc)]);
         for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL)] {
@@ -1152,9 +1171,44 @@ impl<'a> Lower<'a> {
 
     fn slot_store(&mut self, v: Value, r: Reg) {
         if self.f.ir.reprs[r as usize] == Repr::Obj && !self.f.cold {
-            self.f.written.insert(r);
+            self.note_write(r);
         }
         self.b.ins().store(MF, v, self.f.regs, r as i32 * 8);
+    }
+
+    /// Object register `r`'s slot is written here: in a cold block, it
+    /// sets the `dirty` flag.
+    fn note_write(&mut self, r: Reg) {
+        let cold = self.slow || self.b.current_block().is_some_and(|b| self.b.func.layout.is_cold(b));
+        if !cold {
+            self.f.written.insert(r);
+            return;
+        }
+        self.f.cold_written.insert(r);
+        let one = self.b.ins().iconst(types::I64, 1);
+        self.b.ins().stack_store(self.ptr, one, self.fuel, DIRTY);
+    }
+
+    /// Release the slots of `regs` (null or owned), when `dirty` is set.
+    fn release_if_dirty(&mut self, regs: &[Reg], frame: Value, zero: bool) {
+        if regs.is_empty() {
+            return;
+        }
+        let (yes, done) = (self.b.create_block(), self.b.create_block());
+        let d = self.b.ins().stack_load(self.ptr, types::I64, self.fuel, DIRTY);
+        self.b.ins().brif(d, yes, &[], done, &[]);
+        self.b.set_cold_block(yes);
+        self.b.switch_to_block(yes);
+        let z = self.b.ins().iconst(types::I64, 0);
+        for &r in regs {
+            let v = self.b.ins().load(types::I64, MF, frame, r as i32 * 8);
+            if zero {
+                self.b.ins().store(MF, z, frame, r as i32 * 8);
+            }
+            self.xdecref(v);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
     fn repr(&self, r: Reg) -> Repr {
@@ -1163,6 +1217,11 @@ impl<'a> Lower<'a> {
 
     fn is_param(&self, r: Reg) -> bool {
         r < self.f.nparams && self.f.u.borrow_params
+    }
+
+    /// An inlined function's parameter passed unboxed (`Inlined::args`).
+    fn lazy_param(&self, r: Reg) -> bool {
+        self.f.inline.as_ref().is_some_and(|i| i.args.get(r as usize).is_some_and(Option::is_none))
     }
 
     fn live_at(&self, pc: usize, r: Reg) -> bool {
@@ -1519,7 +1578,7 @@ impl<'a> Lower<'a> {
         for r in self.f.ir.code[pc].writes() {
             self.f.vals.remove(&r);
             if self.f.ir.reprs[r as usize] == Repr::Obj {
-                self.f.written.insert(r);
+                self.note_write(r);
             }
             if let Some(v) = self.f.vars[r as usize] {
                 let x = self.slot_load(r);
@@ -1546,7 +1605,7 @@ impl<'a> Lower<'a> {
     /// materialized): its innermost handler, else leave the function.
     fn raise(&mut self, p: usize) {
         if self.f.inline.is_some() {
-            self.prepare_frame();
+            self.prepare_frame(None);
             let fail = self.f.inline.as_ref().unwrap().fail;
             let pc = self.pc_val(p);
             self.b.ins().jump(fail, &[BlockArg::Value(pc)]);
@@ -1616,7 +1675,8 @@ impl<'a> Lower<'a> {
         regs.sort_unstable();
         let mut live = Vec::new();
         for r in regs {
-            if !self.f.vals[&r].in_slot && self.live_at(t, r) {
+            // (An inlined function's parameters are known at every label.)
+            if !self.f.vals[&r].in_slot && self.live_at(t, r) && !self.lazy_param(r) {
                 live.push(r);
             }
         }
@@ -1635,7 +1695,32 @@ impl<'a> Lower<'a> {
             self.b.set_cold_block(check);
             self.b.ins().brif(fuel, blk, &args, check, &[]);
             self.b.switch_to_block(check);
+            // The loop's values cross the call in memory, so that the loop
+            // itself needs no registers that survive calls for them.
+            let vars: Vec<(Reg, Variable)> = (0..self.f.vars.len()).filter_map(|r| self.f.vars[r].filter(|_| self.live_at(t, r as Reg)).map(|v| (r as Reg, v))).collect();
+            let n = (carried.len() + vars.len()) as u32;
+            let save = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, n.max(1) * 8, 3));
+            for (i, (_, _, v)) in carried.iter().enumerate() {
+                self.b.ins().stack_store(self.ptr, *v, save, i as i32 * 8);
+            }
+            for (i, (_, var)) in vars.iter().enumerate() {
+                let x = self.b.use_var(*var);
+                self.b.ins().stack_store(self.ptr, x, save, (carried.len() + i) as i32 * 8);
+            }
             let call = self.call(self.h.safepoint, &[self.ctx], Some(types::I32)).unwrap();
+            let carried: Vec<(Reg, Kind, Value)> = carried
+                .iter()
+                .enumerate()
+                .map(|(i, &(r, k, v))| {
+                    let ty = self.b.func.dfg.value_type(v);
+                    (r, k, self.b.ins().stack_load(self.ptr, ty, save, i as i32 * 8))
+                })
+                .collect();
+            for (i, (_, var)) in vars.iter().enumerate() {
+                let x = self.b.ins().stack_load(self.ptr, types::I64, save, (carried.len() + i) as i32 * 8);
+                self.b.def_var(*var, x);
+            }
+            let args: Vec<BlockArg> = carried.iter().map(|&(_, _, v)| BlockArg::Value(v)).collect();
             let refuel = self.b.ins().iconst(types::I64, FUEL);
             self.b.ins().stack_store(self.ptr, refuel, self.fuel, 0);
             let failed = self.b.create_block();
@@ -1647,7 +1732,9 @@ impl<'a> Lower<'a> {
                 let num = if k == Kind::F { Unboxed::F64(v) } else { Unboxed::I64(v) };
                 self.f.vals.insert(r, Virt { ptr: None, in_slot: false, num, ty: None, konst: false, checked: false, global: false });
             }
+            let was = std::mem::replace(&mut self.slow, true);
             self.flush(from);
+            self.slow = was;
             self.f.vals.clear();
             self.raise(from);
         }
@@ -1867,16 +1954,22 @@ impl<'a> Lower<'a> {
     /// with its result. Code emitted after this is unreachable.
     fn deopt(&mut self, pc: usize) {
         let cold = std::mem::replace(&mut self.f.cold, true);
-        self.prepare_frame();
+        self.prepare_frame(Some(pc));
         self.flush(pc);
         self.f.cold = cold;
         let inl = self.f.inline.as_ref().unwrap();
         let (frame, desc, exit, call_pc) = (inl.frame, inl.desc, inl.exit, inl.call_pc);
         let raised = inl.raised;
+        // The lazy parameters' objects: `finish` takes its own references
+        // and releases the frame.
+        let lazy: Vec<Value> = (0..inl.args.len() as Reg).filter(|&r| self.lazy_param(r)).collect::<Vec<_>>().into_iter().map(|r| self.slot_load(r)).collect();
         let fp = self.b.ins().stack_addr(self.ptr, frame, 0);
         let d = self.b.ins().iconst(self.ptr, desc as i64);
         let pcv = self.pc_val(pc);
         let r = self.call(self.h.finish, &[self.ctx, fp, d, pcv], Some(self.ptr)).unwrap();
+        for p in lazy {
+            self.decref(p);
+        }
         let z = self.b.ins().iconst(types::I64, 0);
         self.b.ins().brif(r, exit, &[BlockArg::Value(r), BlockArg::Value(z)], raised, &[]);
         let _ = call_pc;
@@ -1887,18 +1980,45 @@ impl<'a> Lower<'a> {
     /// interpreter, or released after an exception): its parameters in their
     /// slots, and the object slots its code has not written so far null
     /// (instructions run in pc order: nothing emitted later ran yet).
-    fn prepare_frame(&mut self) {
+    /// For the interpreter (`at`: it continues there), the lazy parameters
+    /// are boxed into their slots (a failure raises at `at`); else (an
+    /// exception) they are left as they are.
+    fn prepare_frame(&mut self, at: Option<usize>) {
         let inl = self.f.inline.as_ref().unwrap();
         let regs = self.f.regs;
         let args = inl.args.clone();
         for (i, p) in args.iter().enumerate() {
-            self.b.ins().store(MF, *p, regs, i as i32 * 8);
+            if let Some(p) = p {
+                self.b.ins().store(MF, *p, regs, i as i32 * 8);
+            }
         }
         let z = self.b.ins().iconst(types::I64, 0);
         for r in args.len()..self.f.ir.reprs.len() {
-            if self.f.ir.reprs[r] == Repr::Obj && !self.f.written.contains(&(r as Reg)) {
+            if self.f.ir.reprs[r] == Repr::Obj && !self.f.written.contains(&(r as Reg)) && !self.f.cold_written.contains(&(r as Reg)) {
                 self.b.ins().store(MF, z, regs, r as i32 * 8);
             }
+        }
+        let Some(pc) = at else { return };
+        let lazy: Vec<Reg> = (0..args.len() as Reg).filter(|&r| args[r as usize].is_none() && self.f.vals.get(&r).is_some_and(|v| !v.in_slot)).collect();
+        for r in lazy {
+            let v = self.f.vals[&r];
+            let p = match v.num {
+                Unboxed::I64(x) => self.new_int(x),
+                Unboxed::F64(x) => self.call(self.h.float_new, &[x], Some(self.ptr)).unwrap(),
+                Unboxed::None => v.ptr.expect("a lazy parameter's value"),
+            };
+            if v.ptr.is_some() {
+                self.incref(p);
+            }
+            let (ok, failed) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(p, ok, &[], failed, &[]);
+            self.b.switch_to_block(failed);
+            let fail = self.f.inline.as_ref().unwrap().fail;
+            let pcv = self.pc_val(pc);
+            self.b.ins().jump(fail, &[BlockArg::Value(pcv)]);
+            self.b.switch_to_block(ok);
+            self.put(r, p);
+            self.f.vals.insert(r, Virt { ptr: Some(p), in_slot: true, konst: false, ..v });
         }
     }
 
@@ -1910,11 +2030,13 @@ impl<'a> Lower<'a> {
         let done = self.f.done;
         self.b.set_cold_block(blk);
         self.b.switch_to_block(blk);
+        let was = std::mem::replace(&mut self.slow, true);
         if self.f.inline.is_some() {
             self.deopt(pc);
         } else {
             self.bail_to(pc);
         }
+        self.slow = was;
         self.f.vals = fast;
         self.f.done = done;
     }
@@ -1944,12 +2066,14 @@ impl<'a> Lower<'a> {
         let done = self.f.done;
         self.b.set_cold_block(slow);
         self.b.switch_to_block(slow);
+        let was = std::mem::replace(&mut self.slow, true);
         if self.f.inline.is_some() {
             self.deopt(pc);
         } else {
             self.generic(pc);
             then(self);
         }
+        self.slow = was;
         self.f.vals = start;
         for r in self.f.ir.code[pc].writes() {
             self.f.vals.remove(&r);
@@ -2846,7 +2970,9 @@ impl<'a> Lower<'a> {
         self.f.vals = start;
         self.b.set_cold_block(slow);
         self.b.switch_to_block(slow);
+        let was = std::mem::replace(&mut self.slow, true);
         self.generic(pc);
+        self.slow = was;
         self.f.done = true;
     }
 
@@ -2876,7 +3002,9 @@ impl<'a> Lower<'a> {
         self.f.vals = start;
         self.b.set_cold_block(slow);
         self.b.switch_to_block(slow);
+        let was = std::mem::replace(&mut self.slow, true);
         self.step(pc);
+        self.slow = was;
         self.f.done = true;
     }
 
@@ -3012,11 +3140,24 @@ impl<'a> Lower<'a> {
         }
         let mut all: Vec<Reg> = obj.into_iter().collect();
         all.extend(args);
+        // Compiled in here: numbers the code has unboxed stay so (boxed
+        // only if the callee's code needs their objects).
+        let inline = spec.inline.as_deref().filter(|c| !spec.native && (self.f.depth == 0 || (self.f.depth == 1 && c.ir.code.len() <= INLINE_MAX_NESTED)) && inlinable(c));
+        let skip = matches!(spec.guard, CallGuard::Ctor { .. }) as usize;
+        let lazy: Vec<bool> = all
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| {
+                let q = spec.checks.get(i + skip).copied().unwrap_or(Quick::Slow);
+                let v = self.f.vals.get(&r).copied();
+                inline.is_some() && v.is_some_and(|v| v.ptr.is_none() && !matches!(v.num, Unboxed::None)) && self.known_pass(v, q)
+            })
+            .collect();
         // The arguments must stay alive during the call: in their slots or
         // kept by the code.
-        for &r in &all {
+        for (i, &r) in all.iter().enumerate() {
             if let Some(v) = self.f.vals.get(&r).copied() {
-                if !v.in_slot && !v.konst {
+                if !v.in_slot && !v.konst && !lazy[i] {
                     self.materialize(r, pc);
                 }
             }
@@ -3056,10 +3197,15 @@ impl<'a> Lower<'a> {
             _ => unreachable!("a call spec for another instruction"),
         }
         let mut ptrs = Vec::new();
+        let mut lazy_ptrs = Vec::new();
         // A constructor's `__init__` has the instance first.
-        let skip = ctor.is_some() as usize;
         for (i, &r) in all.iter().enumerate() {
+            if lazy[i] {
+                lazy_ptrs.push(None);
+                continue;
+            }
             let p = self.obj(r, pc, slow);
+            lazy_ptrs.push(Some(p));
             let q = spec.checks.get(i + skip).copied().unwrap_or(Quick::Slow);
             if !self.known_pass(self.f.vals.get(&r).copied(), q) {
                 self.quick(p, q, slow);
@@ -3096,6 +3242,7 @@ impl<'a> Lower<'a> {
         });
         if let Some(o) = inst {
             ptrs.insert(0, o);
+            lazy_ptrs.insert(0, Some(o));
         }
         let r = match spec.inline.as_deref() {
             _ if spec.native => {
@@ -3110,7 +3257,8 @@ impl<'a> Lower<'a> {
                 self.call(self.h.vectorcall, &[callable, fp, n, none], Some(self.ptr)).unwrap()
             }
             // Not within an inlined function: one level.
-            Some(callee) if (self.f.depth == 0 || (self.f.depth == 1 && callee.ir.code.len() <= INLINE_MAX_NESTED)) && inlinable(callee) => {
+            _ if inline.is_some() => {
+                let callee = inline.unwrap();
                 // Its first parameter's type is verified: the receiver's,
                 // or the class of the instance just allocated.
                 let first = receiver.or(ctor.map(|(tp, _)| tp));
@@ -3121,7 +3269,7 @@ impl<'a> Lower<'a> {
                     known.insert(0, None);
                     donors.insert(0, false);
                 }
-                let (r, int) = self.inline_call(pc, &ptrs, &known, &donors, callee, spec.desc, first);
+                let (r, int) = self.inline_call(pc, &lazy_ptrs, &known, &donors, callee, spec.desc, first);
                 if let Some(x) = int {
                     return self.int_result(pc, dst, r, x, slow, start);
                 }
@@ -3200,7 +3348,7 @@ impl<'a> Lower<'a> {
     /// in a stack slot: its result (a new reference), at the end of its
     /// code. An exception leaving it raises at the call (`pc`).
     #[allow(clippy::too_many_arguments)]
-    fn inline_call(&mut self, pc: usize, args: &[Value], known: &[Option<Virt>], donors: &[bool], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> (Value, Option<Value>) {
+    fn inline_call(&mut self, pc: usize, args: &[Option<Value>], known: &[Option<Virt>], donors: &[bool], callee: &'a Unit<'a>, desc: usize, first: Option<usize>) -> (Value, Option<Value>) {
         let ir = callee.ir;
         let nregs = ir.reprs.len();
         // The frame: initialized where it is used (`init` below,
@@ -3256,7 +3404,8 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, &p)| {
                 let k = known.get(i).copied().flatten();
-                let mut v = Virt { ptr: Some(p), in_slot: true, num: Unboxed::None, ty: None, konst: false, checked: false, global: false };
+                // (A lazy parameter: its value, and no object yet.)
+                let mut v = Virt { ptr: p, in_slot: p.is_some(), num: Unboxed::None, ty: None, konst: false, checked: false, global: false };
                 if let Some(k) = k {
                     v = Virt { num: k.num, ty: k.ty, konst: k.konst, checked: k.checked, ..v };
                 }
@@ -3268,7 +3417,7 @@ impl<'a> Lower<'a> {
             })
             .collect();
         let inlined = Inlined { frame, desc, call_pc: pc, exit, fail, raised, donors: donors.to_vec(), args: args.to_vec(), ret_const: None, ret_int };
-        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default(), depth: self.f.depth + 1, cold: false };
+        let callee_fn = Fn { u: callee, ir, labels, catch_blocks: Vec::new(), regs, vars, vals: HashMap::new(), live, carry, nparams: ir.params.len() as u32, done: false, inline: Some(inlined), seed, written: Default::default(), cold_written: Default::default(), depth: self.f.depth + 1, cold: false };
         let caller = std::mem::replace(&mut self.f, callee_fn);
         let first = self.f.labels[0].expect("an entry");
         let init = self.b.create_block();
@@ -3277,12 +3426,17 @@ impl<'a> Lower<'a> {
         if !self.f.done {
             self.b.ins().trap(TrapCode::unwrap_user(5));
         }
-        // The slots the code may write (and the exit releases) start null.
+        // The slots the code may write (and the exit releases) start null,
+        // as do the lazy parameters'.
         self.b.switch_to_block(init);
-        for r in self.f.written.clone() {
+        for r in self.f.written.union(&self.f.cold_written).copied().collect::<Vec<_>>() {
             if r as usize >= args.len() {
                 self.b.ins().store(MF, z, regs, r as i32 * 8);
             }
+        }
+        let lazy: Vec<Reg> = (0..args.len() as Reg).filter(|&r| args[r as usize].is_none()).collect();
+        for &r in &lazy {
+            self.b.ins().store(MF, z, regs, r as i32 * 8);
         }
         self.b.ins().jump(first, &[]);
         let ret_const = self.f.inline.as_ref().and_then(|i| i.ret_const).flatten();
@@ -3291,16 +3445,25 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(fail);
         let d = self.b.ins().iconst(self.ptr, desc as i64);
         self.call(self.h.unwind, &[regs, d, fail_pc], None);
+        for &r in &lazy {
+            let v = self.b.ins().load(types::I64, MF, regs, r as i32 * 8);
+            self.xdecref(v);
+        }
         self.b.ins().jump(raised, &[]);
         self.b.switch_to_block(raised);
         self.raise(pc);
         // The result: release what the frame holds (but the borrowed
         // parameters).
         self.b.switch_to_block(exit);
-        for &r in done.written.iter().filter(|&&r| r >= ir.params.len() as u32) {
+        // (A lazy parameter's slot holds the box made for it, if any.)
+        let owned = |r: Reg| r >= ir.params.len() as u32 || lazy.contains(&r);
+        for &r in done.written.iter().filter(|&&r| owned(r)) {
             let v = self.b.ins().load(types::I64, MF, regs, r as i32 * 8);
             self.xdecref(v);
         }
+        // Written only on slow paths: when one ran.
+        let cold: Vec<Reg> = done.cold_written.iter().copied().filter(|&r| owned(r) && !done.written.contains(&r)).collect();
+        self.release_if_dirty(&cold, regs, false);
         // Always the same immortal constant (None): known here.
         match ret_const {
             Some(c) => (self.b.ins().iconst(self.ptr, c as i64), None),
@@ -3393,9 +3556,11 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(big);
         let saved = self.f.vals.clone();
         self.clobber();
+        let was = std::mem::replace(&mut self.slow, true);
         self.put(dst, r);
         self.f.vals.remove(&dst);
         self.bail_to(pc + 1);
+        self.slow = was;
         self.f.vals = saved;
         self.b.switch_to_block(done);
         self.clobber();

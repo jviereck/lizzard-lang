@@ -134,6 +134,39 @@ def grow(xs: list[int]) -> int:
     return n
 
 
+def checked(n: int) -> int:
+    if n == -77:
+        raise ValueError("seventy-seven")
+    return n * n
+
+
+def boxes(n: int) -> list[int]:
+    return [n, n + 1]
+
+
+def half(x: float) -> float:
+    return x / 2.0
+
+
+def lazies(m: int, k: int) -> int:
+    s = 0
+    for i in range(m):
+        # Arguments unboxed here, passed on unboxed.
+        s += checked(i * k) % 1000 + boxes(i + k)[1] + int(half(i * 0.5))
+    return s
+
+
+def long_loop(n: int) -> str:
+    t = 0
+    f = 0.0
+    k = 0
+    for i in range(n):
+        t += i * 3
+        f += i * 0.25
+        k = k + 1
+    return f"{t} {f} {k}"
+
+
 def deep(n: int) -> int:
     return deep(n + 1) + 1
 
@@ -228,6 +261,14 @@ if __name__ == "__main__":
     # Ints returned unboxed from inlined calls, then too big for that.
     print(sqs(300, 3), sqs(10, 2**31), sqs(10, 2**40), sqs(10, -(2**40)), sqs(10, 2**70))
     print(sq1(2**31), sq1(2**40), sq1(-(2**40)), sq1(2**70), sq1(3))
+    # Inlined calls whose arguments stay unboxed, then need their objects.
+    print(lazies(300, 1), lazies(10, 2**31), lazies(5, 2**40), lazies(3, -(2**62)))
+    try:
+        lazies(100, -7)
+    except ValueError as e:
+        print("ValueError", e)
+    # Values kept unboxed across loop safepoints.
+    print(long_loop(5000), long_loop(100000))
     # Iterating lists inline; then other iterables.
     print(sum([total([i, 2, 3]) for i in range(300)]), total(list(range(10))))
     print(halves([1, 2, 3, 4, 5]), [len(halves([1, 2, 3, i])) for i in range(300)][-1])
