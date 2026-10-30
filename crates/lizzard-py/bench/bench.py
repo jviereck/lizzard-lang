@@ -3,6 +3,7 @@
 # `LIZZARD_JIT=0 python -m lizzard bench.py` (interpreted). Build the extension
 # with `maturin develop --release` first.
 import time
+from collections.abc import Iterator
 from typing import Callable
 
 
@@ -102,6 +103,38 @@ def lists(n: int) -> int:
     return s
 
 
+def count(n: int) -> Iterator[int]:
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+
+
+def gens(n: int) -> int:
+    t = 0
+    for x in count(n):
+        t += x * x
+    return t
+
+
+def evens(xs: Iterator[int]) -> Iterator[int]:
+    for x in xs:
+        if x % 2 == 0:
+            yield x
+
+
+def scaled(xs: Iterator[int], k: int) -> Iterator[int]:
+    yield from evens(xs)
+    yield k
+
+
+def pipeline(n: int) -> int:
+    t = 0
+    for x in scaled(count(n), 3):
+        t += x
+    return t
+
+
 def timeit(name: str, fn: Callable[[int], object], arg: int) -> None:
     best = 1e9
     for _ in range(3):
@@ -119,3 +152,5 @@ if __name__ == "__main__":
     timeit("bodies", bodies, 500_000)
     timeit("bodies/s", bodies_slots, 500_000)
     timeit("lists", lists, 1_000_000)
+    timeit("gens", gens, 2_000_000)
+    timeit("pipeline", pipeline, 1_000_000)
