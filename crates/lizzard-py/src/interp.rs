@@ -794,6 +794,7 @@ pub(crate) fn run_interp<'py>(
                                         *pc = q;
                                         return Ok(exit);
                                     }
+                                    jit::Ran::YieldInt { .. } => unreachable!("an int yielded to a caller that takes objects"),
                                 }
                             }
                         }

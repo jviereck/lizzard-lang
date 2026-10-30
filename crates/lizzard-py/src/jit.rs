@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use lizzard_jit::{CallGuard, CallSpec, Entry, Helpers, Layout, Num, Quick, Spec, BAIL, ERROR, EXIT, NEXT, TAKEN, YIELD};
+use lizzard_jit::{CallGuard, CallSpec, Entry, Helpers, Layout, Num, Quick, Spec, BAIL, ERROR, EXIT, NEXT, TAKEN, YIELD, YIELD_INT};
 use lizzard_py_front::ir::{Const, Instr, ParamKind};
 use pyo3::ffi;
 use pyo3::panic::PanicException;
@@ -102,13 +102,15 @@ pub(crate) struct Ctx<'a, 'py> {
     target: *const Target<'a, 'py>,
     /// How `step` left the function (a yield).
     exit: Option<Box<Exit<'py>>>,
+    /// The caller takes a yielded int as it is (`YIELD_INT`).
+    want_int: usize,
 }
 
 const _: () = assert!(std::mem::size_of::<Ctx>() == lizzard_jit::CTX_SIZE as usize);
 
 impl<'a, 'py> Ctx<'a, 'py> {
     fn new(target: &Target<'a, 'py>, slots: *mut u64) -> Self {
-        Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), slots, target, exit: None }
+        Ctx { tid: crate::rc::tid(), ret: std::ptr::null_mut(), slots, target, exit: None, want_int: 0 }
     }
 
     fn t(&self) -> &'a Target<'a, 'py> {
@@ -146,7 +148,7 @@ fn warm_loops() -> u32 {
 }
 
 #[inline]
-fn loaded(f: &FuncRt) -> Option<Entry> {
+pub(crate) fn loaded(f: &FuncRt) -> Option<Entry> {
     let e = f.jit.entry.load(Ordering::Acquire);
     // SAFETY: only compiled entries are stored.
     (e != 0).then(|| unsafe { std::mem::transmute::<usize, Entry>(e) })
@@ -230,6 +232,7 @@ fn compile(py: Python<'_>, f: &FuncRt) -> Option<Entry> {
         compare_bool: a(lz_compare_bool as *const ()),
         call: a(lz_call as *const ()),
         for_iter: a(lz_for_iter as *const ()),
+        for_iter_int: a(lz_for_iter_int as *const ()),
         check: a(lz_check as *const ()),
         load_global: a(lz_load_global as *const ()),
         enter: a(lz_enter as *const ()),
@@ -647,7 +650,14 @@ pub fn exec<'py>(
     pc: &mut usize,
     pending: Option<PyErr>,
 ) -> PyResult<Exit<'py>> {
-    match run(py, entry, f, globals, closure, regs, pc, pending) {
+    let ran = run(py, entry, f, globals, closure, regs, pc, pending);
+    settle(py, f, globals, closure, regs, pc, ran)
+}
+
+/// How a run of compiled code ends the call: as it stopped, or the
+/// interpreter continues it.
+pub(crate) fn settle<'py>(py: Python<'py>, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, ran: Ran<'py>) -> PyResult<Exit<'py>> {
+    match ran {
         Ran::Exit(e) => Ok(e),
         Ran::Bail => run_interp(py, f, globals, closure, regs, pc, None),
         Ran::Err(e) => {
@@ -656,12 +666,15 @@ pub fn exec<'py>(
             let _ = e.add_note(py, format!("lizzard: {}:{line} in {}", ir.file, ir.name));
             Err(e)
         }
+        Ran::YieldInt { .. } => unreachable!("an int yielded to a caller that takes objects"),
     }
 }
 
 /// How compiled code stopped.
 pub enum Ran<'py> {
     Exit(Exit<'py>),
+    /// A generator yielded an int as it is (asked for: `run_with`).
+    YieldInt { value: i64, dst: u32 },
     /// The interpreter continues at the pc.
     Bail,
     /// An exception no handler of the function caught.
@@ -671,9 +684,17 @@ pub enum Ran<'py> {
 /// Run compiled code on a frame from `*pc` (left where it stopped).
 #[allow(clippy::too_many_arguments)]
 pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>) -> Ran<'py> {
+    run_with(py, entry, f, globals, closure, regs, pc, pending, false)
+}
+
+/// `run`; `want_int`: a `yield` of an unboxed int gives `Ran::YieldInt`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn run_with<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, PyDict>, closure: &[Py<PyAny>], regs: &mut Regs, pc: &mut usize, pending: Option<PyErr>, want_int: bool) -> Ran<'py> {
     let slots = regs.as_mut_ptr();
     let target = Target { py, f, globals, closure };
     let mut ctx = Ctx::new(&target, slots);
+    ctx.want_int = want_int as usize;
     let throw = pending.is_some();
     if let Some(e) = pending {
         e.restore(py);
@@ -691,6 +712,10 @@ pub fn run<'py>(py: Python<'py>, entry: Entry, f: &FuncRt, globals: &Bound<'py, 
             let Instr::Yield { dst, .. } = f.ir.code[*pc] else { unreachable!("a yield's status at another instruction") };
             // SAFETY: compiled code stored a new reference.
             Ran::Exit(Exit::Yield { value: unsafe { Bound::from_owned_ptr(py, ctx.ret) }, dst })
+        }
+        YIELD_INT => {
+            let Instr::Yield { dst, .. } = f.ir.code[*pc] else { unreachable!("a yield's status at another instruction") };
+            Ran::YieldInt { value: ctx.ret as i64, dst }
         }
         BAIL => {
             bailed(f);
@@ -836,6 +861,20 @@ extern "C" fn lz_for_iter(ctx_: *mut c_void, slots: *mut u64, dst: u32, iter: u3
     }
 }
 
+/// `lz_for_iter`, where the loop keeps its item unboxed: a Lizzard
+/// generator's int may come as it is, in `*out` (`NEXT_INT`).
+extern "C" fn lz_for_iter_int(ctx_: *mut c_void, slots: *mut u64, dst: u32, iter: u32, pc: u32, out: *mut i64) -> u32 {
+    unsafe {
+        let it = slot(slots, iter);
+        if !it.is_null() && ffi::Py_TYPE(it) == crate::generator::type_ptr() {
+            let t = ctx(ctx_).t();
+            crate::interp::note_iter(t.f, pc as usize, it);
+            return crate::generator::for_iter_int(t.py, slots, dst, it, out);
+        }
+        lz_for_iter(ctx_, slots, dst, iter, pc)
+    }
+}
+
 /// The value of an exact int, if it fits in an `i64`.
 extern "C" fn lz_long_value(o: *mut ffi::PyObject, out: *mut i64) -> u32 {
     unsafe {
@@ -973,7 +1012,7 @@ extern "C" fn lz_enter(ctx_: *mut c_void, frame: *mut u64, desc: *const CallDesc
     let r = match entry(py, rt) {
         Some(e) => match run(py, e, rt, globals, closure, &mut regs, &mut pc, None) {
             Ran::Exit(Exit::Return(v)) => Ok(v),
-            Ran::Exit(_) => unreachable!("yield in a function that is not a generator"),
+            Ran::Exit(_) | Ran::YieldInt { .. } => unreachable!("yield in a function that is not a generator"),
             Ran::Bail => {
                 own(&mut borrowed);
                 run_interp(py, rt, globals, closure, &mut regs, &mut pc, None).map(|e| match e {

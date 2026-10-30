@@ -67,6 +67,11 @@ pub const BAIL: u32 = 4;
 /// A generator yielded at `*pc` (a `Yield`): the value (a new reference)
 /// is the context's `CTX_RET`.
 pub const YIELD: u32 = 5;
+/// The same, for an int yielded as it is (`CTX_WANT_INT`): `CTX_RET` holds
+/// the `i64`.
+pub const YIELD_INT: u32 = 6;
+/// `for_iter_int`: the next item, an int, in its `out` (not in `dst`).
+pub const NEXT_INT: u32 = 7;
 
 /// The context's thread id (free-threaded reference counting compares an
 /// object's owner with it), and where `Return` leaves its value (a new
@@ -78,7 +83,10 @@ pub const CTX_RET: i32 = 8;
 pub const CTX_SLOTS: i32 = 16;
 pub const CTX_TARGET: i32 = 24;
 pub const CTX_EXIT: i32 = 32;
-pub const CTX_SIZE: i32 = 40;
+/// Non-zero: a `yield` of an unboxed int may hand over the int itself
+/// (`YIELD_INT`).
+pub const CTX_WANT_INT: i32 = 40;
+pub const CTX_SIZE: i32 = 48;
 
 pub type Entry = unsafe extern "C" fn(ctx: *mut c_void, regs: *mut u64, pc: *mut u32, pending: u32) -> u32;
 
@@ -176,6 +184,10 @@ pub struct Helpers {
     /// `for_iter(ctx, regs, dst, iter, pc)`: `NEXT`, `TAKEN` at the end, or
     /// `ERROR`.
     pub for_iter: usize,
+    /// `for_iter_int(ctx, regs, dst, iter, pc, out)`: `for_iter`, but a
+    /// Lizzard generator yielding an unboxed int gives it in `*out`
+    /// (`NEXT_INT`).
+    pub for_iter_int: usize,
     /// `check(ctx, regs, reg, check, pc)`
     pub check: usize,
     /// `load_global(ctx, regs, dst, pc)`
@@ -440,6 +452,9 @@ fn kinds(u: &Unit, params: &[Kind]) -> Vec<Vec<Kind>> {
                     w(&mut st, *dst, k);
                 }
                 Instr::Box { dst, src } if ir.reprs[*src as usize] == Repr::I64 => w(&mut st, *dst, Kind::I),
+                // Items the checker knows are ints (speculatively: unboxed,
+                // or the loop bails out).
+                Instr::ForIter { dst, .. } if ir.hints.get(pc).copied() == Some(HINT_INT) => w(&mut st, *dst, Kind::I),
                 Instr::Move { dst, src } if obj(*src) && obj(*dst) => w(&mut st, *dst, before[*src as usize]),
                 Instr::Take { dst, src } if obj(*src) && obj(*dst) => {
                     w(&mut st, *dst, before[*src as usize]);
@@ -909,6 +924,8 @@ struct Lower<'a> {
     bail: Block,
     /// A `yield`: `YIELD` at its pc.
     yielded: Block,
+    /// A `yield` of an int as it is: `YIELD_INT` at its pc.
+    yielded_int: Block,
     /// `return`: its value (a new reference) and pc.
     ret_block: Block,
     ctx: Value,
@@ -948,7 +965,7 @@ impl<'a> Lower<'a> {
             b.append_block_param(blk, types::I32);
             blk
         };
-        let (exit, fail, bail, yielded) = (leave(), leave(), leave(), leave());
+        let (exit, fail, bail, yielded, yielded_int) = (leave(), leave(), leave(), leave(), leave());
         let ret_block = b.create_block();
         b.append_block_param(ret_block, ptr);
         b.append_block_param(ret_block, types::I32);
@@ -973,6 +990,7 @@ impl<'a> Lower<'a> {
             fail,
             bail,
             yielded,
+            yielded_int,
             ret_block,
             ctx: ps[0],
             pcp: ps[2],
@@ -1102,7 +1120,7 @@ impl<'a> Lower<'a> {
         self.release_if_dirty(&cold, regs, true);
         self.b.ins().store(MF, p, self.ctx, CTX_RET);
         self.b.ins().jump(self.exit, &[BlockArg::Value(pc)]);
-        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL), (self.yielded, YIELD)] {
+        for (blk, status) in [(self.exit, EXIT), (self.fail, ERROR), (self.bail, BAIL), (self.yielded, YIELD), (self.yielded_int, YIELD_INT)] {
             self.b.switch_to_block(blk);
             let pc = self.b.block_params(blk)[0];
             self.b.ins().store(MF, pc, self.pcp, 0);
@@ -3004,6 +3022,20 @@ impl<'a> Lower<'a> {
     /// raises.
     fn yield_value(&mut self, pc: usize, src: Reg) {
         let start = self.f.vals.clone();
+        // An unboxed int, to a caller that takes one (`CTX_WANT_INT`): as
+        // it is, boxed only if the generator itself needs it after.
+        if let Some(Unboxed::I64(x)) = self.f.vals.get(&src).map(|v| v.num) {
+            let (int, obj) = (self.b.create_block(), self.b.create_block());
+            let want = self.b.ins().load(self.ptr, MF, self.ctx, CTX_WANT_INT);
+            self.b.ins().brif(want, int, &[], obj, &[]);
+            self.b.switch_to_block(int);
+            self.flush(pc + 1);
+            self.b.ins().store(MF, x, self.ctx, CTX_RET);
+            let pcv = self.pc_val(pc);
+            self.b.ins().jump(self.yielded_int, &[BlockArg::Value(pcv)]);
+            self.f.vals = start.clone();
+            self.b.switch_to_block(obj);
+        }
         let slow = self.b.create_block();
         let p = self.obj(src, pc, slow);
         self.incref(p);
@@ -3071,7 +3103,32 @@ impl<'a> Lower<'a> {
         self.clobber();
         let (d, it, p) = (self.i32c(dst), self.i32c(iter), self.pc_val(pc));
         let (ctx, regs) = (self.ctx, self.f.regs);
+        // Over a generator, an item the loop keeps unboxed may come as a
+        // machine int.
+        let ints = matches!(self.f.u.specs[pc], Spec::Iter(ITER_GEN)) && self.f.carry[pc + 1].iter().any(|&(r, k)| r == dst && k == Kind::I);
+        if ints {
+            let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let op = self.b.ins().stack_addr(self.ptr, out, 0);
+            let st = self.call(self.h.for_iter_int, &[ctx, regs, d, it, p, op], Some(types::I32)).unwrap();
+            let (int, rest) = (self.b.create_block(), self.b.create_block());
+            let is_int = self.b.ins().icmp_imm_u(IntCC::Equal, st, NEXT_INT as i64);
+            self.b.ins().brif(is_int, int, &[], rest, &[]);
+            self.b.switch_to_block(int);
+            let x = self.b.ins().stack_load(self.ptr, types::I64, out, 0);
+            let saved = self.f.vals.clone();
+            self.wrote(pc);
+            self.f.vals.insert(dst, Virt { ptr: None, in_slot: false, num: Unboxed::I64(x), ty: Some(self.l.long_type), konst: false, checked: false, global: false });
+            self.goto(pc, pc as u32 + 1);
+            self.f.vals = saved;
+            self.b.switch_to_block(rest);
+            return self.for_iter_status(pc, target, st);
+        }
         let st = self.call(self.h.for_iter, &[ctx, regs, d, it, p], Some(types::I32)).unwrap();
+        self.for_iter_status(pc, target, st)
+    }
+
+    /// After `ForIter`'s helper: its status `st`.
+    fn for_iter_status(&mut self, pc: usize, target: u32, st: Value) {
         self.wrote(pc);
         // NEXT continues, TAKEN jumps, ERROR raises (an unbound iterator
         // too).
@@ -3585,6 +3642,7 @@ impl<'a> Lower<'a> {
         let t = self.b.ins().iconst(self.ptr, target as i64);
         self.b.ins().stack_store(self.ptr, t, ctx, CTX_TARGET);
         self.b.ins().stack_store(self.ptr, zero, ctx, CTX_EXIT);
+        self.b.ins().stack_store(self.ptr, zero, ctx, CTX_WANT_INT);
         // `*pc`, after the context.
         let z32 = self.b.ins().iconst(types::I32, 0);
         self.b.ins().stack_store(self.ptr, z32, ctx, CTX_SIZE);

@@ -65,6 +65,16 @@ pub enum Op<'py> {
     Throw(PyErr),
 }
 
+/// The next item for a `for` loop (`next_direct`).
+pub(crate) enum Next<'py> {
+    Value(Bound<'py, PyAny>),
+    /// An int it yielded as it is.
+    Int(i64),
+    End,
+    /// Not this way: `resume`.
+    Slow,
+}
+
 /// What resuming an iterator gave: a value, or its return value.
 pub enum Sent<'py> {
     Next(Bound<'py, PyAny>),
@@ -213,16 +223,23 @@ impl LizzardGenerator {
             r = exec(py, &self.rt, self.globals.bind(py), &self.closure, &mut frame.regs, &mut pc, pending);
             own_handled = None;
         }
-        let suspend = |value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
+        self.after(py, slot, pc, r, own_handled)
+    }
+
+    /// The end of a run of its code (`pc` where it stopped): suspended at a
+    /// yield (with the handled exception it keeps, if any), or done.
+    fn after<'py>(&self, py: Python<'py>, slot: &mut Option<Frame>, pc: usize, r: PyResult<Exit<'py>>, handled: Option<Py<PyAny>>) -> PyResult<Sent<'py>> {
+        let suspend = |slot: &mut Option<Frame>, value: Bound<'py, PyAny>, dst: u32, delegate: Option<Bound<'py, PyAny>>| {
+            let frame = slot.as_mut().expect("a running generator's frame");
             frame.pc = pc;
             frame.dst = dst;
             frame.delegate = delegate.map(Bound::unbind);
-            frame.handled = own_handled;
+            frame.handled = handled;
             Sent::Next(value)
         };
         match r {
-            Ok(Exit::Yield { value, dst }) => Ok(suspend(value, dst, None)),
-            Ok(Exit::YieldFrom { value, dst, iter }) => Ok(suspend(value, dst, Some(iter))),
+            Ok(Exit::Yield { value, dst }) => Ok(suspend(slot, value, dst, None)),
+            Ok(Exit::YieldFrom { value, dst, iter }) => Ok(suspend(slot, value, dst, Some(iter))),
             Ok(Exit::Return(v)) => {
                 self.finish(slot);
                 Ok(Sent::Return(v))
@@ -239,6 +256,58 @@ impl LizzardGenerator {
                 Err(e)
             }
         }
+    }
+
+    /// The next item for a `for` loop, from the generator's compiled code
+    /// entered directly (no `exec` and its layers): when it is compiled,
+    /// not running, not delegating (`yield from`) and keeps no handled
+    /// exception; else `Slow` (`resume` does it). `want_int`: an int it
+    /// yields unboxed comes as it is.
+    pub(crate) fn next_direct<'py>(&self, py: Python<'py>, want_int: bool) -> PyResult<Next<'py>> {
+        let Some(entry) = crate::jit::loaded(&self.rt) else { return Ok(Next::Slow) };
+        if self.rt.sets_handled || self.running.swap(true, Ordering::Acquire) {
+            return Ok(Next::Slow);
+        }
+        let r = self.next_running(py, entry, want_int);
+        self.running.store(false, Ordering::Release);
+        r
+    }
+
+    fn next_running<'py>(&self, py: Python<'py>, entry: lizzard_jit::Entry, want_int: bool) -> PyResult<Next<'py>> {
+        // SAFETY: this thread set `running`: the frame is its own.
+        let slot = unsafe { &mut *self.frame.get() };
+        let status = self.status();
+        let frame = match (status, slot.as_mut()) {
+            (Status::Created | Status::Suspended, Some(f)) if f.delegate.is_none() && f.handled.is_none() => f,
+            _ => return Ok(Next::Slow),
+        };
+        let mut pc = if status == Status::Suspended {
+            // `next()` sends None to the `yield`.
+            frame.regs.set_obj(frame.dst, py.None().into_bound(py));
+            frame.pc + 1
+        } else {
+            0
+        };
+        self.set_status(Status::Suspended);
+        let globals = self.globals.bind(py);
+        let ran = crate::jit::run_with(py, entry, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, None, want_int);
+        let r = match ran {
+            crate::jit::Ran::Exit(Exit::Yield { value, dst }) => {
+                frame.pc = pc;
+                frame.dst = dst;
+                return Ok(Next::Value(value));
+            }
+            crate::jit::Ran::YieldInt { value, dst } => {
+                frame.pc = pc;
+                frame.dst = dst;
+                return Ok(Next::Int(value));
+            }
+            ran => crate::jit::settle(py, &self.rt, globals, &self.closure, &mut frame.regs, &mut pc, ran),
+        };
+        Ok(match self.after(py, slot, pc, r, None)? {
+            Sent::Next(v) => Next::Value(v),
+            Sent::Return(_) => Next::End,
+        })
     }
 
     fn close_gen(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -266,16 +335,44 @@ impl LizzardGenerator {
 /// # Safety
 /// `it` is a LizzardGenerator; `slots` has register `dst`.
 pub(crate) unsafe fn for_iter(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi::PyObject) -> u32 {
-    use lizzard_jit::{ERROR, NEXT, TAKEN};
+    // SAFETY: as required.
+    unsafe { for_iter_with(py, slots, dst, it, None) }
+}
+
+/// `for_iter`, an int yielded as it is going to `*out` (`NEXT_INT`).
+///
+/// # Safety
+/// As `for_iter`; `out` is writable.
+pub(crate) unsafe fn for_iter_int(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi::PyObject, out: *mut i64) -> u32 {
+    // SAFETY: as required.
+    unsafe { for_iter_with(py, slots, dst, it, Some(out)) }
+}
+
+unsafe fn for_iter_with(py: Python<'_>, slots: *mut u64, dst: u32, it: *mut ffi::PyObject, out: Option<*mut i64>) -> u32 {
+    use lizzard_jit::{ERROR, NEXT, NEXT_INT, TAKEN};
     // SAFETY: as required.
     let g = unsafe { Bound::from_borrowed_ptr(py, it).cast_into_unchecked::<LizzardGenerator>() };
-    match g.get().resume(py, Op::Send(py.None().into_bound(py))) {
-        Ok(Sent::Next(v)) => {
+    let g = g.get();
+    let r = match g.next_direct(py, out.is_some()) {
+        Ok(Next::Slow) => match g.resume(py, Op::Send(py.None().into_bound(py))) {
+            Ok(Sent::Next(v)) => Ok(Next::Value(v)),
+            Ok(Sent::Return(_)) => Ok(Next::End),
+            Err(e) => Err(e),
+        },
+        r => r,
+    };
+    match r {
+        Ok(Next::Value(v)) => {
             // SAFETY: a new reference for the slot.
             unsafe { crate::ops::put(slots, dst, v.into_ptr()) };
             NEXT
         }
-        Ok(Sent::Return(_)) => TAKEN,
+        Ok(Next::Int(x)) => {
+            // SAFETY: asked for with `out`.
+            unsafe { *out.expect("an int for a loop that takes one") = x };
+            NEXT_INT
+        }
+        Ok(_) => TAKEN,
         Err(e) => {
             e.restore(py);
             ERROR

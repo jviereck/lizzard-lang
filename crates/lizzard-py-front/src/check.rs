@@ -969,7 +969,7 @@ impl<'a> Lower<'a> {
         }
         let mut hints = vec![0u8; l.code.len()];
         for (pc, h) in l.hints {
-            if matches!(l.code.get(pc), Some(Instr::BinOp { .. })) {
+            if matches!(l.code.get(pc), Some(Instr::BinOp { .. } | Instr::ForIter { .. })) {
                 hints[pc] = h;
             }
         }
@@ -2404,6 +2404,9 @@ impl<'a> Lower<'a> {
         let top = self.here();
         let x = self.reg(Repr::Obj);
         let exit = self.emit(Instr::ForIter { dst: x, iter, target: 0 });
+        if matches!(elem, Ty::Int) {
+            self.hints.push((exit, crate::ir::HINT_INT));
+        }
         let item = Val { reg: x, ty: elem, repr: Repr::Obj };
         let what = format!("item of {}", self.src(&*f.iter));
         self.check(&item, what, None);

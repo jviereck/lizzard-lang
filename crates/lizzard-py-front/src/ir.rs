@@ -298,7 +298,7 @@ pub struct FuncIr {
 /// Both operands are statically `float`, or one is an `int` (at runtime: a
 /// float or an int each; the result a float unless both are ints).
 pub const HINT_FLOAT: u8 = 1;
-/// Both operands are statically `int`.
+/// Both operands are statically `int` (at a `ForIter`: its items are).
 pub const HINT_INT: u8 = 2;
 
 #[derive(Clone, Debug, Default)]

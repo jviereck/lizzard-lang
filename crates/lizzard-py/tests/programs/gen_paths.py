@@ -121,6 +121,75 @@ def pair() -> Generator[int, None, None]:
     yield 1
 
 
+def squares_of(n: int, k: int) -> Iterator[int]:
+    # Computed ints: handed to a loop that takes ints as they are.
+    for i in range(n):
+        yield i * k
+
+
+def sum_squares(n: int, k: int) -> int:
+    t = 0
+    for x in squares_of(n, k):
+        t += x
+    return t
+
+
+def kept(n: int) -> list[int]:
+    # The ints are needed as objects too.
+    out: list[int] = []
+    for x in squares_of(n, 3):
+        out.append(x)
+    return out
+
+
+def flags(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i % 2 == 0
+
+
+def count_flags(n: int) -> int:
+    t = 0
+    for x in flags(n):
+        t += x
+    return t
+
+
+def guarded_ints(n: int) -> Iterator[int]:
+    for i in range(n):
+        try:
+            if i == 3:
+                raise KeyError(i)
+            yield i
+        except KeyError:
+            yield -1
+
+
+def sum_guarded(n: int) -> int:
+    t = 0
+    for x in guarded_ints(n):
+        t += x
+    return t
+
+
+def chained(n: int) -> Iterator[int]:
+    yield from squares_of(n, 2)
+    yield 7
+
+
+def sum_chained(n: int) -> int:
+    t = 0
+    for x in chained(n):
+        t += x
+    return t
+
+
+def rest_of(g: Iterator[int]) -> int:
+    t = 0
+    for x in g:
+        t += x
+    return t
+
+
 def thrown() -> Generator[int, None, None]:
     try:
         yield 1
@@ -141,6 +210,12 @@ if __name__ == "__main__":
     print([early() for _ in range(300)][-1])
     print(list(delegating(3)), sum([total_of(delegating(50)) for _ in range(300)]))
     print(mixed(300))
+    print([sum_squares(n, 3) for n in range(300)][-1], sum_squares(1000, 2**40), sum_squares(10, 2**62))
+    print(kept(5), [len(kept(50)) for _ in range(300)][-1])
+    print([count_flags(n) for n in range(300)][-1], count_flags(5))
+    print([sum_guarded(10) for _ in range(300)][-1], [sum_chained(20) for _ in range(300)][-1])
+    part = squares_of(10, 1)
+    print(next(part), next(part), rest_of(part), [rest_of(squares_of(n, 1)) for n in range(300)][-1])
     g = thrown()
     print(next(g), g.throw(KeyError("k")), next(g), list(g))
     print(gen_paths_patch.reenter(count(3)))
