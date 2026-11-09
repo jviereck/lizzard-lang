@@ -43,6 +43,36 @@ python -m lizzard app.py     # checked and compiled by Lizzard
 
 Importing `lizzard` installs an import hook, so any module marked `# lizzard: module` is checked and compiled when it is imported.
 
+
+## Performance
+
+`crates/lizzard-py/bench/bench.py`, release build, best of 3, CPython 3.14.6 free-threaded, Intel Xeon @ 2.80 GHz:
+
+| Benchmark | CPython | Lizzard interpreter | Lizzard JIT | JIT vs CPython |
+|---|---|---|---|---|
+| int loop, `t += i * i` (2M) | 0.103 s | 0.149 s | **0.004 s** | ~26× |
+| `fib(25)` | 0.008 s | 0.028 s | **0.002 s** | ~4× |
+| vector objects, `a = a.add(d)` (500k) | 0.081 s | 0.184 s | **0.008 s** | ~10× |
+| same, `__slots__` | 0.074 s | 0.171 s | **0.006 s** | ~12× |
+| method calls updating attributes, `b.step(dt)` over a list (500k) | 0.037 s | 0.083 s | **0.004 s** | ~9× |
+| same, `__slots__` | 0.035 s | 0.083 s | **0.004 s** | ~9× |
+| list build and scan (1M) | 0.095 s | 0.173 s | **0.062 s** | 1.5× |
+| generator consumed by `for` (2M) | 0.152 s | 0.323 s | **0.040 s** | 3.8× |
+| generator pipeline: filter + `yield from` (1M) | 0.084 s | 0.187 s | **0.063 s** | 1.3× |
+| tail-recursive int sum (900 deep, ×2000) | 0.219 s | 0.133 s | **0.016 s** | 14× |
+| tail-recursive float sum (900 deep, ×2000) | 0.245 s | 0.197 s | **0.014 s** | 18× |
+
+Timings of a few milliseconds are close to the timer's resolution. Machine instruction counts (Valgrind, per unit of work) are exact:
+
+| Unit of work | CPython | Lizzard JIT |
+|---|---|---|
+| one loop iteration | 715 | 21 |
+| one `b.step(0.01)` call | 938 | 70 |
+| `fib(10)` | 84.6k | 21.8k |
+| one item of the `for`-over-generator benchmark | ~760 | ~310 |
+
+The tail-recursion rows come from a separate script, not `bench.py`. The `list build and scan` row is dominated by CPython's own `list.append`, which Lizzard calls rather than replaces.
+
 ## How it works
 
 1. **Checker** (`crates/lizzard-py-front`). Python is parsed with ruff's parser and the module is type-checked. Every function, method and lambda is lowered to a register IR. Annotations are *checked assertions*: a value entering an annotated position from untyped code is checked at runtime, and where the checker proves a type no check is emitted.
@@ -115,35 +145,6 @@ The checker's types and the interpreter's caches let compiled code skip most of 
 - **List iteration inline.** `for` over a list reads the list iterator directly.
 - **Cheap safepoints.** Safepoints cost one counter decrement per iteration, and the loop's values stay in registers.
 - **Globals.** They are read through caches invalidated by CPython dict watchers.
-
-## Performance
-
-`crates/lizzard-py/bench/bench.py`, release build, best of 3, CPython 3.14.6 free-threaded, Intel Xeon @ 2.80 GHz:
-
-| Benchmark | CPython | Lizzard interpreter | Lizzard JIT | JIT vs CPython |
-|---|---|---|---|---|
-| int loop, `t += i * i` (2M) | 0.103 s | 0.149 s | **0.004 s** | ~26× |
-| `fib(25)` | 0.008 s | 0.028 s | **0.002 s** | ~4× |
-| vector objects, `a = a.add(d)` (500k) | 0.081 s | 0.184 s | **0.008 s** | ~10× |
-| same, `__slots__` | 0.074 s | 0.171 s | **0.006 s** | ~12× |
-| method calls updating attributes, `b.step(dt)` over a list (500k) | 0.037 s | 0.083 s | **0.004 s** | ~9× |
-| same, `__slots__` | 0.035 s | 0.083 s | **0.004 s** | ~9× |
-| list build and scan (1M) | 0.095 s | 0.173 s | **0.062 s** | 1.5× |
-| generator consumed by `for` (2M) | 0.152 s | 0.323 s | **0.040 s** | 3.8× |
-| generator pipeline: filter + `yield from` (1M) | 0.084 s | 0.187 s | **0.063 s** | 1.3× |
-| tail-recursive int sum (900 deep, ×2000) | 0.219 s | 0.133 s | **0.016 s** | 14× |
-| tail-recursive float sum (900 deep, ×2000) | 0.245 s | 0.197 s | **0.014 s** | 18× |
-
-Timings of a few milliseconds are close to the timer's resolution. Machine instruction counts (Valgrind, per unit of work) are exact:
-
-| Unit of work | CPython | Lizzard JIT |
-|---|---|---|
-| one loop iteration | 715 | 21 |
-| one `b.step(0.01)` call | 938 | 70 |
-| `fib(10)` | 84.6k | 21.8k |
-| one item of the `for`-over-generator benchmark | ~760 | ~310 |
-
-The tail-recursion rows come from a separate script, not `bench.py`. The `list build and scan` row is dominated by CPython's own `list.append`, which Lizzard calls rather than replaces.
 
 ## Building and testing
 
